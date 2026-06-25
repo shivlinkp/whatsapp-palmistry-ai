@@ -3,7 +3,7 @@ import axios from "axios";
 import OpenAI from "openai";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "20mb" }));
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "palmistry_verify_123";
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
@@ -14,12 +14,25 @@ const QR_IMAGE_URL = process.env.QR_IMAGE_URL || "";
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const sessions = new Map();
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const randomDelay = (min, max) =>
-  delay((Math.floor(Math.random() * (max - min + 1)) + min) * 1000);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function randomDelay(min, max) {
+  return (Math.floor(Math.random() * (max - min + 1)) + min) * 1000;
+}
+
+function getSession(phone) {
+  if (!sessions.has(phone)) {
+    sessions.set(phone, {
+      history: [],
+    });
+  }
+  return sessions.get(phone);
+}
 
 app.get("/", (req, res) => {
-  res.send("Palmistry WhatsApp bot is running ✅");
+  res.send("Palmistry GPT WhatsApp bot is running ✅");
 });
 
 app.get("/webhook", (req, res) => {
@@ -33,22 +46,6 @@ app.get("/webhook", (req, res) => {
 
   return res.sendStatus(403);
 });
-
-function getSession(phone) {
-  if (!sessions.has(phone)) {
-    sessions.set(phone, {
-      stage: "new",
-      name: "",
-      dob: "",
-      gender: "",
-      firstHandReceived: false,
-      secondHandReceived: false,
-      paymentReceived: false,
-      history: [],
-    });
-  }
-  return sessions.get(phone);
-}
 
 async function sendText(to, body) {
   await axios.post(
@@ -68,17 +65,14 @@ async function sendText(to, body) {
   );
 }
 
-async function sendImage(to, imageUrl, caption = "") {
+async function sendImage(to, imageUrl) {
   await axios.post(
     `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
     {
       messaging_product: "whatsapp",
       to,
       type: "image",
-      image: {
-        link: imageUrl,
-        caption,
-      },
+      image: { link: imageUrl },
     },
     {
       headers: {
@@ -89,7 +83,36 @@ async function sendImage(to, imageUrl, caption = "") {
   );
 }
 
-const welcomeMessage = `Hi 👋
+const systemPrompt = `
+You are handling WhatsApp enquiries for a ₹99 Malayalam palmistry assessment service.
+
+You must behave like a calm human staff member.
+Never say you are AI, chatbot, automation, OpenAI, model, or system.
+Never introduce yourself.
+Never say "assistant".
+Never sound robotic.
+Use emojis only in the first welcome message and final assessment.
+Normal replies must be short, natural and human.
+Ask only one thing at a time.
+Never ask for information already given.
+Understand Malayalam, English and Manglish.
+
+Main flow:
+1. If customer says hi, hello, hey, hai, test, anyone, or starts a new enquiry, send the welcome message.
+2. Collect Name, Date of Birth and Gender.
+3. If any detail is missing, ask only for the missing detail.
+4. If Gender is Male, ask for right hand photo first.
+5. If Gender is Female, ask for left hand photo first.
+6. After first hand photo, ask for the other hand.
+7. After both hand photos, tell the system to send QR.
+8. After QR is sent, ask customer to pay ₹99 and send screenshot.
+9. After payment screenshot, say "ഒരു നിമിഷം."
+10. Then confirm payment and say report will be sent in about 30 minutes.
+11. If final report is needed, write a detailed Malayalam palmistry assessment.
+
+Welcome message must be exactly:
+
+Hi 👋
 
 ₹99 കൈരേഖാ വിശകലനത്തിൽ നിങ്ങൾക്ക് ലഭിക്കുന്നത്:
 
@@ -109,138 +132,63 @@ const welcomeMessage = `Hi 👋
 
 ✍🏻 Name, Date of Birth, Gender പറയാമോ?
 
-✨ ഫീസ്: ₹99 മാത്രം.`;
+✨ ഫീസ്: ₹99 മാത്രം.
 
-function looksLikeGreeting(text) {
-  const t = text.toLowerCase().trim();
-  return ["hi", "hello", "hey", "hai", "test", "anyone", "halo"].some((x) =>
-    t.includes(x)
-  );
-}
+Male first hand message:
+ഇനി നിങ്ങളുടെ വലത് കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?
 
-function detectGender(text) {
-  const t = text.toLowerCase();
+ഫോട്ടോ എടുക്കുമ്പോൾ കൈ മുഴുവനും വ്യക്തമായി കാണണം. നല്ല വെളിച്ചത്തിൽ എടുത്തതാണെങ്കിൽ വിശകലനം കൂടുതൽ കൃത്യമായിരിക്കും.
 
-  if (
-    t.includes("female") ||
-    t.includes("girl") ||
-    t.includes("woman") ||
-    t.includes("സ്ത്രീ") ||
-    t.includes("പെൺ") ||
-    t.includes("പെണ്ണ്")
-  ) {
-    return "female";
-  }
+Female first hand message:
+ഇനി നിങ്ങളുടെ ഇടത് കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?
 
-  if (
-    t.includes("male") ||
-    t.includes("boy") ||
-    t.includes("man") ||
-    t.includes("പുരുഷൻ") ||
-    t.includes("ആൺ") ||
-    t.includes("ആണ്")
-  ) {
-    return "male";
-  }
+ഫോട്ടോ എടുക്കുമ്പോൾ കൈ മുഴുവനും വ്യക്തമായി കാണണം. നല്ല വെളിച്ചത്തിൽ എടുത്തതാണെങ്കിൽ വിശകലനം കൂടുതൽ കൃത്യമായിരിക്കും.
 
-  return "";
-}
+After QR:
+ഇതിൽ ₹99 payment ചെയ്തോളൂ.
 
-async function extractDetails(session, text) {
-  const prompt = `
-Extract customer details from this WhatsApp message.
+Payment ചെയ്തതിന് ശേഷം സ്ക്രീൻഷോട്ട് ഇവിടെ അയച്ചാൽ മതി.
 
-Message:
-${text}
+Final assessment:
+Write in Malayalam.
+Make it detailed, personal, premium and satisfying.
+Include personality, love, marriage, family life, career, business, money, opportunities, challenges and special palm indications.
+Never mention AI.
+Never add disclaimers.
 
-Return only valid JSON like this:
+Return ONLY JSON:
 {
-  "name": "",
-  "dob": "",
-  "gender": ""
+  "reply": "message to send to customer",
+  "action": "none | send_qr | final_report",
+  "delay_seconds": 15
 }
-
-Rules:
-- gender must be "male", "female", or "".
-- Understand Malayalam, English and Manglish.
-- If a value is missing, keep it empty.
 `;
+
+async function askGPT(session, userMessage) {
+  const messages = [
+    { role: "system", content: systemPrompt },
+    ...session.history,
+    { role: "user", content: userMessage },
+  ];
 
   const response = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0.1,
+    temperature: 0.7,
+    messages,
   });
+
+  const raw = response.choices[0].message.content.trim();
 
   try {
-    const json = JSON.parse(response.choices[0].message.content);
-    if (json.name && !session.name) session.name = json.name;
-    if (json.dob && !session.dob) session.dob = json.dob;
-    if (json.gender && !session.gender) session.gender = json.gender;
+    const cleaned = raw.replace(/```json/g, "").replace(/```/g, "").trim();
+    return JSON.parse(cleaned);
   } catch {
-    const gender = detectGender(text);
-    if (gender && !session.gender) session.gender = gender;
+    return {
+      reply: raw,
+      action: "none",
+      delay_seconds: 15,
+    };
   }
-}
-
-function missingDetailsReply(session) {
-  if (!session.name && !session.dob && !session.gender) {
-    return "Name, Date of Birth, Gender പറയാമോ?";
-  }
-
-  if (!session.name) return "Name കൂടി പറയാമോ?";
-  if (!session.dob) return "Date of Birth കൂടി പറയാമോ?";
-  if (!session.gender) return "Gender പറയാമോ?";
-
-  return "";
-}
-
-function firstHandMessage(session) {
-  if (session.gender === "male") {
-    return `ഇനി നിങ്ങളുടെ വലത് കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?
-
-ഫോട്ടോ എടുക്കുമ്പോൾ കൈ മുഴുവനും വ്യക്തമായി കാണണം. നല്ല വെളിച്ചത്തിൽ എടുത്തതാണെങ്കിൽ വിശകലനം കൂടുതൽ കൃത്യമായിരിക്കും.`;
-  }
-
-  return `ഇനി നിങ്ങളുടെ ഇടത് കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?
-
-ഫോട്ടോ എടുക്കുമ്പോൾ കൈ മുഴുവനും വ്യക്തമായി കാണണം. നല്ല വെളിച്ചത്തിൽ എടുത്തതാണെങ്കിൽ വിശകലനം കൂടുതൽ കൃത്യമായിരിക്കും.`;
-}
-
-function secondHandMessage(session) {
-  if (session.gender === "male") {
-    return "ഇനി ഇടത് കൈയുടെ ഫോട്ടോ കൂടി അയച്ചാൽ മതി.";
-  }
-
-  return "ഇനി വലത് കൈയുടെ ഫോട്ടോ കൂടി അയച്ചാൽ മതി.";
-}
-
-async function generateFinalAssessment(session) {
-  const prompt = `
-Write a detailed Malayalam palmistry assessment.
-
-Customer details:
-Name: ${session.name}
-Date of Birth: ${session.dob}
-Gender: ${session.gender}
-
-Style:
-- Write like an experienced palmistry consultant.
-- Make it personal and satisfying.
-- Do not mention AI.
-- Do not mention entertainment.
-- Use emojis only inside the final report where it feels natural.
-- Include personality, love, marriage, family life, career, business, money, opportunities, challenges, and special palm indications.
-- Make it detailed and premium.
-`;
-
-  const response = await openai.chat.completions.create({
-    model: "gpt-4.1-mini",
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0.8,
-  });
-
-  return response.choices[0].message.content.trim();
 }
 
 app.post("/webhook", async (req, res) => {
@@ -253,108 +201,41 @@ app.post("/webhook", async (req, res) => {
     const from = message.from;
     const session = getSession(from);
 
+    let userMessage = "";
+
     if (message.type === "text") {
-      const text = message.text.body;
-
-      if (session.stage === "new" && looksLikeGreeting(text)) {
-        session.stage = "collecting_details";
-        await sendText(from, welcomeMessage);
-        return;
-      }
-
-      await extractDetails(session, text);
-
-      const missing = missingDetailsReply(session);
-      await randomDelay(12, 18);
-
-      if (missing) {
-        await sendText(from, missing);
-        return;
-      }
-
-      if (session.stage === "collecting_details" || session.stage === "new") {
-        session.stage = "waiting_first_hand";
-        await sendText(from, firstHandMessage(session));
-        return;
-      }
-
-      await sendText(from, "കൈയുടെ വ്യക്തമായ ഫോട്ടോ അയച്ചുതരാമോ?");
-      return;
+      userMessage = message.text.body;
+    } else if (message.type === "image") {
+      userMessage = "Customer sent an image/photo.";
+    } else if (message.type === "audio") {
+      userMessage = "Customer sent a voice note.";
+    } else {
+      userMessage = `Customer sent ${message.type}.`;
     }
 
-    if (message.type === "image") {
-      if (session.stage === "waiting_first_hand") {
-        session.firstHandReceived = true;
-        session.stage = "waiting_second_hand";
+    const result = await askGPT(session, userMessage);
 
-        await randomDelay(15, 20);
-        await sendText(from, secondHandMessage(session));
-        return;
-      }
+    const delaySeconds =
+      typeof result.delay_seconds === "number"
+        ? result.delay_seconds
+        : Math.floor(Math.random() * 7) + 12;
 
-      if (session.stage === "waiting_second_hand") {
-        session.secondHandReceived = true;
-        session.stage = "waiting_payment";
+    await sleep(delaySeconds * 1000);
 
-        await randomDelay(15, 20);
-
-        if (QR_IMAGE_URL) {
-          await sendImage(from, QR_IMAGE_URL);
-        }
-
-        await sendText(
-          from,
-          `ഇതിൽ ₹99 payment ചെയ്തോളൂ.
-
-Payment ചെയ്തതിന് ശേഷം സ്ക്രീൻഷോട്ട് ഇവിടെ അയച്ചാൽ മതി.`
-        );
-        return;
-      }
-
-      if (session.stage === "waiting_payment") {
-        session.paymentReceived = true;
-        session.stage = "payment_confirmed";
-
-        await randomDelay(5, 10);
-        await sendText(from, "ഒരു നിമിഷം.");
-
-        await randomDelay(5, 8);
-        await sendText(
-          from,
-          `Payment സ്ഥിരീകരിച്ചു.
-
-നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
-
-റിപ്പോർട്ട് ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കുന്നതാണ്.`
-        );
-
-        setTimeout(async () => {
-          try {
-            const report = await generateFinalAssessment(session);
-            await sendText(from, report);
-            session.stage = "completed";
-          } catch (err) {
-            console.error("Final report error:", err.message);
-          }
-        }, 30 * 60 * 1000);
-
-        return;
-      }
-
-      await sendText(from, "Name, Date of Birth, Gender ആദ്യം അയച്ചുതരാമോ?");
-      return;
+    if (result.action === "send_qr" && QR_IMAGE_URL) {
+      await sendImage(from, QR_IMAGE_URL);
+      await sleep(2000);
     }
 
-    if (message.type === "audio") {
-      await randomDelay(12, 18);
-      await sendText(
-        from,
-        "Voice note കിട്ടി. Name, Date of Birth, Gender text ആയി അയച്ചാൽ മതി."
-      );
-      return;
+    if (result.reply) {
+      await sendText(from, result.reply);
     }
 
-    await sendText(from, "Message കിട്ടി. Name, Date of Birth, Gender പറയാമോ?");
+    session.history.push({ role: "user", content: userMessage });
+    session.history.push({
+      role: "assistant",
+      content: result.reply || "",
+    });
   } catch (error) {
     console.error("Webhook error:", error.response?.data || error.message);
   }
