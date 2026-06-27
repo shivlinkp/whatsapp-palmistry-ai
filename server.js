@@ -69,6 +69,10 @@ app.get("/", (req, res) => {
   res.status(200).send("Palmistry WhatsApp bot is running ✅");
 });
 
+app.get("/qr.png", (req, res) => {
+  res.sendFile(path.resolve("qr.png"));
+});
+
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
