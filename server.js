@@ -448,7 +448,11 @@ app.post("/webhook", async (req, res) => {
         return;
       }
     }
-
+ if (session.palmPhotoReceived && !session.paymentRequested) {
+      await sleep(randomDelay(12, 18));
+      await sendPaymentRequest(from, session);
+      return;
+    }
     const missing = missingInfo(session);
 
     if (missing) {
@@ -456,12 +460,6 @@ app.post("/webhook", async (req, res) => {
       await sendText(from, missing);
       session.history.push({ role: "user", content: userMessage });
       session.history.push({ role: "assistant", content: missing });
-      return;
-    }
-
-    if (session.palmPhotoReceived && !session.paymentRequested) {
-      await sleep(randomDelay(12, 18));
-      await sendPaymentRequest(from, session);
       return;
     }
 
