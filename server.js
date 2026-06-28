@@ -393,8 +393,34 @@ app.post("/webhook", async (req, res) => {
       if (!userMessage) userMessage = "Voice note വ്യക്തമായി കിട്ടിയില്ല.";
       await extractFacts(session, userMessage);
     } else if (message.type === "image") {
-      userMessage = "Customer sent an image.";
-    } else {
+  if (session.paymentRequested) {
+    session.paymentScreenshotReceived = true;
+
+    await sleep(randomDelay(8, 12));
+    await sendText(from, "ഒരു നിമിഷം.");
+
+    await sleep(5000);
+    session.paymentConfirmed = true;
+
+    await sendText(
+      from,
+      `Payment സ്ഥിരീകരിച്ചു.
+
+നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
+
+റിപ്പോർട്ട് ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കുന്നതാണ്.`
+    );
+
+    scheduleAssessment(from, session);
+    return;
+  }
+
+  if (!session.palmPhotoReceived) {
+    session.palmPhotoReceived = true;
+  }
+
+  userMessage = "Customer sent an image.";
+} else {
       userMessage = `Customer sent ${message.type}.`;
     }
 
@@ -406,67 +432,23 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    async function sendPaymentRequest(to, session) {
-  if (session.paymentRequested) {
-    return;
-  }
-
-  session.paymentRequested = true;
-
-      if (session.paymentRequested && !session.paymentConfirmed) {
-        session.paymentScreenshotReceived = true;
-
-        await sleep(randomDelay(8, 12));
-        await sendText(from, "ഒരു നിമിഷം.");
-
-        await sleep(5000);
-        session.paymentConfirmed = true;
-
-        await sendText(
-          from,
-          `Payment സ്ഥിരീകരിച്ചു.
-
-നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
-
-റിപ്പോർട്ട് ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കുന്നതാണ്.`
-        );
-
-        scheduleAssessment(from, session);
-        return;
-      }
-    }
- if (session.palmPhotoReceived && !session.paymentRequested) {
-      await sleep(randomDelay(12, 18));
-      await sendPaymentRequest(from, session);
-      return;
-    }
+if (session.palmPhotoReceived && !session.paymentRequested) {
     const missing = missingInfo(session);
 
     if (missing) {
-      await sleep(randomDelay(12, 18));
-      await sendText(from, missing);
-      session.history.push({ role: "user", content: userMessage });
-      session.history.push({ role: "assistant", content: missing });
-      return;
-    }
-
-    if (!session.palmPhotoReceived) {
-      await sleep(randomDelay(12, 18));
-      const reply = handRequest(session);
-      await sendText(from, reply);
-      session.history.push({ role: "user", content: userMessage });
-      session.history.push({ role: "assistant", content: reply });
-      return;
-    }
-
-    if (session.paymentRequested && !session.paymentConfirmed) {
-      await sleep(randomDelay(12, 18));
-      await sendText(from, "Payment ചെയ്തതിന് ശേഷം സ്ക്രീൻഷോട്ട് ഇവിടെ അയച്ചാൽ മതി.");
-      return;
+        await sleep(randomDelay(12, 18));
+        await sendText(from, missing);
+        session.history.push({ role: "user", content: userMessage });
+        session.history.push({ role: "assistant", content: missing });
+        return;
     }
 
     await sleep(randomDelay(12, 18));
-    const reply = await humanReply(session, userMessage);
+    await sendPaymentRequest(from, session);
+    return;
+}
+
+      const reply = await humanReply(session, userMessage);
     await sendText(from, reply);
 
     session.history.push({ role: "user", content: userMessage });
