@@ -406,29 +406,12 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    if (message.type === "image") {
-      if (session.paymentRequested) {
+    async function sendPaymentRequest(to, session) {
+  if (session.paymentRequested) {
     return;
-}
-      if (!session.palmPhotoReceived && !session.paymentRequested && !session.paymentConfirmed) {
-        session.palmPhotoReceived = true;
+  }
 
-        await sleep(randomDelay(12, 18));
-
-        const missing = missingInfo(session);
-        if (missing) {
-          await sendText(
-            from,
-            `കൈയുടെ ഫോട്ടോ ലഭിച്ചു.
-
-വിശകലനം ആരംഭിക്കാൻ Name, Date of Birth, Gender കൂടി അയച്ചുതരാമോ?`
-          );
-          return;
-        }
-
-        await sendPaymentRequest(from, session);
-        return;
-      }
+  session.paymentRequested = true;
 
       if (session.paymentRequested && !session.paymentConfirmed) {
         session.paymentScreenshotReceived = true;
