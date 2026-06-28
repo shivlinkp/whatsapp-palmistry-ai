@@ -236,10 +236,18 @@ function handRequest(session) {
 async function sendPaymentRequest(to, session) {
   session.paymentRequested = true;
 
+ try {
   if (QR_IMAGE_URL) {
+    console.log("Sending QR:", QR_IMAGE_URL);
     await sendImage(to, QR_IMAGE_URL);
+    console.log("QR sent successfully");
     await sleep(2000);
+  } else {
+    console.log("QR_IMAGE_URL is empty");
   }
+} catch (err) {
+  console.error("QR Error:", err.response?.data || err.message);
+}
 
   await sendText(
     to,
