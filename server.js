@@ -234,6 +234,10 @@ function handRequest(session) {
 }
 
 async function sendPaymentRequest(to, session) {
+  if (session.paymentRequested) {
+    return;
+  }
+
   session.paymentRequested = true;
 
  try {
