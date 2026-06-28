@@ -403,6 +403,9 @@ app.post("/webhook", async (req, res) => {
     }
 
     if (message.type === "image") {
+      if (session.paymentRequested) {
+    return;
+}
       if (!session.palmPhotoReceived && !session.paymentRequested && !session.paymentConfirmed) {
         session.palmPhotoReceived = true;
 
