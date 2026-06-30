@@ -1,3 +1,5 @@
+import { isValidMessage } from "../utils/inputGuard.js";
+
 export async function handleFlow({
   message,
   session,
@@ -7,46 +9,84 @@ export async function handleFlow({
   extractFacts,
   sendPaymentRequest,
   handRequest,
-  humanReply
+  humanReply,
+  sessionMissingInfo
 }) {
+
   let userMessage = "";
 
-  // 1. Extract message
+  // Extract text
   if (message.type === "text") {
-    userMessage = message.text?.body || "";
+    userMessage = message.text?.body?.trim() || "";
   }
 
-  // 2. Update session
+  // Reset reply flag for this message
   session.replied = false;
 
-  // 3. Intent detection
+  // Ignore invalid messages
+  if (!isValidMessage(userMessage)) {
+    await safeReply(
+      from,
+      session,
+      "ക്ഷമിക്കണം, സന്ദേശം മനസ്സിലായില്ല. ദയവായി വ്യക്തമായി എഴുതൂ."
+    );
+    return;
+  }
+
+  // Learn facts from user message
+  await extractFacts(session, userMessage);
+
+  // Detect intent
   const intent = detectIntent(userMessage);
 
-  // 4. GREETING FLOW (clean exit)
+  // Greeting
   if (intent === "GREETING" && session.history.length === 0) {
-    await safeReply(from, session, "Hi ߑ How can I help you today?");
-    session.replied = true;
+    await safeReply(
+      from,
+      session,
+      "നമസ്കാരം ߘ ഞാൻ നിങ്ങളുടെ കൈരേഖാ വിശകലനത്തിനായി സഹായിക്കാം."
+    );
     return;
   }
 
-  // 5. PAYMENT FLOW
+  // Waiting for payment
   if (session.paymentRequested && !session.paymentConfirmed) {
     await sendPaymentRequest(from, session);
-    session.replied = true;
     return;
   }
 
-  // 6. MISSING INFO FLOW
+  // Missing information
   const missing = sessionMissingInfo(session);
+
   if (missing) {
     await safeReply(from, session, missing);
-    session.replied = true;
     return;
   }
 
-  // 7. NORMAL AI RESPONSE
+  // Ask for palm photo
+  if (!session.palmPhotoReceived) {
+    await safeReply(
+      from,
+      session,
+      handRequest(session)
+    );
+    return;
+  }
+
+  // AI reply
   const reply = await humanReply(session, userMessage);
 
   await safeReply(from, session, reply);
-  session.replied = true;
+
+  // Save history
+  session.history.push({
+    role: "user",
+    content: userMessage
+  });
+
+  session.history.push({
+    role: "assistant",
+    content: reply
+  });
+
 }
