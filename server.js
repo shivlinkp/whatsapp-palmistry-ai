@@ -446,15 +446,25 @@ app.post("/webhook", async (req, res) => {
 
 if (session.palmPhotoReceived && !session.paymentRequested) {
     const missing = missingInfo(session);
+if (missing) {
 
-    if (missing) {
-        await sleep(randomDelay(12, 18));
-        await sendText(from, missing);
-        session.history.push({ role: "user", content: userMessage });
-        session.history.push({ role: "assistant", content: missing });
-        return;
-    }
+  // If user already asked something else, don't interrupt blindly
+  const lastIntent = session.lastIntent || "";
 
+  if (lastIntent === "ASK_PAYMENT") {
+    await sendText(from, "₹99 payment ചെയ്തോളൂ. Payment ചെയ്ത ശേഷം screenshot അയക്കുക.");
+  }
+
+  else if (lastIntent === "ASK_PHOTO") {
+    await sendText(from, handRequest(session));
+  }
+
+  else {
+    await sendText(from, missing);
+  }
+
+  return;
+}
     await sleep(randomDelay(12, 18));
     await sendPaymentRequest(from, session);
     return;
