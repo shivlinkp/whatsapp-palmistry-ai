@@ -65,6 +65,20 @@ function getSession(phone) {
   return sessions.get(phone);
 }
 
+function detectIntent(text) {
+  const t = text.toLowerCase();
+
+  if (t.includes("hi") || t.includes("hello") || t.includes("hai")) {
+    return "GREETING";
+  }
+
+  if (t.includes("price") || t.includes("₹") || t.includes("cost")) {
+    return "PRICE";
+  }
+
+  return "NORMAL";
+}
+
 app.get("/", (req, res) => {
   res.status(200).send("Palmistry WhatsApp bot is running ✅");
 });
