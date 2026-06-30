@@ -60,10 +60,18 @@ function getSession(phone) {
       paymentConfirmed: false,
       reportSent: false,
       history: []
+      replied: false,
+      
     });
   }
-  return sessions.get(phone);
+
+async function safeReply(from, session, text) {
+  if (session.replied) return;
+
+  session.replied = true;
+  await safereply(from, session, text);
 }
+ 
 
 function detectIntent(text) {
   const t = text.toLowerCase();
@@ -99,7 +107,7 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-async function sendText(to, body) {
+async function  safereply(to, session, body) {
   if (!body) return;
 
   await axios.post(
@@ -279,8 +287,8 @@ async function sendPaymentRequest(to, session) {
   console.error("QR Error:", err.response?.data || err.message);
 }
 
-  await sendText(
-    to,
+  await  safereply(
+    to,session,
     `ഇതിൽ ₹99 payment ചെയ്തോളൂ.
 
 Payment ചെയ്തതിന് ശേഷം സ്ക്രീൻഷോട്ട് ഇവിടെ അയച്ചാൽ മതി.`
@@ -388,7 +396,7 @@ function scheduleAssessment(to, session) {
     try {
       if (session.reportSent) return;
       const report = await generateAssessment(session);
-      await sendText(to, report);
+      await  safereply(to,session report);
       session.reportSent = true;
     } catch (e) {
       console.error("Report error:", e.message);
@@ -407,13 +415,16 @@ app.post("/webhook", async (req, res) => {
 
     const from = message.from;
     const session = getSession(from);
+    session.replied = false;
 
     let userMessage = "";
 
     if (message.type === "text") {
       userMessage = message.text?.body || "";
       await extractFacts(session, userMessage);
-    } else if (message.type === "audio") {
+    } 
+    const intent = detectIntent(userMessage);
+    else if (message.type === "audio") {
       const audioId = message.audio?.id;
       userMessage = audioId ? await transcribeAudio(audioId) : "";
       if (!userMessage) userMessage = "Voice note വ്യക്തമായി കിട്ടിയില്ല.";
@@ -423,13 +434,13 @@ app.post("/webhook", async (req, res) => {
     session.paymentScreenshotReceived = true;
 
     await sleep(randomDelay(8, 12));
-    await sendText(from, "ഒരു നിമിഷം.");
+    await  safereply(from,session, "ഒരു നിമിഷം.");
 
     await sleep(5000);
     session.paymentConfirmed = true;
 
-    await sendText(
-      from,
+    await  safereply(
+      from, session,
       `Payment സ്ഥിരീകരിച്ചു.
 
 നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
@@ -452,7 +463,7 @@ app.post("/webhook", async (req, res) => {
 
     if (message.type === "text" && isGreeting(userMessage) && session.history.length === 0) {
       await sleep(randomDelay(1, 2));
-      await sendText(from, WELCOME);
+      await  safereply(from,session, WELCOME);
       session.history.push({ role: "user", content: userMessage });
       session.history.push({ role: "assistant", content: WELCOME });
       return;
@@ -466,15 +477,15 @@ if (missing) {
   const lastIntent = session.lastIntent || "";
 
   if (lastIntent === "ASK_PAYMENT") {
-    await sendText(from, "₹99 payment ചെയ്തോളൂ. Payment ചെയ്ത ശേഷം screenshot അയക്കുക.");
+    await  safereply(from,session,"₹99 payment ചെയ്തോളൂ. Payment ചെയ്ത ശേഷം screenshot അയക്കുക.");
   }
 
   else if (lastIntent === "ASK_PHOTO") {
-    await sendText(from, handRequest(session));
+    await  safereply(from,session, handRequest(session));
   }
 
   else {
-    await sendText(from, missing);
+    await  safereply(from,session, missing);
   }
 
   return;
@@ -485,7 +496,7 @@ if (missing) {
 }
 
       const reply = await humanReply(session, userMessage);
-    await sendText(from, reply);
+    await  safereply(from,session,reply);
 
     session.history.push({ role: "user", content: userMessage });
     session.history.push({ role: "assistant", content: reply });
