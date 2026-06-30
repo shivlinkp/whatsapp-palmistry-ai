@@ -417,32 +417,7 @@ app.post("/webhook", async (req, res) => {
     const session = getSession(from);
     session.replied = false;
 
-    let userMessage = "";
-
-    if (message.type === "text") {
-      userMessage = message.text?.body || "";
-      await extractFacts(session, userMessage);
-    } 
-    const intent = detectIntent(userMessage);
-    else if (message.type === "audio") {
-      const audioId = message.audio?.id;
-      userMessage = audioId ? await transcribeAudio(audioId) : "";
-      if (!userMessage) userMessage = "Voice note വ്യക്തമായി കിട്ടിയില്ല.";
-      await extractFacts(session, userMessage);
-    } else if (message.type === "image") {
-  if (session.paymentRequested) {
-    session.paymentScreenshotReceived = true;
-
-    await sleep(randomDelay(8, 12));
-    await  safereply(from,session, "ഒരു നിമിഷം.");
-
-    await sleep(5000);
-    session.paymentConfirmed = true;
-
-    await  safereply(
-      from, session,
-      `Payment സ്ഥിരീകരിച്ചു.
-
+    
 നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
 
 റിപ്പോർട്ട് ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കുന്നതാണ്.`
