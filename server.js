@@ -87,6 +87,9 @@ async function sendWhatsAppRequest(payload) {
   const delay = randomHumanDelayMs();
   log(`Waiting ${(delay / 1000).toFixed(1)}s before sending (human-like delay)`);
   await new Promise((resolve) => setTimeout(resolve, delay));
+
+  log("Outgoing WhatsApp API payload:", JSON.stringify(payload));
+
   try {
     const res = await fetch(GRAPH_URL, {
       method: "POST",
@@ -96,55 +99,94 @@ async function sendWhatsAppRequest(payload) {
       },
       body: JSON.stringify(payload),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      log("WhatsApp API error:", JSON.stringify(data));
+
+    const rawText = await res.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      data = { rawText };
     }
-    return data;
+
+    log("WhatsApp API HTTP status:", res.status);
+    log("WhatsApp API full response:", JSON.stringify(data));
+
+    return { httpStatus: res.status, ok: res.ok, data };
   } catch (err) {
-    log("WhatsApp send failed:", err.message);
-    return null;
+    log("WhatsApp send network error:", err.message);
+    return { httpStatus: null, ok: false, data: null, networkError: err.message };
   }
 }
 
 async function sendText(to, body) {
   log("Sending text to", to, "->", body.slice(0, 60).replace(/\n/g, " "));
-  return sendWhatsAppRequest({
+  const result = await sendWhatsAppRequest({
     messaging_product: "whatsapp",
     to,
     type: "text",
     text: { body },
   });
+  return result?.ok === true;
 }
 
+// Sends an image by link, following Meta's documented schema exactly:
+// https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages#image-messages
+// Returns true ONLY if Meta's response confirms acceptance (HTTP 2xx + a
+// real message id in response.messages[0].id). Returns false otherwise —
+// callers must NOT proceed to the next step in the flow if this is false.
 async function sendImageByUrl(to, link, caption) {
   if (!link || !/^https?:\/\//i.test(link)) {
     log(
       `QR image NOT sent — QR_IMAGE_URL is missing or invalid. Current value: "${link}"`
     );
-    return null;
+    return false;
   }
 
-  log("Sending QR/image to", to, "-> link:", link);
   const payload = {
     messaging_product: "whatsapp",
+    recipient_type: "individual",
     to,
     type: "image",
     image: caption ? { link, caption } : { link },
   };
 
-  const data = await sendWhatsAppRequest(payload);
+  log("Sending QR image to", to, "-> link:", link);
 
-  if (!data || data.error) {
-    log(
-      "QR image send FAILED. Meta API error:",
-      JSON.stringify(data?.error || "no response from sendWhatsAppRequest")
-    );
-  } else {
-    log("QR image sent successfully:", JSON.stringify(data.messages || data));
+  const result = await sendWhatsAppRequest(payload);
+
+  if (!result || result.networkError) {
+    log("QR image send FAILED — network error:", result?.networkError || "unknown");
+    return false;
   }
 
-  return data;
+  if (!result.ok) {
+    log(
+      "QR image REJECTED by Meta. HTTP status:",
+      result.httpStatus,
+      "Full response:",
+      JSON.stringify(result.data)
+    );
+    return false;
+  }
+
+  const wamid = result.data?.messages?.[0]?.id;
+  if (!wamid) {
+    log(
+      "QR image response was HTTP",
+      result.httpStatus,
+      "but contained no message id — treating as failure. Full response:",
+      JSON.stringify(result.data)
+    );
+    return false;
+  }
+
+  log(
+    "QR image ACCEPTED by Meta. HTTP status:",
+    result.httpStatus,
+    "wamid:",
+    wamid
+  );
+  return true;
 }
 
 // Splits long text into WhatsApp-safe chunks (~4000 char limit), breaking on
@@ -220,6 +262,9 @@ const PHOTO_RECEIVED_PAYMENT_MESSAGE = `ഫോട്ടോ ലഭിച്ചു
 താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്യുക.
 
 Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`;
+
+const QR_FAILURE_MESSAGE =
+  "QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ.";
 
 function paymentReceivedMessage(name) {
   return `Payment screenshot ലഭിച്ചു. നന്ദി ${name}.
@@ -514,6 +559,19 @@ async function handleTextMessage(phone, text, session) {
     if (faqAnswer) {
       await sendText(phone, faqAnswer);
     }
+
+    if (session.palmMediaId) {
+      // Photo was already received but QR sending failed earlier — retry now.
+      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+      if (qrSent) {
+        session.stage = "awaiting_payment";
+        await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
+      } else {
+        await sendText(phone, QR_FAILURE_MESSAGE);
+      }
+      return;
+    }
+
     await sendText(
       phone,
       `ദയവായി നിങ്ങളുടെ ${
@@ -598,9 +656,22 @@ async function handleImageMessage(phone, mediaId, session) {
 
   if (session.stage === "awaiting_photo") {
     session.palmMediaId = mediaId;
-    session.stage = "awaiting_payment";
 
-    await sendImageByUrl(phone, QR_IMAGE_URL, "");
+    const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+    if (!qrSent) {
+      log(
+        "QR image failed to send to",
+        phone,
+        "— NOT sending payment message. Staying in awaiting_photo for retry."
+      );
+      await sendText(phone, QR_FAILURE_MESSAGE);
+      // Stage stays "awaiting_photo"; palmMediaId is already saved so the
+      // next incoming message from this customer retries the QR send
+      // instead of asking them to resend the photo.
+      return;
+    }
+
+    session.stage = "awaiting_payment";
     await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
     return;
   }
