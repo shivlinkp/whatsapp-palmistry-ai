@@ -1,139 +1,130 @@
 import { extractFacts } from "../utils/extractFacts.js";
 import { isValidMessage } from "../utils/inputGuard.js";
 
-/* ---------------- SESSION MISSING INFO ---------------- */
-
-function sessionMissingInfo(session) {
-  if (!session.name) return "Name പറയാമോ?";
-  if (!session.dob) return "Date of Birth പറയാമോ?";
-  if (!session.gender) return "Gender പറയാമോ?";
-  return "";
-}
-
-/* ---------------- HAND REQUEST ---------------- */
-
-function getHandRequest(session) {
-  if (session.gender === "male") {
-    return "ദയവായി നിങ്ങളുടെ വലത് കൈയുടെ വ്യക്തമായ ഫോട്ടോ അയക്കൂ ߓ";
-  }
-  return "ദയവായി നിങ്ങളുടെ ഇടത് കൈയുടെ വ്യക്തമായ ഫോട്ടോ അയക്കൂ ߓ";
-}
-
-/* ---------------- MAIN FLOW ---------------- */
-
 export async function handleFlow({
   message,
   session,
   from,
-  detectIntent,
   safeReply,
   sendPaymentRequest,
+  handRequest,
   humanReply
 }) {
-  let userMessage = "";
 
-  /* Extract text */
+  let text = "";
+
   if (message.type === "text") {
-    userMessage = message.text?.body?.trim() || "";
+    text = message.text?.body?.trim() || "";
   }
-
-  if (!session.history) session.history = [];
 
   session.replied = false;
 
-  /* Validate message */
-  if (!isValidMessage(userMessage)) {
-    await safeReply(
-      from,
-      session,
-      "ക്ഷമിക്കണം ߙ ദയവായി വ്യക്തമായി എഴുതൂ."
-    );
+  if (!isValidMessage(text)) {
+    await safeReply(from, session, "ദയവായി ശരിയായ message അയക്കൂ ߙ");
     return;
   }
 
-  /* Extract facts (IMPORTANT FIX) */
-  extractFacts(session, userMessage);
+  // Save facts
+  extractFacts(session, text);
 
-  /* Detect intent */
-  const intent = detectIntent(userMessage);
+  const isFirstMessage = session.step === undefined;
 
-  /* ---------------- GREETING ---------------- */
-  if (intent === "GREETING" && session.history.length === 0) {
-    await safeReply(
-      from,
-      session,
-`Hi ߑ
+  // STEP SYSTEM (IMPORTANT FIX)
+  if (!session.step) session.step = "WELCOME";
+
+  /* ---------------- WELCOME ---------------- */
+  if (session.step === "WELCOME") {
+
+    session.step = "GET_NAME";
+
+    await safeReply(from, session, `Hi ߑ
 
 ₹99 കൈരേഖാ വിശകലനത്തിൽ നിങ്ങൾക്ക് ലഭിക്കുന്നത്:
 
-ߔ നിങ്ങളുടെ സ്വഭാവവും വ്യക്തിത്വവും
-
-❤️ സ്നേഹവും ബന്ധങ്ങളും
-
-ߒ വിവാഹ സാധ്യതകളും കുടുംബജീവിതവും
-
-ߒ ജോലി, കരിയർ, ബിസിനസ് സാധ്യതകൾ
-
-ߒ സാമ്പത്തിക വളർച്ചയും ധനകാര്യ സൂചനകളും
-
-ߌ ഭാവിയിലെ പ്രധാന അവസരങ്ങളും വെല്ലുവിളികളും
-
-ߓ നിങ്ങളുടെ കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ
+ߔ നിങ്ങളുടെ സ്വഭാവവും വ്യക്തിത്വവും  
+❤️ സ്നേഹവും ബന്ധങ്ങളും  
+ߒ വിവാഹ സാധ്യതകളും കുടുംബജീവിതവും  
+ߒ ജോലി, കരിയർ, ബിസിനസ് സാധ്യതകൾ  
+ߒ സാമ്പത്തിക വളർച്ചയും ധനകാര്യ സൂചനകളും  
+ߌ ഭാവിയിലെ പ്രധാന അവസരങ്ങളും വെല്ലുവിളികളും  
+ߓ നിങ്ങളുടെ കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ  
 
 ✍ߏ Name, Date of Birth, Gender പറയാമോ?
 
-✨ ഫീസ്: ₹99 മാത്രം.`
-    );
-
-    session.history.push({ role: "assistant", content: "welcome" });
-    return;
-  }
-
-  /* ---------------- MISSING INFO ---------------- */
-  const missing = sessionMissingInfo(session);
-  if (missing) {
-    await safeReply(from, session, missing);
-    return;
-  }
-
-  /* ---------------- PALM PHOTO ---------------- */
-  if (!session.palmPhotoReceived) {
-    session.palmPhotoReceived = true;
-
-    await safeReply(from, session, getHandRequest(session));
-    return;
-  }
-
-  /* ---------------- PAYMENT FLOW ---------------- */
-  if (!session.paymentRequested) {
-    session.paymentRequested = true;
-
-    await sendPaymentRequest(from, session);
-
-    await safeReply(
-      from,
-      session,
-      "Payment ചെയ്ത ശേഷം screenshot ഇവിടെ അയക്കൂ ߙ"
-    );
+✨ ഫീസ്: ₹99 മാത്രം.`);
 
     return;
   }
 
-  /* ---------------- PAYMENT WAIT ---------------- */
-  if (!session.paymentConfirmed) {
-    await safeReply(
-      from,
-      session,
-      "Payment screenshot ലഭിച്ചു. പരിശോധിക്കുന്നു... ⏳"
-    );
+  /* ---------------- NAME STEP ---------------- */
+  if (session.step === "GET_NAME") {
+
+    if (!session.name) {
+      session.name = text;
+      await safeReply(from, session, "Date of Birth പറയാമോ? (DD/MM/YYYY)");
+      session.step = "GET_DOB";
+      return;
+    }
+  }
+
+  /* ---------------- DOB STEP ---------------- */
+  if (session.step === "GET_DOB") {
+
+    if (!session.dob) {
+      session.dob = text;
+      await safeReply(from, session, "Gender പറയാമോ? (Male / Female)");
+      session.step = "GET_GENDER";
+      return;
+    }
+  }
+
+  /* ---------------- GENDER STEP ---------------- */
+  if (session.step === "GET_GENDER") {
+
+    if (!session.gender) {
+      session.gender = text.toLowerCase();
+
+      await safeReply(
+        from,
+        session,
+        "നന്ദി ߙ\n\nഇപ്പോൾ നിങ്ങളുടെ കൈയുടെ clear photo അയക്കൂ (Right/Left hand)"
+      );
+
+      session.step = "WAIT_PHOTO";
+      return;
+    }
+  }
+
+  /* ---------------- WAIT PHOTO ---------------- */
+  if (session.step === "WAIT_PHOTO") {
+
+    if (message.type === "image") {
+
+      session.palmPhotoReceived = true;
+
+      await sendPaymentRequest(from, session);
+
+      await safeReply(
+        from,
+        session,
+        "ߓ Payment received ചെയ്ത ശേഷം 25–30 minutes കാത്തിരിക്കൂ. Report തയ്യാറാക്കുന്നു..."
+      );
+
+      session.step = "WAIT_PAYMENT";
+      return;
+    }
+
+    await safeReply(from, session, "ദയവായി hand photo അയക്കൂ ߙ");
     return;
   }
 
-  /* ---------------- AI RESPONSE ---------------- */
-  const reply = await humanReply(session, userMessage);
+  /* ---------------- PAYMENT STEP ---------------- */
+  if (session.step === "WAIT_PAYMENT") {
 
-  await safeReply(from, session, reply);
+    await safeReply(from, session, "Payment screenshot കിട്ടിയാൽ report process തുടങ്ങും.");
+    return;
+  }
 
-  session.history.push({ role: "user", content: userMessage });
-  session.history.push({ role: "assistant", content: reply });
+  /* ---------------- DEFAULT ---------------- */
+  await safeReply(from, session, "OK ߑ");
 }
