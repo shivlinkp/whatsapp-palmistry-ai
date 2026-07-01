@@ -18,17 +18,23 @@ const WELCOME = `Hi ߑ
 
 ₹99 കൈരേഖാ വിശകലനത്തിൽ നിങ്ങൾക്ക് ലഭിക്കുന്നത്:
 
-- നിങ്ങളുടെ സ്വഭാവവും വ്യക്തിത്വവും
-- സ്നേഹവും ബന്ധങ്ങളും
-- വിവാഹ സാധ്യതകളും കുടുംബജീവിതവും
-- ജോലി, കരിയർ, ബിസിനസ് സാധ്യതകൾ
-- സാമ്പത്തിക വളർച്ചയും ധനകാര്യ സൂചനകളും
-- ഭാവിയിലെ പ്രധാന അവസരങ്ങളും വെല്ലുവിളികളും
-- നിങ്ങളുടെ കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ
+ߔ നിങ്ങളുടെ സ്വഭാവവും വ്യക്തിത്വവും
 
-Name, Date of Birth, Gender പറയാമോ?
+❤️ സ്നേഹവും ബന്ധങ്ങളും
 
-ഫീസ്: ₹99 മാത്രം.`;
+ߒ വിവാഹ സാധ്യതകളും കുടുംബജീവിതവും
+
+ߒ ജോലി, കരിയർ, ബിസിനസ് സാധ്യതകൾ
+
+ߒ സാമ്പത്തിക വളർച്ചയും ധനകാര്യ സൂചനകളും
+
+ߌ ഭാവിയിലെ പ്രധാന അവസരങ്ങളും വെല്ലുവിളികളും
+
+ߓ നിങ്ങളുടെ കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ
+
+✍ߏ Name, Date of Birth, Gender പറയാമോ?
+
+✨ ഫീസ്: ₹99 മാത്രം.`;
 
 function getSession(phone) {
   if (!sessions.has(phone)) {
@@ -43,11 +49,12 @@ function getSession(phone) {
       paymentConfirmed: false,
       assessmentScheduled: false,
       reportSent: false,
-      lastMessageId: "",
       report: "",
+      lastMessageId: "",
       history: []
     });
   }
+
   return sessions.get(phone);
 }
 
@@ -59,10 +66,25 @@ function randomMinutes(min, max) {
   return (Math.floor(Math.random() * (max - min + 1)) + min) * 60 * 1000;
 }
 
+function splitMessage(text, maxLength = 3500) {
+  const parts = [];
+  let remaining = text || "";
+
+  while (remaining.length > maxLength) {
+    let cut = remaining.lastIndexOf("\n", maxLength);
+    if (cut < 1000) cut = maxLength;
+    parts.push(remaining.slice(0, cut).trim());
+    remaining = remaining.slice(cut).trim();
+  }
+
+  if (remaining) parts.push(remaining);
+  return parts;
+}
+
 async function sendText(to, body) {
   if (!body) return;
 
-  const chunks = splitMessage(body, 3500);
+  const chunks = splitMessage(body);
 
   for (const chunk of chunks) {
     await axios.post(
@@ -82,7 +104,7 @@ async function sendText(to, body) {
       }
     );
 
-    await sleep(1000);
+    await sleep(800);
   }
 }
 
@@ -107,23 +129,6 @@ async function sendImage(to, imageUrl) {
   );
 }
 
-
-function splitMessage(text, maxLength) {
-  const parts = [];
-  let remaining = text;
-
-  while (remaining.length > maxLength) {
-    let cut = remaining.lastIndexOf("\n", maxLength);
-    if (cut < 1000) cut = maxLength;
-
-    parts.push(remaining.slice(0, cut).trim());
-    remaining = remaining.slice(cut).trim();
-  }
-
-  if (remaining) parts.push(remaining);
-  return parts;
-}
-
 function normalize(text = "") {
   return text.toLowerCase().trim();
 }
@@ -134,18 +139,30 @@ function isGreeting(text = "") {
 }
 
 function detectDob(text = "") {
-  const match = text.match(/\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/);
-  return match ? match[0] : "";
+  const match = text.match(/\b\d{1,2}[\/\-.,]\d{1,2}[\/\-.,]\d{2,4}\b/);
+  return match ? match[0].replace(/,/g, "-") : "";
 }
 
 function detectGender(text = "") {
   const t = normalize(text);
 
-  if (/\bfemale\b/.test(t) || /\bgirl\b/.test(t) || /\bwoman\b/.test(t) || t.includes("സ്ത്രീ") || t.includes("പെൺ")) {
+  if (
+    /\bfemale\b/.test(t) ||
+    /\bgirl\b/.test(t) ||
+    /\bwoman\b/.test(t) ||
+    t.includes("സ്ത്രീ") ||
+    t.includes("പെൺ")
+  ) {
     return "female";
   }
 
-  if (/\bmale\b/.test(t) || /\bboy\b/.test(t) || /\bman\b/.test(t) || t.includes("പുരുഷൻ") || t.includes("ആൺ")) {
+  if (
+    /\bmale\b/.test(t) ||
+    /\bboy\b/.test(t) ||
+    /\bman\b/.test(t) ||
+    t.includes("പുരുഷൻ") ||
+    t.includes("ആൺ")
+  ) {
     return "male";
   }
 
@@ -160,21 +177,21 @@ function detectName(text = "") {
     .replace(/\bboy\b/gi, "")
     .replace(/\bwoman\b/gi, "")
     .replace(/\bman\b/gi, "")
-    .replace(/\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}/g, "")
+    .replace(/\d{1,2}[\/\-.,]\d{1,2}[\/\-.,]\d{2,4}/g, "")
     .replace(/name[:\-]/gi, "")
     .replace(/dob[:\-]/gi, "")
+    .replace(/date of birth[:\-]/gi, "")
     .replace(/gender[:\-]/gi, "")
     .replace(/[,\|]/g, " ")
     .trim();
 
   const lower = normalize(cleaned);
-
   if (!cleaned) return "";
   if (isGreeting(cleaned)) return "";
   if (lower.includes("payment") || lower.includes("price") || lower.includes("fee")) return "";
 
   const words = cleaned.split(/\s+/).filter(Boolean);
-  if (words.length > 0 && words.length <= 3) return words.join(" ");
+  if (words.length >= 1 && words.length <= 3) return words.join(" ");
 
   return "";
 }
@@ -291,10 +308,7 @@ Important:
     messages: [
       {
         role: "user",
-        content: [
-          { type: "text", text: prompt },
-          ...imageContent
-        ]
+        content: [{ type: "text", text: prompt }, ...imageContent]
       }
     ]
   });
@@ -369,64 +383,99 @@ app.get("/webhook", (req, res) => {
 });
 
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200); // ALWAYS respond fast
+  res.sendStatus(200);
 
   try {
-    const value = req.body?.entry?.[0]?.changes?.[0]?.value;
-    const message = value?.messages?.[0];
-
+    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!message) return;
 
     const from = message.from;
     const session = getSession(from);
 
-    try {
-      // EVERYTHING SAFE WRAPPED
+    if (message.id && session.lastMessageId === message.id) return;
+    session.lastMessageId = message.id;
 
-      if (message.type === "text") {
-        const text = message.text?.body || "";
+    if (message.type === "text") {
+      const text = message.text?.body?.trim() || "";
+      if (!text) return;
 
-        session.history.push({ role: "user", content: text });
+      session.history.push({ role: "user", content: text });
 
-        if (!session.welcomed) {
-          session.welcomed = true;
-          await sendText(from, WELCOME);
-          return;
-        }
-
-        extractFacts(session, text);
-
-        const missing = missingInfo(session);
-        if (missing) {
-          await sendText(from, missing);
-          return;
-        }
-
-        if (!session.palmPhotoReceived) {
-          await sendText(from, handRequest(session));
-          return;
-        }
-
-        await sendText(from, "OK received. Processing...");
+      if (!session.welcomed) {
+        session.welcomed = true;
+        await sendText(from, WELCOME);
         return;
       }
 
-      if (message.type === "image") {
-        session.palmPhotoReceived = true;
+      extractFacts(session, text);
 
-        await sendText(from, "Image received. Thank you.");
+      const missing = missingInfo(session);
+      if (missing) {
+        await sendText(from, missing);
+        return;
+      }
+
+      if (!session.palmPhotoReceived) {
+        await sendText(from, handRequest(session));
+        return;
+      }
+
+      if (session.paymentRequested && !session.paymentConfirmed) {
+        await sendText(from, "Payment ചെയ്ത ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.");
+        return;
+      }
+
+      if (session.paymentConfirmed && !session.reportSent) {
+        await sendText(from, "Report തയ്യാറാക്കിക്കൊണ്ടിരിക്കുകയാണ്. ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ലഭിക്കും.");
+        return;
+      }
+
+      if (session.reportSent) {
+        const reply = await followUpReply(session, text);
+        await sendText(from, reply);
+        return;
+      }
+
+      await sendText(from, "ശരി. തുടരാൻ നിങ്ങളുടെ കൈയുടെ ഫോട്ടോ അയക്കൂ.");
+      return;
+    }
+
+    if (message.type === "image") {
+      const imageId = message.image?.id || "";
+
+      if (!session.palmPhotoReceived) {
+        session.palmPhotoReceived = true;
+        session.palmPhotoMediaId = imageId;
+
+        await sendText(from, "ഫോട്ടോ ലഭിച്ചു. നന്ദി.");
+        await sleep(1500);
         await sendPaymentRequest(from, session);
+        return;
+      }
+
+      if (session.paymentRequested && !session.paymentConfirmed) {
+        session.paymentConfirmed = true;
+
+        await sendText(
+          from,
+          `Payment screenshot ലഭിച്ചു. നന്ദി ${session.name || ""}.
+
+നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
+
+Report ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും.`
+        );
 
         scheduleAssessment(from, session);
         return;
       }
 
-    } catch (err) {
-      console.error("INNER FLOW ERROR:", err);
+      await sendText(from, "Image ലഭിച്ചു.");
+      return;
     }
 
-  } catch (err) {
-    console.error("WEBHOOK CRASH SAFE BLOCK:", err);
+    await sendText(from, "Text അല്ലെങ്കിൽ image ആയി അയക്കാമോ?");
+  } catch (error) {
+    console.error("Webhook error:", error.response?.data || error.message);
   }
 });
 
