@@ -69,9 +69,8 @@ async function safeReply(from, session, text) {
   if (session.replied) return;
 
   session.replied = true;
-  await safereply(from, session, text);
+  await sendText(from, text);
 }
- 
 
 function detectIntent(text) {
   const t = text.toLowerCase();
