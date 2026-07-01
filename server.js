@@ -416,11 +416,13 @@ app.post("/webhook", async (req, res) => {
     const session = getSession(from);
     session.replied = false;
 
-    
-നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
+   await safeReply(
+  from,
+  session,
+  `നിങ്ങളുടെ കൈവിവരങ്ങൾ പരിശോധിക്കുന്നു.
 
-റിപ്പോർട്ട് ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കുന്നതാണ്.`
-    );
+വിശദമായ റിപ്പോർട്ട് 30 മിനിറ്റിനുള്ളിൽ തയ്യാറാകും.`
+);
 
     scheduleAssessment(from, session);
     return;
@@ -437,7 +439,7 @@ app.post("/webhook", async (req, res) => {
 
     if (message.type === "text" && isGreeting(userMessage) && session.history.length === 0) {
       await sleep(randomDelay(1, 2));
-      await  safeReply(from,session, WELCOME);
+      await safeReply(from, session, "WELCOME MESSAGE HERE");
       session.history.push({ role: "user", content: userMessage });
       session.history.push({ role: "assistant", content: WELCOME });
       return;
