@@ -155,7 +155,6 @@ function detectDob(text = "") {
   const match = text.match(/\b\d{1,2}[\/\-.,]\d{1,2}[\/\-.,]\d{2,4}\b/);
   return match ? match[0].replace(/,/g, "-") : "";
 }
-
 function detectGender(text = "") {
   const t = normalize(text);
 
