@@ -1,12 +1,11 @@
 import express from "express";
 import axios from "axios";
 import OpenAI from "openai";
-import fs from "fs";
-import os from "os";
-import path from "path";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
+
+/* ---------------- ENV ---------------- */
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "palmistry_verify_123";
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
@@ -25,15 +24,12 @@ function getSession(phone) {
       name: "",
       dob: "",
       gender: "",
-      mainQuestion: "",
       palmPhotoReceived: false,
       paymentRequested: false,
-      paymentScreenshotReceived: false,
       paymentConfirmed: false,
       reportSent: false,
       history: [],
-      replied: false,
-      lastIntent: ""
+      replied: false
     });
   }
   return sessions.get(phone);
@@ -45,11 +41,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function randomDelay(min, max) {
-  return (Math.floor(Math.random() * (max - min + 1)) + min) * 1000;
-}
-
-/* ---------------- WHATSAPP SEND ---------------- */
+/* ---------------- SEND ---------------- */
 
 async function sendText(to, text) {
   if (!text) return;
@@ -71,8 +63,8 @@ async function sendText(to, text) {
   );
 }
 
-async function sendImage(to, imageUrl) {
-  if (!imageUrl) return;
+async function sendImage(to, url) {
+  if (!url) return;
 
   await axios.post(
     `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
@@ -80,7 +72,7 @@ async function sendImage(to, imageUrl) {
       messaging_product: "whatsapp",
       to,
       type: "image",
-      image: { link: imageUrl }
+      image: { link: url }
     },
     {
       headers: {
@@ -91,11 +83,10 @@ async function sendImage(to, imageUrl) {
   );
 }
 
-/* ---------------- SAFE REPLY (FIXED) ---------------- */
+/* ---------------- SAFE REPLY ---------------- */
 
 async function safeReply(from, session, text) {
   if (session.replied) return;
-
   session.replied = true;
   await sendText(from, text);
 }
@@ -107,17 +98,40 @@ function isGreeting(text) {
   return ["hi", "hello", "hai", "hey"].some(x => t.includes(x));
 }
 
-/* ---------------- BASIC FLOW HELPERS ---------------- */
+/* ---------------- USER DATA PARSER (IMPORTANT FIX) ---------------- */
 
-function missingInfo(session) {
-  if (!session.name) return "Name കൂടി പറയാമോ?";
-  if (!session.dob) return "Date of Birth കൂടി പറയാമോ?";
-  if (!session.gender) return "Gender പറയാമോ?";
-  return "";
+function extractUserData(text, session) {
+  if (!text) return;
+
+  // NAME
+  if (!session.name && /^[a-zA-Z ]{2,}$/.test(text)) {
+    session.name = text.trim();
+    return;
+  }
+
+  // DOB (very simple detection)
+  if (!session.dob && /\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(text)) {
+    session.dob = text.trim();
+    return;
+  }
+
+  // GENDER
+  const t = text.toLowerCase();
+  if (!session.gender) {
+    if (t.includes("male") || t.includes("female") || t.includes("m") || t.includes("f")) {
+      session.gender = text.trim();
+      return;
+    }
+  }
 }
 
-function handRequest(session) {
-  return `Please send your palm photo clearly.`;
+/* ---------------- MISSING INFO ---------------- */
+
+function missingInfo(session) {
+  if (!session.name) return "Name പറയാമോ?";
+  if (!session.dob) return "Date of Birth പറയാമോ?";
+  if (!session.gender) return "Gender പറയാമോ?";
+  return "";
 }
 
 /* ---------------- PAYMENT ---------------- */
@@ -133,17 +147,22 @@ async function sendPaymentRequest(to, session) {
 
   await sendText(
     to,
-    `₹99 payment ചെയ്യുക. Screenshot അയച്ചാൽ report process ചെയ്യും.`
+    `₹99 payment ചെയ്യുക.
+
+Screenshot അയച്ചാൽ analysis start ചെയ്യും.`
   );
 }
 
 /* ---------------- REPORT ---------------- */
 
-async function generateAssessment(session) {
-  const prompt = `Write Malayalam palm reading for:
-Name:${session.name}
-DOB:${session.dob}
-Gender:${session.gender}`;
+async function generateReport(session) {
+  const prompt = `
+Write a detailed Malayalam palm reading.
+
+Name: ${session.name}
+DOB: ${session.dob}
+Gender: ${session.gender}
+`;
 
   const res = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
@@ -154,12 +173,12 @@ Gender:${session.gender}`;
   return res.choices[0].message.content;
 }
 
-function scheduleAssessment(to, session) {
+async function scheduleReport(to, session) {
   setTimeout(async () => {
     try {
       if (session.reportSent) return;
 
-      const report = await generateAssessment(session);
+      const report = await generateReport(session);
       await sendText(to, report);
 
       session.reportSent = true;
@@ -186,7 +205,9 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
   try {
-    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const message =
+      req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+
     if (!message) return;
 
     const from = message.from;
@@ -195,38 +216,74 @@ app.post("/webhook", async (req, res) => {
 
     let userMessage = "";
 
+    /* ---------------- MESSAGE TYPE ---------------- */
+
     if (message.type === "text") {
       userMessage = message.text?.body || "";
     } else if (message.type === "image") {
-      userMessage = "Customer sent image";
+      userMessage = "image";
       session.palmPhotoReceived = true;
     } else {
-      userMessage = `Customer sent ${message.type}`;
+      userMessage = message.type;
     }
 
-    /* GREETING */
-    if (isGreeting(userMessage) && session.history.length === 0) {
-      await safeReply(from, session, "Hi ߑ Welcome!");
-      session.history.push(userMessage);
+    session.history.push(userMessage);
+
+    /* ---------------- GREETING ---------------- */
+
+    if (isGreeting(userMessage) && session.history.length === 1) {
+      await safeReply(
+        from,
+        session,
+        `Hi ߑ
+
+₹99 കൈരേഖാ വിശകലനത്തിൽ നിങ്ങൾക്ക് ലഭിക്കുന്നത്:
+
+ߔ നിങ്ങളുടെ സ്വഭാവവും വ്യക്തിത്വവും
+❤️ സ്നേഹവും ബന്ധങ്ങളും
+ߒ വിവാഹ സാധ്യതകളും കുടുംബജീവിതവും
+ߒ ജോലി, കരിയർ, ബിസിനസ് സാധ്യതകൾ
+ߒ സാമ്പത്തിക വളർച്ചയും ധനകാര്യ സൂചനകളും
+ߌ ഭാവിയിലെ പ്രധാന അവസരങ്ങളും വെല്ലുവിളികളും
+ߓ കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ
+
+✍ߏ Name, Date of Birth, Gender പറയാമോ?
+
+✨ ഫീസ്: ₹99 മാത്രം.`
+      );
       return;
     }
 
-    /* MISSING INFO */
+    /* ---------------- EXTRACT INFO ---------------- */
+
+    extractUserData(userMessage, session);
+
+    /* ---------------- MISSING INFO CHECK ---------------- */
+
     const missing = missingInfo(session);
     if (missing) {
       await safeReply(from, session, missing);
       return;
     }
 
-    /* PAYMENT FLOW */
-    if (session.palmPhotoReceived && !session.paymentRequested) {
-      await sendPaymentRequest(from, session);
-      scheduleAssessment(from, session);
+    /* ---------------- PALM PHOTO ---------------- */
+
+    if (!session.palmPhotoReceived) {
+      await safeReply(from, session, "ദയവായി നിങ്ങളുടെ കൈയുടെ ഫോട്ടോ അയയ്ക്കൂ ߓ");
       return;
     }
 
-    /* DEFAULT */
-    await safeReply(from, session, "OK received. Working on it...");
+    /* ---------------- PAYMENT FLOW ---------------- */
+
+    if (!session.paymentRequested) {
+      await sendPaymentRequest(from, session);
+      await scheduleReport(from, session);
+      return;
+    }
+
+    /* ---------------- DEFAULT ---------------- */
+
+    await safeReply(from, session, "Received. Processing your report...");
 
   } catch (err) {
     console.error("Webhook error:", err.message);
