@@ -106,7 +106,7 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-async function  safereply(to, session, body) {
+async function  safeReply(to, session, body) {
   if (!body) return;
 
   await axios.post(
@@ -286,7 +286,7 @@ async function sendPaymentRequest(to, session) {
   console.error("QR Error:", err.response?.data || err.message);
 }
 
-  await  safereply(
+  await  safeReply(
     to,session,
     `ഇതിൽ ₹99 payment ചെയ്തോളൂ.
 
@@ -395,7 +395,7 @@ function scheduleAssessment(to, session) {
     try {
       if (session.reportSent) return;
       const report = await generateAssessment(session);
-      await  safereply(to,session report);
+      await  safeReply(to,session. report);
       session.reportSent = true;
     } catch (e) {
       console.error("Report error:", e.message);
@@ -437,7 +437,7 @@ app.post("/webhook", async (req, res) => {
 
     if (message.type === "text" && isGreeting(userMessage) && session.history.length === 0) {
       await sleep(randomDelay(1, 2));
-      await  safereply(from,session, WELCOME);
+      await  safeReply(from,session, WELCOME);
       session.history.push({ role: "user", content: userMessage });
       session.history.push({ role: "assistant", content: WELCOME });
       return;
@@ -451,15 +451,15 @@ if (missing) {
   const lastIntent = session.lastIntent || "";
 
   if (lastIntent === "ASK_PAYMENT") {
-    await  safereply(from,session,"₹99 payment ചെയ്തോളൂ. Payment ചെയ്ത ശേഷം screenshot അയക്കുക.");
+    await  safeReply(from,session,"₹99 payment ചെയ്തോളൂ. Payment ചെയ്ത ശേഷം screenshot അയക്കുക.");
   }
 
   else if (lastIntent === "ASK_PHOTO") {
-    await  safereply(from,session, handRequest(session));
+    await  safeReply(from,session, handRequest(session));
   }
 
   else {
-    await  safereply(from,session, missing);
+    await  safeReply(from,session, missing);
   }
 
   return;
@@ -470,7 +470,7 @@ if (missing) {
 }
 
       const reply = await humanReply(session, userMessage);
-    await  safereply(from,session,reply);
+    await  safeReply(from,session,reply);
 
     session.history.push({ role: "user", content: userMessage });
     session.history.push({ role: "assistant", content: reply });
