@@ -150,7 +150,7 @@ async function sendImageByUrl(to, link, caption) {
     image: caption ? { link, caption } : { link },
   };
 
-  log("Sending QR image to", to, "-> link:", link);
+  log("Sending QR image (by link) to", to, "-> link:", link);
 
   const result = await sendWhatsAppRequest(payload);
 
@@ -181,12 +181,147 @@ async function sendImageByUrl(to, link, caption) {
   }
 
   log(
-    "QR image ACCEPTED by Meta. HTTP status:",
+    "QR image (by link) ACCEPTED by Meta. HTTP status:",
     result.httpStatus,
     "wamid:",
     wamid
   );
   return true;
+}
+
+// Downloads the QR image from its hosting URL and uploads the raw bytes
+// directly to Meta's /media endpoint, returning a media_id. This removes
+// Meta's dependency on fetching the image from an external host at
+// send-time — the root-cause fix for "accepted (200 + wamid) but never
+// delivered" image sends.
+async function uploadMediaToMeta(imageUrl) {
+  if (!imageUrl || !/^https?:\/\//i.test(imageUrl)) {
+    log(`Media upload skipped — QR_IMAGE_URL is missing or invalid: "${imageUrl}"`);
+    return null;
+  }
+
+  try {
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) {
+      log(
+        "Media upload: failed to download QR image from",
+        imageUrl,
+        "-> HTTP",
+        imgRes.status
+      );
+      return null;
+    }
+    const buffer = await imgRes.buffer();
+    const contentType = imgRes.headers.get("content-type") || "image/png";
+    log(
+      "Downloaded QR image for upload:",
+      buffer.length,
+      "bytes, content-type:",
+      contentType
+    );
+
+    const form = new FormData();
+    form.append("messaging_product", "whatsapp");
+    form.append("file", new Blob([buffer], { type: contentType }), "qr.png");
+
+    const uploadRes = await globalThis.fetch(
+      `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/media`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+        body: form,
+      }
+    );
+    const uploadText = await uploadRes.text();
+    let uploadData;
+    try {
+      uploadData = JSON.parse(uploadText);
+    } catch {
+      uploadData = { rawText: uploadText };
+    }
+
+    log("Media upload HTTP status:", uploadRes.status);
+    log("Media upload full response:", JSON.stringify(uploadData));
+
+    if (!uploadRes.ok || !uploadData.id) {
+      log("Media upload FAILED — no media id returned.");
+      return null;
+    }
+
+    log("Media upload SUCCEEDED — media_id:", uploadData.id);
+    return uploadData.id;
+  } catch (err) {
+    log("Media upload crashed (caught):", err.message);
+    return null;
+  }
+}
+
+async function sendImageByMediaId(to, mediaId, caption) {
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to,
+    type: "image",
+    image: caption ? { id: mediaId, caption } : { id: mediaId },
+  };
+
+  log("Sending QR image (by media_id) to", to, "-> media_id:", mediaId);
+
+  const result = await sendWhatsAppRequest(payload);
+
+  if (!result || result.networkError) {
+    log(
+      "QR image (by media_id) send FAILED — network error:",
+      result?.networkError || "unknown"
+    );
+    return false;
+  }
+
+  if (!result.ok) {
+    log(
+      "QR image (by media_id) REJECTED by Meta. HTTP status:",
+      result.httpStatus,
+      "Full response:",
+      JSON.stringify(result.data)
+    );
+    return false;
+  }
+
+  const wamid = result.data?.messages?.[0]?.id;
+  if (!wamid) {
+    log(
+      "QR image (by media_id) response was HTTP",
+      result.httpStatus,
+      "but contained no message id — treating as failure. Full response:",
+      JSON.stringify(result.data)
+    );
+    return false;
+  }
+
+  log(
+    "QR image (by media_id) ACCEPTED by Meta. HTTP status:",
+    result.httpStatus,
+    "wamid:",
+    wamid
+  );
+  return true;
+}
+
+// Primary QR-sending path: upload the image to Meta directly, then send by
+// media_id. Falls back to the old link-based method only if the upload
+// itself fails (e.g. Cloudinary temporarily unreachable) — link-based
+// sending is what we've confirmed gets accepted-but-not-delivered, so it's
+// a last resort, not the default anymore.
+async function sendQrImage(to) {
+  const mediaId = await uploadMediaToMeta(QR_IMAGE_URL);
+  if (mediaId) {
+    const sent = await sendImageByMediaId(to, mediaId, "");
+    if (sent) return true;
+    log("Send-by-media_id failed after successful upload — falling back to link method.");
+  } else {
+    log("Media upload failed — falling back to link method.");
+  }
+  return sendImageByUrl(to, QR_IMAGE_URL, "");
 }
 
 // Splits long text into WhatsApp-safe chunks (~4000 char limit), breaking on
@@ -562,7 +697,7 @@ async function handleTextMessage(phone, text, session) {
 
     if (session.palmMediaId) {
       // Photo was already received but QR sending failed earlier — retry now.
-      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+      const qrSent = await sendQrImage(phone);
       if (qrSent) {
         session.stage = "awaiting_payment";
         await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
@@ -657,7 +792,7 @@ async function handleImageMessage(phone, mediaId, session) {
   if (session.stage === "awaiting_photo") {
     session.palmMediaId = mediaId;
 
-    const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+    const qrSent = await sendQrImage(phone);
     if (!qrSent) {
       log(
         "QR image failed to send to",
