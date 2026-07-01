@@ -374,99 +374,64 @@ app.get("/webhook", (req, res) => {
 });
 
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // ALWAYS respond fast
 
   try {
-    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const value = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const message = value?.messages?.[0];
+
     if (!message) return;
 
     const from = message.from;
     const session = getSession(from);
 
-    if (message.id && session.lastMessageId === message.id) return;
-    session.lastMessageId = message.id;
+    try {
+      // EVERYTHING SAFE WRAPPED
 
-    if (message.type === "text") {
-      const text = message.text?.body?.trim() || "";
-      if (!text) return;
+      if (message.type === "text") {
+        const text = message.text?.body || "";
 
-      session.history.push({ role: "user", content: text });
+        session.history.push({ role: "user", content: text });
 
-      if (!session.welcomed) {
-        session.welcomed = true;
-        await sendText(from, WELCOME);
+        if (!session.welcomed) {
+          session.welcomed = true;
+          await sendText(from, WELCOME);
+          return;
+        }
+
+        extractFacts(session, text);
+
+        const missing = missingInfo(session);
+        if (missing) {
+          await sendText(from, missing);
+          return;
+        }
+
+        if (!session.palmPhotoReceived) {
+          await sendText(from, handRequest(session));
+          return;
+        }
+
+        await sendText(from, "OK received. Processing...");
         return;
       }
 
-      extractFacts(session, text);
-
-      const missing = missingInfo(session);
-      if (missing) {
-        await sendText(from, missing);
-        return;
-      }
-
-      if (!session.palmPhotoReceived) {
-        await sendText(from, handRequest(session));
-        return;
-      }
-
-      if (session.paymentRequested && !session.paymentConfirmed) {
-        await sendText(from, "Payment ചെയ്ത ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.");
-        return;
-      }
-
-      if (session.paymentConfirmed && !session.reportSent) {
-        await sendText(from, "Report തയ്യാറാക്കിക്കൊണ്ടിരിക്കുകയാണ്. ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ലഭിക്കും.");
-        return;
-      }
-
-      if (session.reportSent) {
-        const reply = await followUpReply(session, text);
-        await sendText(from, reply);
-        return;
-      }
-
-      await sendText(from, "ശരി. തുടരാൻ നിങ്ങളുടെ കൈയുടെ ഫോട്ടോ അയക്കൂ.");
-      return;
-    }
-
-    if (message.type === "image") {
-      const imageId = message.image?.id || "";
-
-      if (!session.palmPhotoReceived) {
+      if (message.type === "image") {
         session.palmPhotoReceived = true;
-        session.palmPhotoMediaId = imageId;
 
-        await sendText(from, "ഫോട്ടോ ലഭിച്ചു. നന്ദി.");
-        await sleep(1500);
+        await sendText(from, "Image received. Thank you.");
         await sendPaymentRequest(from, session);
-        return;
-      }
-
-      if (session.paymentRequested && !session.paymentConfirmed) {
-        session.paymentConfirmed = true;
-
-        await sendText(
-          from,
-          `Payment screenshot ലഭിച്ചു. നന്ദി ${session.name || ""}.
-
-നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
-
-Report ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും.`
-        );
 
         scheduleAssessment(from, session);
         return;
       }
 
-      await sendText(from, "Image ലഭിച്ചു.");
-      return;
+    } catch (err) {
+      console.error("INNER FLOW ERROR:", err);
     }
 
-    await sendText(from, "Text അല്ലെങ്കിൽ image ആയി അയക്കാമോ?");
-  } catch (error) {
-    console.error("Webhook error:", error.response?.data || error.message);
+  } catch (err) {
+    console.error("WEBHOOK CRASH SAFE BLOCK:", err);
   }
 });
 
