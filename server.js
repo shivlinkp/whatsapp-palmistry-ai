@@ -77,7 +77,16 @@ function log(...args) {
 // WhatsApp send helpers
 // ---------------------------------------------------------------------------
 
+// Human-like delay: every outgoing message waits 8-12s before sending.
+// Centralized here so no call site needs to remember to add it.
+function randomHumanDelayMs() {
+  return 8000 + Math.random() * 4000; // 8-12 seconds
+}
+
 async function sendWhatsAppRequest(payload) {
+  const delay = randomHumanDelayMs();
+  log(`Waiting ${(delay / 1000).toFixed(1)}s before sending (human-like delay)`);
+  await new Promise((resolve) => setTimeout(resolve, delay));
   try {
     const res = await fetch(GRAPH_URL, {
       method: "POST",
@@ -138,9 +147,9 @@ function splitIntoChunks(text, maxLen = 3500) {
 async function sendLongText(to, text) {
   const chunks = splitIntoChunks(text);
   for (const chunk of chunks) {
+    // sendText -> sendWhatsAppRequest already applies an 8-12s human-like
+    // delay before each send, so chunks naturally arrive spaced out in order.
     await sendText(to, chunk);
-    // small delay so messages arrive in order
-    await new Promise((r) => setTimeout(r, 700));
   }
 }
 
@@ -183,7 +192,9 @@ function handRequestMessage(name, gender) {
 - കൈരേഖകൾ blur ആകരുത്`;
 }
 
-const PAYMENT_MESSAGE = `ഇതിൽ ₹99 payment ചെയ്തോളൂ.
+const PHOTO_RECEIVED_PAYMENT_MESSAGE = `ഫോട്ടോ ലഭിച്ചു. നന്ദി.
+
+ഇപ്പോൾ ₹99 payment ചെയ്തോളൂ.
 
 Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.`;
 
@@ -545,7 +556,7 @@ async function handleImageMessage(phone, mediaId, session) {
     if (QR_IMAGE_URL) {
       await sendImageByUrl(phone, QR_IMAGE_URL, "");
     }
-    await sendText(phone, PAYMENT_MESSAGE);
+    await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
     return;
   }
 
