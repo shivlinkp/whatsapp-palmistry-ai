@@ -118,13 +118,33 @@ async function sendText(to, body) {
 }
 
 async function sendImageByUrl(to, link, caption) {
-  log("Sending QR/image to", to);
-  return sendWhatsAppRequest({
+  if (!link || !/^https?:\/\//i.test(link)) {
+    log(
+      `QR image NOT sent — QR_IMAGE_URL is missing or invalid. Current value: "${link}"`
+    );
+    return null;
+  }
+
+  log("Sending QR/image to", to, "-> link:", link);
+  const payload = {
     messaging_product: "whatsapp",
     to,
     type: "image",
-    image: { link, caption: caption || "" },
-  });
+    image: caption ? { link, caption } : { link },
+  };
+
+  const data = await sendWhatsAppRequest(payload);
+
+  if (!data || data.error) {
+    log(
+      "QR image send FAILED. Meta API error:",
+      JSON.stringify(data?.error || "no response from sendWhatsAppRequest")
+    );
+  } else {
+    log("QR image sent successfully:", JSON.stringify(data.messages || data));
+  }
+
+  return data;
 }
 
 // Splits long text into WhatsApp-safe chunks (~4000 char limit), breaking on
@@ -169,16 +189,19 @@ const WELCOME_MESSAGE = `Hi
 - ഭാവിയിലെ പ്രധാന അവസരങ്ങളും വെല്ലുവിളികളും
 - നിങ്ങളുടെ കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ
 
-Name, Date of Birth, Gender പറയാമോ?
+ദയവായി താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
+
+• പേര്
+• ജനനത്തീയതി
+• ലിംഗം
 
 ഫീസ്: ₹99 മാത്രം.`;
 
-function askMissingFieldMessage(field) {
-  if (field === "name") return "Name പറയാമോ?";
-  if (field === "dob") return "Date of Birth പറയാമോ?";
-  if (field === "gender") return "Gender പറയാമോ?";
-  return "";
-}
+const ASK_ALL_DETAILS_MESSAGE = `ദയവായി താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
+
+• പേര്
+• ജനനത്തീയതി
+• ലിംഗം`;
 
 function handRequestMessage(name, gender) {
   const hand = gender === "female" ? "ഇടത്" : "വലത്";
@@ -194,9 +217,9 @@ function handRequestMessage(name, gender) {
 
 const PHOTO_RECEIVED_PAYMENT_MESSAGE = `ഫോട്ടോ ലഭിച്ചു. നന്ദി.
 
-ഇപ്പോൾ ₹99 payment ചെയ്തോളൂ.
+താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്യുക.
 
-Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.`;
+Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`;
 
 function paymentReceivedMessage(name) {
   return `Payment screenshot ലഭിച്ചു. നന്ദി ${name}.
@@ -287,7 +310,13 @@ async function extractFields(text, known) {
   }
 
   // --- OpenAI pass to catch names / messier formats / Malayalam script ---
-  const prompt = `Extract name, date of birth, and gender from the customer message below.
+  const prompt = `Extract name, date of birth, and gender from the customer's WhatsApp message below.
+The customer may send the details in ANY order, on separate lines, comma-separated, or in Malayalam/Manglish. Examples of valid inputs:
+"Shivlin, 07-11-1992, Male"
+"Shivlin\\n07-11-1992\\nMale"
+"Male\\n07-11-1992\\nShivlin"
+"പേര് Shivlin ജനനത്തീയതി 07-11-1992 ലിംഗം Male"
+
 Already known (do not change unless the new message clearly overrides it): ${JSON.stringify(
     known
   )}
@@ -313,6 +342,24 @@ If a field is not present in the message, set it to null.`;
       }
     } catch (err) {
       log("Extraction JSON parse failed, using regex-only result");
+    }
+  }
+
+  // --- Safe regex fallback for name (only if GPT missed it) ---
+  // Only guess a name here when the message also contains a dob or gender
+  // match — otherwise a random question ("how much?") could get misread as
+  // a name, which we want to avoid.
+  if (!result.name && (result.dob || result.gender)) {
+    let residual = text
+      .replace(dobMatch ? dobMatch[0] : "", "")
+      .replace(/\b(male|female)\b/gi, "")
+      .replace(/ആൺ|പുരുഷൻ|പെൺ|സ്ത്രീ/g, "")
+      .replace(/[,\n]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const words = residual.split(" ").filter(Boolean);
+    if (words.length > 0 && words.length <= 4) {
+      result.name = words.join(" ");
     }
   }
 
@@ -535,7 +582,7 @@ async function progressCollectingStage(phone, session) {
   if (!session.gender) missing.push("gender");
 
   if (missing.length > 0) {
-    await sendText(phone, askMissingFieldMessage(missing[0]));
+    await sendText(phone, ASK_ALL_DETAILS_MESSAGE);
     return;
   }
 
@@ -553,9 +600,7 @@ async function handleImageMessage(phone, mediaId, session) {
     session.palmMediaId = mediaId;
     session.stage = "awaiting_payment";
 
-    if (QR_IMAGE_URL) {
-      await sendImageByUrl(phone, QR_IMAGE_URL, "");
-    }
+    await sendImageByUrl(phone, QR_IMAGE_URL, "");
     await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
     return;
   }
@@ -570,10 +615,7 @@ async function handleImageMessage(phone, mediaId, session) {
 
   // Image sent at an unexpected stage
   if (session.stage === "new" || session.stage === "collecting") {
-    await sendText(
-      phone,
-      "ആദ്യം Name, Date of Birth, Gender എന്നിവ പറയാമോ? അതിനുശേഷം കൈയുടെ ഫോട്ടോ ചോദിക്കാം."
-    );
+    await sendText(phone, ASK_ALL_DETAILS_MESSAGE);
     return;
   }
 
