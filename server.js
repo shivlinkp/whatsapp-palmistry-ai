@@ -674,13 +674,21 @@ app.post("/webhook", (req, res) => {
       handleTextMessage(phone, text, session).catch((err) =>
         log("handleTextMessage error (caught):", err.message)
       );
-    } else if (message.type === "image") {
-      const mediaId = message.image?.id;
+    } else if (
+      message.type === "image" ||
+      (message.type === "document" &&
+        message.document?.mime_type?.startsWith("image/"))
+    ) {
+      // WhatsApp sometimes sends photos sent in "HD" quality as a document
+      // (mime_type image/...) instead of a standard image message — treat
+      // both the same way so HD palm photos aren't rejected.
+      const mediaId = message.image?.id || message.document?.id;
+      log("Photo received as", message.type, "-> mediaId:", mediaId);
       handleImageMessage(phone, mediaId, session).catch((err) =>
         log("handleImageMessage error (caught):", err.message)
       );
     } else {
-      // Unsupported type (audio, document, location, etc.)
+      // Unsupported type (audio, non-image document, location, etc.)
       sendText(
         phone,
         "ദയവായി text ആയോ photo ആയോ അയക്കൂ."
