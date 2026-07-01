@@ -59,7 +59,7 @@ function getSession(phone) {
       paymentScreenshotReceived: false,
       paymentConfirmed: false,
       reportSent: false,
-      history: []
+      history: [],
       replied: false,
       
     });
