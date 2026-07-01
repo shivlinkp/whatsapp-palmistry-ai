@@ -113,6 +113,7 @@ async function sendImage(to, imageUrl) {
   );
 }
 
+
 function splitMessage(text, maxLength) {
   const parts = [];
   let remaining = text;
