@@ -48,7 +48,6 @@ function getSession(phone) {
       history: []
     });
   }
-
   return sessions.get(phone);
 }
 
@@ -98,7 +97,7 @@ async function sendText(to, body) {
       }
     );
 
-    await sleep(800);
+    await sleep(700);
   }
 }
 
@@ -180,6 +179,7 @@ function detectName(text = "") {
     .trim();
 
   const lower = normalize(cleaned);
+
   if (!cleaned) return "";
   if (isGreeting(cleaned)) return "";
   if (lower.includes("payment") || lower.includes("price") || lower.includes("fee")) return "";
@@ -190,7 +190,7 @@ function detectName(text = "") {
   return "";
 }
 
-function extractFacts(session, text = "") {
+async function extractFacts(session, text = "") {
   const dob = detectDob(text);
   const gender = detectGender(text);
   const name = detectName(text);
@@ -198,6 +198,44 @@ function extractFacts(session, text = "") {
   if (dob && !session.dob) session.dob = dob;
   if (gender && !session.gender) session.gender = gender;
   if (name && !session.name) session.name = name;
+
+  if (session.name && session.dob && session.gender) return;
+
+  try {
+    const prompt = `Extract customer details from this WhatsApp message.
+
+Message:
+${text}
+
+Return only JSON:
+{"name":"","dob":"","gender":""}
+
+Rules:
+- gender must be male, female, or empty.
+- Understand English, Malayalam, Manglish.
+- Do not guess.
+- If no name is present, keep name empty.
+- DOB can be formats like 07-11-1992, 07/11/1992, 07,11,1992.`;
+
+    const result = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }]
+    });
+
+    const raw = result.choices[0].message.content
+      .trim()
+      .replace(/```json/g, "")
+      .replace(/```/g, "");
+
+    const data = JSON.parse(raw);
+
+    if (data.name && !session.name) session.name = data.name;
+    if (data.dob && !session.dob) session.dob = data.dob;
+    if (data.gender && !session.gender) session.gender = data.gender.toLowerCase();
+  } catch (e) {
+    console.error("Fact extraction skipped:", e.message);
+  }
 }
 
 function missingInfo(session) {
@@ -214,9 +252,9 @@ function handRequest(session) {
 ഇപ്പോൾ ദയവായി നിങ്ങളുടെ വലത് കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?
 
 ഫോട്ടോ എടുക്കുമ്പോൾ:
-• കൈ മുഴുവനും വ്യക്തമായി കാണണം
-• നല്ല വെളിച്ചത്തിൽ എടുക്കണം
-• കൈരേഖകൾ blur ആകരുത്`;
+- കൈ മുഴുവനും വ്യക്തമായി കാണണം
+- നല്ല വെളിച്ചത്തിൽ എടുക്കണം
+- കൈരേഖകൾ blur ആകരുത്`;
   }
 
   return `നന്ദി ${session.name}.
@@ -224,9 +262,9 @@ function handRequest(session) {
 ഇപ്പോൾ ദയവായി നിങ്ങളുടെ ഇടത് കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?
 
 ഫോട്ടോ എടുക്കുമ്പോൾ:
-• കൈ മുഴുവനും വ്യക്തമായി കാണണം
-• നല്ല വെളിച്ചത്തിൽ എടുക്കണം
-• കൈരേഖകൾ blur ആകരുത്`;
+- കൈ മുഴുവനും വ്യക്തമായി കാണണം
+- നല്ല വെളിച്ചത്തിൽ എടുക്കണം
+- കൈരേഖകൾ blur ആകരുത്`;
 }
 
 async function sendPaymentRequest(to, session) {
@@ -285,11 +323,11 @@ Name: ${session.name}
 Date of Birth: ${session.dob}
 Gender: ${session.gender}
 
-Important:
+Important rules:
 - Malayalam only.
 - Minimum 2000 words.
 - Premium, detailed, satisfying style.
-- Do not mention AI, OpenAI, automation, chatbot, model, system.
+- Do not mention AI, OpenAI, chatbot, automation, model, or system.
 - Do not add disclaimers.
 - Do not say fun or entertainment.
 - Include personality, love, relationships, marriage, family life, job, career, business, money, future opportunities, challenges, and special palm signs.
@@ -401,7 +439,7 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      extractFacts(session, text);
+      await extractFacts(session, text);
 
       const missing = missingInfo(session);
       if (missing) {
