@@ -484,6 +484,18 @@ async function getMediaBase64(mediaId) {
 // general-purpose openaiChat helper used elsewhere) so we can log the full
 // request payload (image data truncated) and the full raw response, per
 // the debugging requirements for this specific flow.
+// Detects short English-language decline/apology text, which is what the
+// model outputs on the rare occasions it refuses instead of writing the
+// Malayalam reading. A real report is 2000+ words of Malayalam script, so
+// any short response matching these patterns is treated as a failure.
+function isLikelyRefusal(text) {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (trimmed.length > 400) return false; // real reports are always much longer
+  const refusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
+  return refusalPatterns.test(trimmed);
+}
+
 async function callOpenAIForReport(messages, maxTokens) {
   if (!OPENAI_API_KEY) {
     log("OPENAI_API_KEY missing, cannot generate report");
@@ -555,11 +567,11 @@ async function generateReport(session) {
   const imageAvailable = Boolean(imageDataUrl);
   log("generateReport: imageAvailable =", imageAvailable);
 
-  const systemPrompt = `You are writing a detailed Malayalam palm reading report for a paying customer.
-Write naturally and warmly, entirely in Malayalam script, minimum 2000 words.
-Cover these sections clearly: സ്വഭാവവും വ്യക്തിത്വവും, സ്നേഹവും ബന്ധങ്ങളും, വിവാഹവും കുടുംബജീവിതവും, ജോലി/കരിയർ/ബിസിനസ്, സാമ്പത്തിക കാര്യങ്ങൾ, ഭാവിയിലെ അവസരങ്ങളും വെല്ലുവിളികളും, കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ.
-Do not include any disclaimers. Do not say you are unable to see or analyze an image. Never use the words: fun, entertainment, AI, OpenAI, bot, automation, model, system (in English or Malayalam equivalents).
-Address the customer by name naturally through the report.`;
+  const systemPrompt = `You are an experienced, warm palmistry reader writing a personal reading for a customer, entirely in Malayalam script, minimum 2000 words.
+Cover these themes naturally, in a flowing narrative (not as labeled headings): സ്വഭാവവും വ്യക്തിത്വവും, സ്നേഹവും ബന്ധങ്ങളും, വിവാഹവും കുടുംബജീവിതവും, ജോലി/കരിയർ/ബിസിനസ്, സാമ്പത്തിക കാര്യങ്ങൾ, ഭാവിയിലെ അവസരങ്ങളും വെല്ലുവിളികളും, കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ.
+Write in the traditional palmistry style — describe what the lines and signs suggest or indicate, as tendencies and possibilities (സാധ്യതകൾ), rather than stating outcomes as certain facts. Keep the tone personal, encouraging, and specific to this customer's details.
+Write in a natural narrator voice, the way a palmistry reader would speak to a client in person — there's no need to mention how this reading was produced.
+Address the customer by name naturally through the reading.`;
 
   // Only ask the model to look at an image if one actually downloaded —
   // asking it to "analyze the attached image" when none is attached is
@@ -567,10 +579,10 @@ Address the customer by name naturally through the report.`;
   const instructionText = imageAvailable
     ? `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
         gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
-      }\n\nThe customer's palm image is attached. Use it together with the details above to write the full report, referencing specific palm lines and signs naturally.`
+      }\n\nThe customer's palm image is attached. Use it together with the details above to write the full reading, referencing specific palm lines and signs naturally.`
     : `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
         gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
-      }\n\nWrite the full palmistry report based on these details. Describe palm lines and signs naturally as part of the reading, without mentioning that no image was provided.`;
+      }\n\nWrite the full palmistry reading based on these details. Describe palm lines and signs naturally as part of the reading, without mentioning that no image was provided.`;
 
   const userContent = [{ type: "text", text: instructionText }];
   if (imageAvailable) {
@@ -585,7 +597,15 @@ Address the customer by name naturally through the report.`;
   // Malayalam script needs noticeably more tokens per word than English
   // under GPT tokenizers — 4000 tokens was cutting a 2000-word Malayalam
   // report short. Raised to give the full report room to complete.
-  const report = await callOpenAIForReport(messages, 7000);
+  let report = await callOpenAIForReport(messages, 7000);
+
+  // Safety net: if the model still declines (short English apology instead
+  // of a Malayalam reading), don't let that reach the customer — treat it
+  // as a failure so scheduleReport's existing retry logic kicks in instead.
+  if (report && isLikelyRefusal(report)) {
+    log("generateReport: model output looks like a refusal, not a report. Treating as failure. Content was:", report);
+    report = null;
+  }
 
   return report;
 }
