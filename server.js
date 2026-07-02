@@ -6,15 +6,9 @@
  *   WHATSAPP_TOKEN    - permanent/temporary token for Graph API
  *   PHONE_NUMBER_ID   - WhatsApp Business phone number id
  *   OPENAI_API_KEY    - OpenAI key for extraction + report generation
- *   QR_IMAGE_URL      - fallback: publicly reachable URL of your payment QR
- *                       image, only used if no local qr.png file is found
- *                       (see QR_LOCAL_PATH below)
- *
- * QR IMAGE: preferred approach is bundling a qr.png file directly in the repo
- * (same folder as server.js). At startup/send-time we read it straight off
- * disk and upload the bytes to Meta directly — no external URL, no Express
- * static route, no network fetch required at all. QR_IMAGE_URL is only a
- * fallback used if no local qr.png is found in the deployment.
+ *   QR_IMAGE_URL      - publicly reachable URL (Cloudinary) of your payment
+ *                       QR image. This is the ONLY source used to send the
+ *                       QR image — no local file, no static route.
  *
  * NOTE: Sessions are stored in-memory (Map). They reset on every Railway
  * restart/deploy. For production durability, add Postgres (see bottom notes).
@@ -23,8 +17,6 @@
 const express = require("express");
 const fetch = require("node-fetch");
 const bodyParser = require("body-parser");
-const fs = require("fs");
-const path = require("path");
 
 const app = express();
 app.use(bodyParser.json());
@@ -35,7 +27,6 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const QR_IMAGE_URL = process.env.QR_IMAGE_URL || "";
-const QR_LOCAL_PATH = path.join(__dirname, "qr.png");
 
 const GRAPH_URL = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
 
@@ -151,6 +142,8 @@ async function sendText(to, body) {
 // Returns true ONLY if Meta's response confirms acceptance (HTTP 2xx + a
 // real message id in response.messages[0].id). Returns false otherwise —
 // callers must NOT proceed to the next step in the flow if this is false.
+// This is the ONLY QR-sending method in the app — no local file, no media
+// upload, no fallback. It only ever uses process.env.QR_IMAGE_URL.
 async function sendImageByUrl(to, link, caption) {
   if (!link || !/^https?:\/\//i.test(link)) {
     log(
@@ -158,6 +151,8 @@ async function sendImageByUrl(to, link, caption) {
     );
     return false;
   }
+
+  console.log("Using QR URL:", QR_IMAGE_URL);
 
   const payload = {
     messaging_product: "whatsapp",
@@ -212,174 +207,6 @@ async function sendImageByUrl(to, link, caption) {
   qrMessageIdsByPhone.set(to, wamid);
   log("Tracked QR message id for", to, "->", wamid);
   return true;
-}
-
-// Uploads the QR image bytes directly to Meta's /media endpoint, returning
-// a media_id. Prefers a local qr.png file bundled in the deployed repo
-// (no network fetch needed at all); falls back to downloading from
-// QR_IMAGE_URL only if no local file is found. Either way, this removes
-// Meta's dependency on fetching the image itself at send-time — the
-// root-cause fix for "accepted (200 + wamid) but never delivered" sends.
-async function uploadMediaToMeta() {
-  let buffer;
-  let contentType = "image/png";
-
-  if (fs.existsSync(QR_LOCAL_PATH)) {
-    try {
-      buffer = fs.readFileSync(QR_LOCAL_PATH);
-      log(
-        "Using local qr.png bundled in deployment:",
-        QR_LOCAL_PATH,
-        "-",
-        buffer.length,
-        "bytes"
-      );
-    } catch (err) {
-      log("Failed to read local qr.png:", err.message);
-      buffer = null;
-    }
-  } else {
-    log("No local qr.png found at", QR_LOCAL_PATH, "— falling back to QR_IMAGE_URL");
-  }
-
-  if (!buffer) {
-    if (!QR_IMAGE_URL || !/^https?:\/\//i.test(QR_IMAGE_URL)) {
-      log(
-        `Media upload skipped — no local qr.png AND QR_IMAGE_URL is missing/invalid: "${QR_IMAGE_URL}"`
-      );
-      return null;
-    }
-    try {
-      const imgRes = await fetch(QR_IMAGE_URL);
-      if (!imgRes.ok) {
-        log(
-          "Media upload: failed to download QR image from",
-          QR_IMAGE_URL,
-          "-> HTTP",
-          imgRes.status
-        );
-        return null;
-      }
-      buffer = await imgRes.buffer();
-      contentType = imgRes.headers.get("content-type") || "image/png";
-      log(
-        "Downloaded QR image from QR_IMAGE_URL for upload:",
-        buffer.length,
-        "bytes, content-type:",
-        contentType
-      );
-    } catch (err) {
-      log("Media upload: download from QR_IMAGE_URL crashed (caught):", err.message);
-      return null;
-    }
-  }
-
-  try {
-    const form = new FormData();
-    form.append("messaging_product", "whatsapp");
-    form.append("file", new Blob([buffer], { type: contentType }), "qr.png");
-
-    const uploadRes = await globalThis.fetch(
-      `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/media`,
-      {
-        method: "POST",
-        headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
-        body: form,
-      }
-    );
-    const uploadText = await uploadRes.text();
-    let uploadData;
-    try {
-      uploadData = JSON.parse(uploadText);
-    } catch {
-      uploadData = { rawText: uploadText };
-    }
-
-    log("Media upload HTTP status:", uploadRes.status);
-    log("Media upload full response:", JSON.stringify(uploadData));
-
-    if (!uploadRes.ok || !uploadData.id) {
-      log("Media upload FAILED — no media id returned.");
-      return null;
-    }
-
-    log("Media upload SUCCEEDED — media_id:", uploadData.id);
-    return uploadData.id;
-  } catch (err) {
-    log("Media upload crashed (caught):", err.message);
-    return null;
-  }
-}
-
-async function sendImageByMediaId(to, mediaId, caption) {
-  const payload = {
-    messaging_product: "whatsapp",
-    recipient_type: "individual",
-    to,
-    type: "image",
-    image: caption ? { id: mediaId, caption } : { id: mediaId },
-  };
-
-  log("Sending QR image (by media_id) to", to, "-> media_id:", mediaId);
-
-  const result = await sendWhatsAppRequest(payload);
-
-  if (!result || result.networkError) {
-    log(
-      "QR image (by media_id) send FAILED — network error:",
-      result?.networkError || "unknown"
-    );
-    return false;
-  }
-
-  if (!result.ok) {
-    log(
-      "QR image (by media_id) REJECTED by Meta. HTTP status:",
-      result.httpStatus,
-      "Full response:",
-      JSON.stringify(result.data)
-    );
-    return false;
-  }
-
-  const wamid = result.data?.messages?.[0]?.id;
-  if (!wamid) {
-    log(
-      "QR image (by media_id) response was HTTP",
-      result.httpStatus,
-      "but contained no message id — treating as failure. Full response:",
-      JSON.stringify(result.data)
-    );
-    return false;
-  }
-
-  log(
-    "QR image (by media_id) ACCEPTED by Meta. HTTP status:",
-    result.httpStatus,
-    "wamid:",
-    wamid
-  );
-  qrMessageIdsByPhone.set(to, wamid);
-  log("Tracked QR message id for", to, "->", wamid);
-  return true;
-}
-
-// Primary QR-sending path: upload the image to Meta directly, then send by
-// media_id. Falls back to the old link-based method only if the upload
-// itself fails (e.g. Cloudinary temporarily unreachable) — link-based
-// sending is what we've confirmed gets accepted-but-not-delivered, so it's
-// a last resort, not the default anymore.
-async function sendQrImage(to) {
-  const mediaId = await uploadMediaToMeta();
-  if (mediaId) {
-    const sent = await sendImageByMediaId(to, mediaId, "");
-    if (sent) return true;
-    log("Send-by-media_id failed after successful upload — falling back to link method.");
-  } else {
-    log("Media upload failed — falling back to link method.");
-  }
-  console.log("ABOUT TO SEND QR_IMAGE_URL =", QR_IMAGE_URL);
-  return sendImageByUrl(to, QR_IMAGE_URL, "");
 }
 
 // Splits long text into WhatsApp-safe chunks (~4000 char limit), breaking on
@@ -755,7 +582,7 @@ async function handleTextMessage(phone, text, session) {
 
     if (session.palmMediaId) {
       // Photo was already received but QR sending failed earlier — retry now.
-      const qrSent = await sendQrImage(phone);
+      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
       if (qrSent) {
         session.stage = "awaiting_payment";
         await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
@@ -850,7 +677,7 @@ async function handleImageMessage(phone, mediaId, session) {
   if (session.stage === "awaiting_photo") {
     session.palmMediaId = mediaId;
 
-    const qrSent = await sendQrImage(phone);
+    const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
     if (!qrSent) {
       log(
         "QR image failed to send to",
@@ -997,12 +824,4 @@ app.post("/webhook", (req, res) => {
 app.listen(PORT, () => {
   log(`Bot running on port ${PORT}`);
   console.log("STARTUP QR_IMAGE_URL =", process.env.QR_IMAGE_URL);
-  if (fs.existsSync(QR_LOCAL_PATH)) {
-    const stats = fs.statSync(QR_LOCAL_PATH);
-    log(`QR check: local qr.png FOUND at ${QR_LOCAL_PATH} (${stats.size} bytes) — will be used directly.`);
-  } else {
-    log(
-      `QR check: no local qr.png found at ${QR_LOCAL_PATH}. Will fall back to QR_IMAGE_URL = "${QR_IMAGE_URL}"`
-    );
-  }
 });
