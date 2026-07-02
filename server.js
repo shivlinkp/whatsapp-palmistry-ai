@@ -47,6 +47,11 @@ const GRAPH_URL = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`
 // sessions: phone -> { stage, name, dob, gender, palmMediaId, reportChunksSent, createdAt, updatedAt }
 const sessions = new Map();
 
+// Tracks the wamid of the last QR image sent per phone number, so incoming
+// status webhooks (sent/delivered/read/failed) can be correlated back to
+// the actual QR send attempt.
+const qrMessageIdsByPhone = new Map();
+
 // Dedup of processed WhatsApp message ids (capped ring buffer)
 const processedMessageIds = new Set();
 const processedMessageOrder = [];
@@ -204,6 +209,8 @@ async function sendImageByUrl(to, link, caption) {
     "wamid:",
     wamid
   );
+  qrMessageIdsByPhone.set(to, wamid);
+  log("Tracked QR message id for", to, "->", wamid);
   return true;
 }
 
@@ -352,6 +359,8 @@ async function sendImageByMediaId(to, mediaId, caption) {
     "wamid:",
     wamid
   );
+  qrMessageIdsByPhone.set(to, wamid);
+  log("Tracked QR message id for", to, "->", wamid);
   return true;
 }
 
@@ -906,10 +915,41 @@ app.post("/webhook", (req, res) => {
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
+
+    // WhatsApp sends message status updates (sent/delivered/read/failed)
+    // as separate webhook events with no "messages" array — log these in
+    // detail so we can see exactly what Meta reports after accepting a send.
+    const statuses = value?.statuses;
+    if (statuses?.length) {
+      console.log("STATUS WEBHOOK:", JSON.stringify(statuses, null, 2));
+      for (const status of statuses) {
+        log("Status update -> id:", status.id);
+        log("Status update -> status:", status.status);
+        log("Status update -> timestamp:", status.timestamp);
+        log("Status update -> recipient_id:", status.recipient_id);
+        log("Status update -> full payload:", JSON.stringify(status));
+
+        if (status.status === "failed") {
+          log("Status update -> FAILURE ERROR DETAILS:", JSON.stringify(status.errors));
+        }
+
+        const trackedQrId = qrMessageIdsByPhone.get(status.recipient_id);
+        if (trackedQrId && trackedQrId === status.id) {
+          log(
+            "*** This status update matches the tracked QR image message id for",
+            status.recipient_id,
+            "-> status:",
+            status.status
+          );
+        }
+      }
+      return;
+    }
+
     const message = value?.messages?.[0];
 
     if (!message) {
-      // Could be a status update (delivered/read) — nothing to do
+      // Neither a message nor a status update — nothing to do
       return;
     }
 
