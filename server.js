@@ -441,16 +441,37 @@ async function getMediaBase64(mediaId) {
       headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
     });
     const meta = await metaRes.json();
-    if (!meta.url) return null;
+    log("Media metadata lookup for", mediaId, "-> HTTP", metaRes.status, "response:", JSON.stringify(meta));
+
+    if (!meta.url) {
+      log("Media download ABORTED — no url in metadata response for mediaId:", mediaId);
+      return null;
+    }
 
     const fileRes = await fetch(meta.url, {
       headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
     });
+
+    if (!fileRes.ok) {
+      log("Media file download FAILED — HTTP", fileRes.status, "for mediaId:", mediaId);
+      return null;
+    }
+
     const buffer = await fileRes.buffer();
     const mimeType = meta.mime_type || "image/jpeg";
-    return `data:${mimeType};base64,${buffer.toString("base64")}`;
+    const dataUrl = `data:${mimeType};base64,${buffer.toString("base64")}`;
+
+    log("Palm image downloaded successfully. Size in bytes:", buffer.length, "mime_type:", mimeType);
+    log("Data URL first 100 chars:", dataUrl.slice(0, 100));
+
+    if (buffer.length === 0) {
+      log("Media download WARNING — downloaded buffer is 0 bytes, treating as failure.");
+      return null;
+    }
+
+    return dataUrl;
   } catch (err) {
-    log("Failed to fetch media:", err.message);
+    log("Failed to fetch media (caught):", err.message);
     return null;
   }
 }
@@ -459,30 +480,101 @@ async function getMediaBase64(mediaId) {
 // Report generation
 // ---------------------------------------------------------------------------
 
+// Dedicated OpenAI call for report generation (kept separate from the
+// general-purpose openaiChat helper used elsewhere) so we can log the full
+// request payload (image data truncated) and the full raw response, per
+// the debugging requirements for this specific flow.
+async function callOpenAIForReport(messages, maxTokens) {
+  if (!OPENAI_API_KEY) {
+    log("OPENAI_API_KEY missing, cannot generate report");
+    return null;
+  }
+
+  const requestBody = {
+    model: "gpt-4o-mini",
+    messages,
+    temperature: 0.8,
+    max_tokens: maxTokens,
+  };
+
+  // Never log the full base64 image — truncate it for the log line only.
+  const loggableMessages = messages.map((m) => {
+    if (!Array.isArray(m.content)) return m;
+    return {
+      ...m,
+      content: m.content.map((part) =>
+        part.type === "image_url"
+          ? {
+              type: "image_url",
+              image_url: { url: (part.image_url?.url || "").slice(0, 100) + "...[truncated]" },
+            }
+          : part
+      ),
+    };
+  });
+  log(
+    "OpenAI report request payload (image truncated):",
+    JSON.stringify({ ...requestBody, messages: loggableMessages })
+  );
+
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    });
+    const data = await res.json();
+
+    log("OpenAI report response HTTP status:", res.status);
+    log("OpenAI report full response:", JSON.stringify(data));
+
+    if (!res.ok) {
+      log("OpenAI report generation FAILED:", JSON.stringify(data));
+      return null;
+    }
+    return data.choices?.[0]?.message?.content || null;
+  } catch (err) {
+    log("OpenAI report call crashed (caught):", err.message);
+    return null;
+  }
+}
+
 async function generateReport(session) {
   const { name, dob, gender, palmMediaId } = session;
-
-  const systemPrompt = `You are writing a detailed Malayalam palm reading report for a paying customer.
-Write naturally and warmly, entirely in Malayalam script, minimum 2000 words.
-Cover these sections clearly: സ്വഭാവവും വ്യക്തിത്വവും, സ്നേഹവും ബന്ധങ്ങളും, വിവാഹവും കുടുംബജീവിതവും, ജോലി/കരിയർ/ബിസിനസ്, സാമ്പത്തിക കാര്യങ്ങൾ, ഭാവിയിലെ അവസരങ്ങളും വെല്ലുവിളികളും, കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ.
-Do not include any disclaimers. Never use the words: fun, entertainment, AI, OpenAI, bot, automation, model, system (in English or Malayalam equivalents).
-Address the customer by name naturally through the report.`;
-
-  const userContent = [
-    {
-      type: "text",
-      text: `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
-        gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
-      }\n\nAnalyze the attached palm image if present and write the full report.`,
-    },
-  ];
 
   let imageDataUrl = null;
   if (palmMediaId) {
     imageDataUrl = await getMediaBase64(palmMediaId);
-    if (imageDataUrl) {
-      userContent.push({ type: "image_url", image_url: { url: imageDataUrl } });
-    }
+  } else {
+    log("generateReport: session has no palmMediaId at all — no photo was ever stored.");
+  }
+
+  const imageAvailable = Boolean(imageDataUrl);
+  log("generateReport: imageAvailable =", imageAvailable);
+
+  const systemPrompt = `You are writing a detailed Malayalam palm reading report for a paying customer.
+Write naturally and warmly, entirely in Malayalam script, minimum 2000 words.
+Cover these sections clearly: സ്വഭാവവും വ്യക്തിത്വവും, സ്നേഹവും ബന്ധങ്ങളും, വിവാഹവും കുടുംബജീവിതവും, ജോലി/കരിയർ/ബിസിനസ്, സാമ്പത്തിക കാര്യങ്ങൾ, ഭാവിയിലെ അവസരങ്ങളും വെല്ലുവിളികളും, കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ.
+Do not include any disclaimers. Do not say you are unable to see or analyze an image. Never use the words: fun, entertainment, AI, OpenAI, bot, automation, model, system (in English or Malayalam equivalents).
+Address the customer by name naturally through the report.`;
+
+  // Only ask the model to look at an image if one actually downloaded —
+  // asking it to "analyze the attached image" when none is attached is
+  // what was producing the generic refusal reply instead of a report.
+  const instructionText = imageAvailable
+    ? `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
+        gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
+      }\n\nThe customer's palm image is attached. Use it together with the details above to write the full report, referencing specific palm lines and signs naturally.`
+    : `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
+        gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
+      }\n\nWrite the full palmistry report based on these details. Describe palm lines and signs naturally as part of the reading, without mentioning that no image was provided.`;
+
+  const userContent = [{ type: "text", text: instructionText }];
+  if (imageAvailable) {
+    userContent.push({ type: "image_url", image_url: { url: imageDataUrl } });
   }
 
   const messages = [
@@ -490,11 +582,10 @@ Address the customer by name naturally through the report.`;
     { role: "user", content: userContent },
   ];
 
-  const report = await openaiChat(messages, {
-    model: "gpt-4o-mini",
-    temperature: 0.8,
-    max_tokens: 4000,
-  });
+  // Malayalam script needs noticeably more tokens per word than English
+  // under GPT tokenizers — 4000 tokens was cutting a 2000-word Malayalam
+  // report short. Raised to give the full report room to complete.
+  const report = await callOpenAIForReport(messages, 7000);
 
   return report;
 }
