@@ -883,6 +883,31 @@ async function handleTextMessage(phone, text, session) {
     const extracted = await extractFields(text, session);
     const patch = applyExtractedPatch(session, extracted);
     if (Object.keys(patch).length) session = await db.updateSession(phone, patch);
+
+    // If nothing new was extracted and no fixed FAQ matched, this is likely
+    // a genuine question or hesitation (trust concerns, "will this work",
+    // etc.) — repeating the exact same "please send your details" prompt
+    // ignores what they actually asked. Give a real, brief, reassuring
+    // reply instead, then still end with the details request.
+    if (!faqAnswer && Object.keys(patch).length === 0) {
+      const preReply = await openaiChat(
+        [
+          {
+            role: "system",
+            content: `You are the same experienced traditional Malayalam palmist. The customer has not yet given their name, date of birth, and gender to start their ₹99 palm reading, and just sent a message that isn't providing those details — it may be a trust concern ("is this genuine", "will it actually work"), a question, or hesitation. Answer briefly and reassuringly in Malayalam (2-3 sentences). Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ. End by asking them to share their പേര് (name), ജനനത്തീയതി (date of birth), and ലിംഗം (gender) together to continue.`,
+          },
+          { role: "user", content: text },
+        ],
+        { model: "gpt-5.5", temperature: 0.7, max_tokens: 300 }
+      );
+
+      if (preReply) {
+        await sendText(phone, preReply);
+        return;
+      }
+      // If the GPT call itself failed, fall through to the normal prompt below.
+    }
+
     await progressCollectingStage(phone, session);
     return;
   }
