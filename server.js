@@ -303,25 +303,45 @@ async function openaiChat(messages, opts = {}) {
   }
   const requestedModel = opts.model || "gpt-4o-mini";
   log("openaiChat: requesting model:", requestedModel);
-  try {
+
+  async function attempt(includeTemperature) {
+    const body = {
+      model: requestedModel,
+      messages,
+      // max_tokens is rejected outright by newer models (e.g. gpt-5.5) with
+      // a 400 error — max_completion_tokens is the current parameter name
+      // and works correctly across all models including older ones.
+      max_completion_tokens: opts.max_tokens || 800,
+    };
+    if (includeTemperature) {
+      body.temperature = opts.temperature ?? 0.7;
+    }
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: requestedModel,
-        messages,
-        temperature: opts.temperature ?? 0.7,
-        // max_tokens is rejected outright by newer models (e.g. gpt-5.5)
-        // with a 400 error — max_completion_tokens is the current parameter
-        // name and works correctly across all models including older ones.
-        max_completion_tokens: opts.max_tokens || 800,
-      }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
+    return { res, data };
+  }
+
+  try {
+    let { res, data } = await attempt(true);
     log("openaiChat: HTTP status:", res.status, "-> actual model used (response.model):", data.model);
+
+    // Some newer models (e.g. gpt-5.5) reject any non-default temperature
+    // value outright rather than accepting/ignoring it. If that's the exact
+    // error, retry once without sending temperature at all, instead of
+    // giving up and silently falling back to a weaker model.
+    if (!res.ok && data?.error?.param === "temperature") {
+      log("openaiChat: model rejected custom temperature — retrying once without it.");
+      ({ res, data } = await attempt(false));
+      log("openaiChat (retry): HTTP status:", res.status, "-> actual model used (response.model):", data.model);
+    }
+
     if (!res.ok) {
       log("OpenAI error:", JSON.stringify(data));
       return null;
