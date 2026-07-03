@@ -832,7 +832,32 @@ async function progressCollectingStage(phone, session) {
   return updated;
 }
 
+// Hidden testing command — wipes a phone number's session back to a fresh
+// state so the same test number(s) can be reused indefinitely instead of
+// needing a new number for every test run. Not documented to customers;
+// deliberately an uncommon phrase so it's never triggered by accident.
+const RESET_COMMAND = "resetmybot123";
+
 async function handleTextMessage(phone, text, session) {
+  if (text.trim().toLowerCase() === RESET_COMMAND) {
+    await db.updateSession(phone, {
+      stage: "new",
+      name: null,
+      dob: null,
+      gender: null,
+      palmMediaId: null,
+      paymentReceived: false,
+      reportText: null,
+      reportStatus: "none",
+      reportDueAt: null,
+      reportAttempts: 0,
+      reportError: null,
+    });
+    log("Session RESET for", phone, "via hidden test command");
+    await sendText(phone, "സെഷൻ റീസെറ്റ് ചെയ്തു. വീണ്ടും തുടങ്ങാൻ 'Hi' എന്ന് അയക്കൂ.");
+    return;
+  }
+
   log(
     "Current session state for",
     phone,
@@ -889,6 +914,28 @@ async function handleTextMessage(phone, text, session) {
     const faqAnswer = matchFaq(text);
     if (faqAnswer) {
       await sendText(phone, faqAnswer);
+      return;
+    }
+
+    // Previously: any message that didn't match the small fixed FAQ list
+    // (price/duration/what-you-get) got the exact same generic reminder,
+    // even for genuinely different questions (trust concerns, "explain
+    // first", etc.) — repetitive and unhelpful right before asking someone
+    // to pay. Now: give a real, brief, reassuring answer, still ending
+    // with the payment reminder.
+    const preReply = await openaiChat(
+      [
+        {
+          role: "system",
+          content: `You are the same experienced traditional Malayalam palmist, speaking with a customer who is about to pay ₹99 for their palm reading but has a question or hesitation before paying. Answer briefly and reassuringly in Malayalam (2-4 sentences) — this could be a trust concern ("how do I know this is legit"), a request to explain the process again, or anything else. Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ. After your answer, end with a gentle reminder that once they complete the ₹99 payment using the QR code above, they should send the payment screenshot here to receive their reading.`,
+        },
+        { role: "user", content: text },
+      ],
+      { model: "gpt-5.5", temperature: 0.7, max_tokens: 300 }
+    );
+
+    if (preReply) {
+      await sendText(phone, preReply);
     } else {
       await sendText(phone, "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.");
     }
