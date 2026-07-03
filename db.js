@@ -23,6 +23,11 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes("railway")
     ? { rejectUnauthorized: false }
     : false,
+  // "pg" has NO default connection timeout — without this, a bad/unreachable
+  // DATABASE_URL causes the app to hang forever with zero output instead of
+  // erroring out. This makes failures fast and visible in the logs.
+  connectionTimeoutMillis: 10000,
+  query_timeout: 15000,
 });
 
 pool.on("error", (err) => {
