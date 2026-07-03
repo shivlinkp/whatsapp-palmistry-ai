@@ -1122,6 +1122,42 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
+// Admin/testing endpoint — resets a phone number's session by visiting a
+// URL, no need to send a WhatsApp message from that number. Protected by
+// the same secret as the hidden in-chat reset command (see RESET_COMMAND).
+// Usage: GET /admin/reset-session?phone=917736236010&key=resetmybot123
+app.get("/admin/reset-session", async (req, res) => {
+  const { phone, key } = req.query;
+
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+  if (!phone) {
+    return res.status(400).send('Missing ?phone= (e.g. ?phone=917736236010&key=...)');
+  }
+
+  try {
+    await db.updateSession(phone, {
+      stage: "new",
+      name: null,
+      dob: null,
+      gender: null,
+      palmMediaId: null,
+      paymentReceived: false,
+      reportText: null,
+      reportStatus: "none",
+      reportDueAt: null,
+      reportAttempts: 0,
+      reportError: null,
+    });
+    log("Session RESET for", phone, "via admin HTTP endpoint");
+    res.status(200).send(`Session reset for ${phone}. Send "Hi" from that number on WhatsApp to start fresh.`);
+  } catch (err) {
+    log("Admin reset failed (caught):", err.message);
+    res.status(500).send("Reset failed: " + err.message);
+  }
+});
+
 app.post("/webhook", (req, res) => {
   res.sendStatus(200); // Ack immediately so Meta doesn't retry/timeout
 
