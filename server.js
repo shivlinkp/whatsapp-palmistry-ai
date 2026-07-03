@@ -85,16 +85,21 @@ function log(...args) {
 // WhatsApp send helpers
 // ---------------------------------------------------------------------------
 
-// Human-like delay: every outgoing message waits 8-12s before sending.
-// Centralized here so no call site needs to remember to add it.
+// Human-like delay: was 8-12s before every outgoing message. TEMPORARILY
+// DISABLED (set to 0) while we debug the report-generation failure — the
+// delay was adding significant friction to every test cycle. Restore by
+// changing this back to `8000 + Math.random() * 4000` once things are
+// confirmed stable end-to-end.
 function randomHumanDelayMs() {
-  return 8000 + Math.random() * 4000; // 8-12 seconds
+  return 0;
 }
 
 async function sendWhatsAppRequest(payload) {
   const delay = randomHumanDelayMs();
-  log(`Waiting ${(delay / 1000).toFixed(1)}s before sending (human-like delay)`);
-  await new Promise((resolve) => setTimeout(resolve, delay));
+  if (delay > 0) {
+    log(`Waiting ${(delay / 1000).toFixed(1)}s before sending (human-like delay)`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
 
   log("Outgoing WhatsApp API payload:", JSON.stringify(payload));
 
@@ -610,42 +615,73 @@ Address the customer by name naturally through the reading.`;
   return report;
 }
 
+const MAX_REPORT_ATTEMPTS = 5;
+const REPORT_RETRY_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes between retries
+
+async function attemptReportGeneration(phone, attemptNumber) {
+  const session = sessions.get(phone);
+  if (!session) {
+    log("attemptReportGeneration: session for", phone, "no longer exists, aborting.");
+    return;
+  }
+  if (session.stage === "report_sent") {
+    log("attemptReportGeneration: report already sent for", phone, "in a prior attempt, aborting.");
+    return;
+  }
+
+  log(`Report generation attempt ${attemptNumber}/${MAX_REPORT_ATTEMPTS} for`, phone);
+
+  let report = null;
+  try {
+    report = await generateReport(session);
+  } catch (err) {
+    log(`Report generation attempt ${attemptNumber} crashed (caught):`, err.message);
+  }
+
+  if (report) {
+    session.reportText = report;
+    session.stage = "report_sent";
+    await sendLongText(phone, report);
+    log(`Report sent to`, phone, `on attempt ${attemptNumber}`);
+    return;
+  }
+
+  log(`Report generation attempt ${attemptNumber} FAILED (no valid report returned) for`, phone);
+
+  if (attemptNumber === 1) {
+    // Only message the customer once, on the first failure, so we don't
+    // spam them every 3 minutes while retries continue in the background.
+    await sendText(
+      phone,
+      "നിങ്ങളുടെ റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ അല്പം സമയമെടുക്കുന്നു. ദയവായി അല്പസമയം കൂടി കാത്തിരിക്കൂ, ഞങ്ങൾ ഉടൻ അയയ്ക്കും."
+    );
+  }
+
+  if (attemptNumber >= MAX_REPORT_ATTEMPTS) {
+    log(
+      `Report generation EXHAUSTED all ${MAX_REPORT_ATTEMPTS} attempts for`,
+      phone,
+      "— notifying customer to contact support instead of leaving them stuck."
+    );
+    await sendText(
+      phone,
+      "ക്ഷമിക്കണം, റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ കൂടുതൽ സമയമെടുക്കുന്നു. ഞങ്ങൾ ഉടൻ തന്നെ നേരിട്ട് നിങ്ങളെ ബന്ധപ്പെടും."
+    );
+    return;
+  }
+
+  setTimeout(() => {
+    attemptReportGeneration(phone, attemptNumber + 1);
+  }, REPORT_RETRY_INTERVAL_MS);
+}
+
 function scheduleReport(phone) {
   const delayMinutes = 25 + Math.random() * 5; // 25-30 min
   const delayMs = delayMinutes * 60 * 1000;
   log("Scheduling report for", phone, "in", delayMinutes.toFixed(1), "minutes");
 
-  setTimeout(async () => {
-    const session = sessions.get(phone);
-    if (!session) return;
-    try {
-      const report = await generateReport(session);
-      if (!report) {
-        await sendText(
-          phone,
-          "നിങ്ങളുടെ റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ അല്പം സമയമെടുക്കുന്നു. ദയവായി അല്പസമയം കൂടി കാത്തിരിക്കൂ, ഞങ്ങൾ ഉടൻ അയയ്ക്കും."
-        );
-        // retry once after 3 minutes
-        setTimeout(async () => {
-          const s2 = sessions.get(phone);
-          if (!s2) return;
-          const retryReport = await generateReport(s2);
-          if (retryReport) {
-            s2.reportText = retryReport;
-            s2.stage = "report_sent";
-            await sendLongText(phone, retryReport);
-            log("Report sent (retry) to", phone);
-          }
-        }, 3 * 60 * 1000);
-        return;
-      }
-      session.reportText = report;
-      session.stage = "report_sent";
-      await sendLongText(phone, report);
-      log("Report sent to", phone);
-    } catch (err) {
-      log("Report generation crashed (caught):", err.message);
-    }
+  setTimeout(() => {
+    attemptReportGeneration(phone, 1);
   }, delayMs);
 }
 
