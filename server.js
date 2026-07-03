@@ -901,17 +901,36 @@ async function handleTextMessage(phone, text, session) {
   }
 
   if (session.stage === "report_sent") {
-    const followUp = await openaiChat(
-      [
-        {
-          role: "system",
-          content: `You are the same experienced traditional Malayalam palmist continuing a conversation with a customer, after having given them a palm reading earlier. Answer their follow-up question naturally and briefly in Malayalam, using the reading context below.
-Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ, or similar — do not address the customer directly by any such term. Speak with the same quiet, authoritative confidence as the original reading (avoid hedging words like എനിക്ക് തോന്നുന്നു, ഒരുപക്ഷേ, ആയിരിക്കാം, ചിലപ്പോൾ).\n\nEarlier reading:\n${session.reportText || ""}`,
-        },
-        { role: "user", content: text },
-      ],
-      { model: "gpt-4o-mini", temperature: 0.7, max_tokens: 500 }
-    );
+    const followUpMessages = [
+      {
+        role: "system",
+        content: `You are the same experienced traditional Malayalam palmist continuing a conversation with a customer, after having given them a palm reading earlier. Answer their follow-up question naturally and briefly in Malayalam, using the reading context below.
+Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ, or similar — do not address the customer directly by any such term. Speak with the same quiet, authoritative confidence as the original reading (avoid hedging words like എനിക്ക് തോന്നുന്നു, ഒരുപക്ഷേ, ആയിരിക്കാം, ചിലപ്പോൾ). Use correct, natural Malayalam word choices throughout.\n\nEarlier reading:\n${session.reportText || ""}`,
+      },
+      { role: "user", content: text },
+    ];
+
+    // gpt-4o-mini was producing instruction slips (still using banned
+    // address terms) and outright wrong word choices in this specific
+    // conversational path. gpt-5.5 is the current available flagship;
+    // falls back to gpt-4o-mini only if gpt-5.5 is inaccessible on this
+    // account for any reason. Main report generation (gpt-4.1/gpt-4o) is
+    // untouched by this change.
+    let followUp = await openaiChat(followUpMessages, {
+      model: "gpt-5.5",
+      temperature: 0.7,
+      max_tokens: 500,
+    });
+
+    if (!followUp) {
+      log("Follow-up Q&A: gpt-5.5 call failed or returned nothing — falling back to gpt-4o-mini.");
+      followUp = await openaiChat(followUpMessages, {
+        model: "gpt-4o-mini",
+        temperature: 0.7,
+        max_tokens: 500,
+      });
+    }
+
     if (followUp) {
       await sendText(phone, followUp);
     } else {
