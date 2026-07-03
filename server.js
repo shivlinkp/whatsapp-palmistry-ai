@@ -443,8 +443,131 @@ async function getMediaBase64(mediaId) {
 }
 
 // ---------------------------------------------------------------------------
-// Report generation
+// Voice message support (transcription) — feeds into the SAME text pipeline
+// as typed messages. Does not touch report generation in any way.
 // ---------------------------------------------------------------------------
+
+// Downloads a WhatsApp audio/voice message and returns the raw bytes +
+// mime type (not a data URL — OpenAI's transcription endpoint needs a real
+// file upload, not base64).
+async function getAudioBuffer(mediaId) {
+  try {
+    const metaRes = await fetch(`https://graph.facebook.com/v20.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    });
+    const meta = await metaRes.json();
+    log("Voice media metadata lookup for", mediaId, "-> HTTP", metaRes.status, "response:", JSON.stringify(meta));
+
+    if (!meta.url) {
+      log("Voice media download ABORTED — no url in metadata response for mediaId:", mediaId);
+      return null;
+    }
+
+    const fileRes = await fetch(meta.url, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    });
+
+    if (!fileRes.ok) {
+      log("Voice media file download FAILED — HTTP", fileRes.status, "for mediaId:", mediaId);
+      return null;
+    }
+
+    const buffer = await fileRes.buffer();
+    const mimeType = meta.mime_type || "audio/ogg";
+    log("Voice message downloaded successfully. Size in bytes:", buffer.length, "mime_type:", mimeType);
+
+    if (buffer.length === 0) {
+      log("Voice media download WARNING — downloaded buffer is 0 bytes, treating as failure.");
+      return null;
+    }
+
+    return { buffer, mimeType };
+  } catch (err) {
+    log("Failed to fetch voice media (caught):", err.message);
+    return null;
+  }
+}
+
+// Transcribes voice message bytes via OpenAI's Whisper endpoint. No
+// "language" parameter is passed — Whisper auto-detects, so both Malayalam
+// and English voice messages work without special-casing either.
+async function transcribeVoiceMessage(buffer, mimeType) {
+  if (!OPENAI_API_KEY) {
+    log("OPENAI_API_KEY missing, cannot transcribe voice message");
+    return null;
+  }
+
+  try {
+    const extension = mimeType.includes("mp4")
+      ? "mp4"
+      : mimeType.includes("mpeg")
+      ? "mp3"
+      : mimeType.includes("wav")
+      ? "wav"
+      : "ogg"; // WhatsApp voice notes are typically audio/ogg (opus codec)
+
+    const form = new FormData();
+    form.append("file", new Blob([buffer], { type: mimeType }), `voice.${extension}`);
+    form.append("model", "whisper-1");
+
+    log("Sending voice message to OpenAI for transcription (whisper-1). Size:", buffer.length, "bytes, mime:", mimeType);
+
+    const res = await globalThis.fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: form,
+    });
+
+    const rawText = await res.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      data = { rawText };
+    }
+
+    log("OpenAI transcription HTTP status:", res.status);
+    log("OpenAI transcription full response:", JSON.stringify(data));
+
+    if (!res.ok || !data.text) {
+      log("Voice transcription FAILED:", JSON.stringify(data));
+      return null;
+    }
+
+    const transcript = data.text.trim();
+    log("Voice transcription SUCCEEDED. Transcript:", transcript);
+    return transcript || null;
+  } catch (err) {
+    log("Voice transcription call crashed (caught):", err.message);
+    return null;
+  }
+}
+
+const VOICE_TRANSCRIPTION_FAILED_MESSAGE =
+  "ക്ഷമിക്കണം, നിങ്ങളുടെ ശബ്ദ സന്ദേശം മനസ്സിലാക്കാൻ കഴിഞ്ഞില്ല. ദയവായി വീണ്ടും ശബ്ദ സന്ദേശം അയക്കാമോ?";
+
+// Handles an incoming voice message end-to-end: download -> transcribe ->
+// hand off to the EXACT SAME handleTextMessage() used for typed text, so
+// every downstream stage (detail collection, FAQs, follow-up Q&A, etc.)
+// behaves identically regardless of whether the customer typed or spoke.
+async function handleVoiceMessage(phone, mediaId, session) {
+  log("Voice message received from", phone, "-> mediaId:", mediaId);
+
+  const audio = await getAudioBuffer(mediaId);
+  if (!audio) {
+    await sendText(phone, VOICE_TRANSCRIPTION_FAILED_MESSAGE);
+    return;
+  }
+
+  const transcript = await transcribeVoiceMessage(audio.buffer, audio.mimeType);
+  if (!transcript) {
+    await sendText(phone, VOICE_TRANSCRIPTION_FAILED_MESSAGE);
+    return;
+  }
+
+  log("Voice message transcribed for", phone, "-> treating as text:", transcript);
+  await handleTextMessage(phone, transcript, session);
+}
 
 // Detects short English-language decline/apology text, which is what the
 // model outputs on the rare occasions it refuses instead of writing the
@@ -945,6 +1068,11 @@ async function processWebhookBody(body) {
   if (message.type === "text") {
     const text = message.text?.body || "";
     await handleTextMessage(phone, text, session);
+  } else if (message.type === "audio") {
+    // Voice messages/voice notes — transcribed and then handled exactly
+    // like a normal text message (see handleVoiceMessage above).
+    const mediaId = message.audio?.id;
+    await handleVoiceMessage(phone, mediaId, session);
   } else if (
     message.type === "image" ||
     (message.type === "document" && message.document?.mime_type?.startsWith("image/"))
