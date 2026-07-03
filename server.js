@@ -314,7 +314,10 @@ async function openaiChat(messages, opts = {}) {
         model: requestedModel,
         messages,
         temperature: opts.temperature ?? 0.7,
-        max_tokens: opts.max_tokens || 800,
+        // max_tokens is rejected outright by newer models (e.g. gpt-5.5)
+        // with a 400 error — max_completion_tokens is the current parameter
+        // name and works correctly across all models including older ones.
+        max_completion_tokens: opts.max_tokens || 800,
       }),
     });
     const data = await res.json();
