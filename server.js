@@ -346,7 +346,25 @@ async function openaiChat(messages, opts = {}) {
       log("OpenAI error:", JSON.stringify(data));
       return null;
     }
-    return data.choices?.[0]?.message?.content || null;
+
+    const content = data.choices?.[0]?.message?.content || "";
+    const finishReason = data.choices?.[0]?.finish_reason;
+    const usage = data.usage;
+    log(
+      "openaiChat: success — content length:",
+      content.length,
+      "finish_reason:",
+      finishReason,
+      "usage:",
+      JSON.stringify(usage)
+    );
+    if (!content) {
+      log(
+        "openaiChat: WARNING — HTTP 200 but content is EMPTY. This can happen when a reasoning model spends its entire max_completion_tokens budget on internal reasoning tokens, leaving nothing for visible output. Full response:",
+        JSON.stringify(data)
+      );
+    }
+    return content || null;
   } catch (err) {
     log("OpenAI call failed:", err.message);
     return null;
@@ -898,7 +916,7 @@ async function handleTextMessage(phone, text, session) {
           },
           { role: "user", content: text },
         ],
-        { model: "gpt-5.5", temperature: 0.7, max_tokens: 300 }
+        { model: "gpt-5.5", temperature: 0.7, max_tokens: 800 }
       );
 
       if (preReply) {
@@ -956,7 +974,7 @@ async function handleTextMessage(phone, text, session) {
         },
         { role: "user", content: text },
       ],
-      { model: "gpt-5.5", temperature: 0.7, max_tokens: 300 }
+      { model: "gpt-5.5", temperature: 0.7, max_tokens: 800 }
     );
 
     if (preReply) {
@@ -1030,7 +1048,7 @@ Earlier reading:\n${session.reportText || ""}`,
     let followUp = await openaiChat(followUpMessages, {
       model: "gpt-5.5",
       temperature: 0.7,
-      max_tokens: 500,
+      max_tokens: 800,
     });
 
     if (!followUp) {
@@ -1248,6 +1266,15 @@ async function processWebhookBody(body) {
     const mediaId = message.image?.id || message.document?.id;
     log("Photo received as", message.type, "-> mediaId:", mediaId);
     await handleImageMessage(phone, mediaId, session);
+  } else if (message.type === "unsupported") {
+    // WhatsApp sends a transient "unsupported" placeholder event a few
+    // milliseconds before the real "image"/"document" event for HD media
+    // sends (confirmed repeatedly in logs — same phone, same moment,
+    // always immediately followed by the real photo event). This is not
+    // real customer content, so we log it and say nothing, letting the
+    // follow-up event that arrives right after handle the actual photo —
+    // replying here just confuses the customer mid-send.
+    log("Ignoring transient 'unsupported' placeholder event from", phone, "(real event should follow immediately)");
   } else {
     await sendText(phone, "ദയവായി text ആയോ photo ആയോ അയക്കൂ.");
   }
