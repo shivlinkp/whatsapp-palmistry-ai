@@ -460,14 +460,14 @@ function isLikelyRefusal(text) {
 
 // Dedicated OpenAI call for report generation, logging the full request
 // payload (image truncated) and full raw response.
-async function callOpenAIForReport(messages, maxTokens) {
+async function callOpenAIForReport(messages, maxTokens, model) {
   if (!OPENAI_API_KEY) {
     log("OPENAI_API_KEY missing, cannot generate report");
-    return null;
+    return { ok: false, status: null, data: null, content: null };
   }
 
   const requestBody = {
-    model: "gpt-4o-mini",
+    model,
     messages,
     temperature: 0.8,
     max_tokens: maxTokens,
@@ -484,7 +484,7 @@ async function callOpenAIForReport(messages, maxTokens) {
       ),
     };
   });
-  log("OpenAI report request payload (image truncated):", JSON.stringify({ ...requestBody, messages: loggableMessages }));
+  log(`OpenAI report request payload for model "${model}" (image truncated):`, JSON.stringify({ ...requestBody, messages: loggableMessages }));
 
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -497,17 +497,17 @@ async function callOpenAIForReport(messages, maxTokens) {
     });
     const data = await res.json();
 
-    log("OpenAI report response HTTP status:", res.status);
-    log("OpenAI report full response:", JSON.stringify(data));
+    log(`OpenAI report response HTTP status (model "${model}"):`, res.status);
+    log(`OpenAI report full response (model "${model}"):`, JSON.stringify(data));
 
     if (!res.ok) {
-      log("OpenAI report generation FAILED:", JSON.stringify(data));
-      return null;
+      log(`OpenAI report generation FAILED (model "${model}"):`, JSON.stringify(data));
+      return { ok: false, status: res.status, data, content: null };
     }
-    return data.choices?.[0]?.message?.content || null;
+    return { ok: true, status: res.status, data, content: data.choices?.[0]?.message?.content || null };
   } catch (err) {
-    log("OpenAI report call crashed (caught):", err.message);
-    return null;
+    log(`OpenAI report call crashed (caught) (model "${model}"):`, err.message);
+    return { ok: false, status: null, data: null, content: null, networkError: err.message };
   }
 }
 
@@ -527,7 +527,7 @@ async function generateReport(session) {
   const systemPrompt = `You are an experienced, warm palmistry reader writing a personal reading for a customer, entirely in Malayalam script, minimum 2000 words.
 Cover these themes naturally, in a flowing narrative (not as labeled headings): സ്വഭാവവും വ്യക്തിത്വവും, സ്നേഹവും ബന്ധങ്ങളും, വിവാഹവും കുടുംബജീവിതവും, ജോലി/കരിയർ/ബിസിനസ്, സാമ്പത്തിക കാര്യങ്ങൾ, ഭാവിയിലെ അവസരങ്ങളും വെല്ലുവിളികളും, കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ.
 Write in the traditional palmistry style — describe what the lines and signs suggest or indicate, as tendencies and possibilities (സാധ്യതകൾ), rather than stating outcomes as certain facts. Keep the tone personal, encouraging, and specific to this customer's details.
-Write in a natural narrator voice, the way a palmistry reader would speak to a client in person — there's no need to mention how this reading was produced.
+Write in a natural narrator voice, the way a palmistry reader would speak to a client in person.
 Address the customer by name naturally through the reading.`;
 
   const instructionText = imageAvailable
@@ -548,7 +548,30 @@ Address the customer by name naturally through the reading.`;
     { role: "user", content: userContent },
   ];
 
-  let report = await callOpenAIForReport(messages, 7000);
+  const REPORT_MODEL_PRIMARY = "gpt-4.1";
+  const REPORT_MODEL_FALLBACK = "gpt-4o";
+
+  let result = await callOpenAIForReport(messages, 7000, REPORT_MODEL_PRIMARY);
+
+  // Only fall back if the PRIMARY model itself is unavailable on this
+  // account (invalid/unknown model error) — not for refusals or other
+  // content-based failures, which should surface normally either way.
+  const modelUnavailable =
+    !result.ok &&
+    result.data?.error &&
+    /model/i.test(result.data.error.code || "") &&
+    /not found|does not exist|invalid|unknown/i.test(result.data.error.message || result.data.error.code || "");
+
+  if (modelUnavailable) {
+    log(
+      `Model "${REPORT_MODEL_PRIMARY}" appears unavailable on this account (error: ${JSON.stringify(
+        result.data.error
+      )}) — falling back to "${REPORT_MODEL_FALLBACK}"`
+    );
+    result = await callOpenAIForReport(messages, 7000, REPORT_MODEL_FALLBACK);
+  }
+
+  let report = result.content;
 
   if (report && isLikelyRefusal(report)) {
     log("generateReport: model output looks like a refusal, not a report. Treating as failure. Content was:", report);
