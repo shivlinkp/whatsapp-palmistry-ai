@@ -301,6 +301,8 @@ async function openaiChat(messages, opts = {}) {
     log("OPENAI_API_KEY missing, skipping OpenAI call");
     return null;
   }
+  const requestedModel = opts.model || "gpt-4o-mini";
+  log("openaiChat: requesting model:", requestedModel);
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -309,13 +311,14 @@ async function openaiChat(messages, opts = {}) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: opts.model || "gpt-4o-mini",
+        model: requestedModel,
         messages,
         temperature: opts.temperature ?? 0.7,
         max_tokens: opts.max_tokens || 800,
       }),
     });
     const data = await res.json();
+    log("openaiChat: HTTP status:", res.status, "-> actual model used (response.model):", data.model);
     if (!res.ok) {
       log("OpenAI error:", JSON.stringify(data));
       return null;
