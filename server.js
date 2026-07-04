@@ -229,6 +229,18 @@ const ASK_ALL_DETAILS_MESSAGE = `ദയവായി താഴെ പറയുന
 • ജനനത്തീയതി
 • ലിംഗം`;
 
+const ASK_SECOND_PERSON_DETAILS_MESSAGE = `തീർച്ചയായും, ഇതേ ചാറ്റിൽ തന്നെ അടുത്ത വ്യക്തിയുടെ കൈരേഖാ വിശകലനം ആരംഭിക്കാം.
+
+ദയവായി ആ വ്യക്തിയുടെ താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
+
+• പേര്
+• ജനനത്തീയതി
+• ലിംഗം
+
+(ഇഷ്ടമെങ്കിൽ, ഈ വ്യക്തി നിങ്ങളുമായി എങ്ങനെ ബന്ധപ്പെട്ടിരിക്കുന്നു എന്നും പറയാം — നിർബന്ധമില്ല.)
+
+ഫീസ്: ₹99 മാത്രം.`;
+
 function handRequestMessage(name, gender) {
   const hand = gender === "female" ? "ഇടത്" : "വലത്";
   return `നന്ദി ${name}.
@@ -250,12 +262,15 @@ Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിട
 const QR_FAILURE_MESSAGE =
   "QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ.";
 
-function paymentReceivedMessage(name) {
+function paymentReceivedMessage(name, isRepeatOrder) {
+  const timingLine = isRepeatOrder
+    ? "Report ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും."
+    : "Report ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
   return `Payment screenshot ലഭിച്ചു. നന്ദി ${name}.
 
 നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
 
-Report ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും.`;
+${timingLine}`;
 }
 
 const REPORT_PREPARING_MESSAGE =
@@ -375,7 +390,7 @@ async function openaiChat(messages, opts = {}) {
 // Returns only the fields it is confident about; never overwrites what we
 // don't find. Falls back to simple regex if OpenAI is unavailable/fails.
 async function extractFields(text, known) {
-  const result = { name: null, dob: null, gender: null };
+  const result = { name: null, dob: null, gender: null, relation: null };
 
   const dobMatch = text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/);
   if (dobMatch) {
@@ -390,19 +405,20 @@ async function extractFields(text, known) {
     result.gender = "female";
   }
 
-  const prompt = `Extract name, date of birth, and gender from the customer's WhatsApp message below.
+  const prompt = `Extract name, date of birth, gender, and (if mentioned) how this person relates to the customer, from the customer's WhatsApp message below.
 The customer may send the details in ANY order, on separate lines, comma-separated, or in Malayalam/Manglish. Examples of valid inputs:
 "Shivlin, 07-11-1992, Male"
 "Shivlin\\n07-11-1992\\nMale"
 "Male\\n07-11-1992\\nShivlin"
 "പേര് Shivlin ജനനത്തീയതി 07-11-1992 ലിംഗം Male"
+"This is for my brother, Shivlin, 07-11-1992, Male"
 
 Already known (do not change unless the new message clearly overrides it): ${JSON.stringify(known)}
 Customer message: """${text}"""
 
 Reply with ONLY a raw JSON object, no markdown, no explanation, in this exact shape:
-{"name": string or null, "dob": "DD-MM-YYYY" or null, "gender": "male" or "female" or null}
-If a field is not present in the message, set it to null.`;
+{"name": string or null, "dob": "DD-MM-YYYY" or null, "gender": "male" or "female" or null, "relation": string or null}
+"relation" should only be set if the customer explicitly describes how this person relates to them (e.g. "brother", "friend", "wife") — otherwise null. If a field is not present in the message, set it to null.`;
 
   const raw = await openaiChat([{ role: "user", content: prompt }], {
     model: "gpt-4o-mini",
@@ -417,6 +433,7 @@ If a field is not present in the message, set it to null.`;
       if (parsed.name) result.name = parsed.name;
       if (parsed.dob) result.dob = parsed.dob;
       if (parsed.gender === "male" || parsed.gender === "female") result.gender = parsed.gender;
+      if (parsed.relation) result.relation = parsed.relation;
     } catch (err) {
       log("Extraction JSON parse failed, using regex-only result");
     }
@@ -538,6 +555,44 @@ async function isPalmPhoto(imageDataUrl) {
   } catch (err) {
     log("Palm photo validation crashed (caught):", err.message);
     return { valid: true, reason: "exception — defaulting to accept" };
+  }
+}
+
+// After a customer already has their own report, do they want to start a
+// NEW reading for a DIFFERENT person, in this SAME chat? Deliberately
+// conservative: any ambiguity, error, or non-YES answer defaults to false,
+// so a misclassification never accidentally resets someone's own session.
+async function wantsAnotherPersonReading(text) {
+  if (!OPENAI_API_KEY) return false;
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: `The customer already received their own palm reading in this WhatsApp chat. Does this NEW message clearly indicate they now want to start ANOTHER palm reading for a DIFFERENT person (a friend, family member, etc.) — in this same chat, not a general question about their own reading? Reply with ONLY one word: YES or NO.\n\nMessage: """${text}"""`,
+          },
+        ],
+        max_completion_tokens: 5,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      log("wantsAnotherPersonReading check FAILED:", JSON.stringify(data));
+      return false;
+    }
+    const answer = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
+    log("wantsAnotherPersonReading classification ->", answer);
+    return answer.startsWith("YES");
+  } catch (err) {
+    log("wantsAnotherPersonReading crashed (caught):", err.message);
+    return false;
   }
 }
 
@@ -734,7 +789,7 @@ async function callOpenAIForReport(messages, maxTokens, model) {
 }
 
 async function generateReport(session) {
-  const { name, dob, gender, palmMediaId } = session;
+  const { name, dob, gender, palmMediaId, relation } = session;
 
   let imageDataUrl = null;
   if (palmMediaId) {
@@ -745,6 +800,10 @@ async function generateReport(session) {
 
   const imageAvailable = Boolean(imageDataUrl);
   log("generateReport: imageAvailable =", imageAvailable);
+
+  const relationLine = relation
+    ? `\n\n(Context for you only, not to be stated as a fact in the reading: the customer described this person as their ${relation}. You may let this inform tone/warmth naturally if relevant, but do not fabricate anything about the relationship that wasn't stated.)`
+    : "";
 
   const systemPrompt = `You are an experienced traditional Malayalam palmist (കൈരേഖാ വിശാരദൻ) with many years of practice, writing a formal, authoritative personal palm reading entirely in Malayalam script, minimum 2000 words.
 
@@ -778,10 +837,10 @@ Do not include any disclaimers. Do not say you are unable to see or analyze an i
   const instructionText = imageAvailable
     ? `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
         gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
-      }\n\nThe customer's palm image is attached. Use it together with the details above to write the full reading, referencing specific palm lines and signs naturally.`
+      }\n\nThe customer's palm image is attached. Use it together with the details above to write the full reading, referencing specific palm lines and signs naturally.${relationLine}`
     : `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
         gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
-      }\n\nWrite the full palmistry reading based on these details. Describe palm lines and signs naturally as part of the reading, without mentioning that no image was provided.`;
+      }\n\nWrite the full palmistry reading based on these details. Describe palm lines and signs naturally as part of the reading, without mentioning that no image was provided.${relationLine}`;
 
   const userContent = [{ type: "text", text: instructionText }];
   if (imageAvailable) {
@@ -891,6 +950,7 @@ function applyExtractedPatch(session, extracted) {
   if (extracted.name && !session.name) patch.name = extracted.name;
   if (extracted.dob && !session.dob) patch.dob = extracted.dob;
   if (extracted.gender && !session.gender) patch.gender = extracted.gender;
+  if (extracted.relation && !session.relation) patch.relation = extracted.relation;
   return patch;
 }
 
@@ -1076,6 +1136,34 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
   }
 
   if (session.stage === "report_sent") {
+    const wantsAnother = await wantsAnotherPersonReading(text);
+    if (wantsAnother) {
+      log(
+        "Customer at",
+        phone,
+        "wants a reading for another person — restarting collection flow in the same chat (order #",
+        (session.orderCount || 1) + 1,
+        ")"
+      );
+      await db.updateSession(phone, {
+        stage: "collecting",
+        name: null,
+        dob: null,
+        gender: null,
+        relation: null,
+        palmMediaId: null,
+        paymentReceived: false,
+        reportText: null,
+        reportStatus: "none",
+        reportDueAt: null,
+        reportAttempts: 0,
+        reportError: null,
+        orderCount: (session.orderCount || 1) + 1,
+      });
+      await sendText(phone, ASK_SECOND_PERSON_DETAILS_MESSAGE);
+      return;
+    }
+
     const todayStr = new Date().toISOString().slice(0, 10); // e.g. "2026-07-03"
     const currentYear = new Date().getFullYear();
 
@@ -1087,9 +1175,8 @@ Never use casual/familiar address terms like ചേട്ടാ, ചേച്ച
 
 Today's actual date is ${todayStr} (year ${currentYear}). If the customer asks about future timing (which year, when, how soon, etc.), any year or timeframe you mention MUST be ${currentYear} or later — never state a year that has already passed as if it were a future prediction. If asked generally "when," prefer a relative timeframe (അടുത്ത കുറച്ച് മാസങ്ങൾ, അടുത്ത വർഷം, അടുത്ത 1-2 വർഷത്തിനുള്ളിൽ) over naming a specific year unless you are confident it is genuinely in the future.
 
-Customers write casually and in Manglish (Malayalam typed in English letters, e.g. "Verey oraludey kayi koodi nokkumo" = "can you also look at another person's hand"). Read past literal wording to their actual intent before answering:
+Customers write casually and in Manglish (Malayalam typed in English letters). Read past literal wording to their actual intent before answering:
 - If they're asking a question about THEIR OWN earlier reading, answer using the reading context below.
-- If they're asking you to read a DIFFERENT person's palm, or to order another reading (for a friend, family member, etc.), explain clearly that each reading is tied to whichever WhatsApp number starts that conversation — the other person needs to send the first message ("Hi") to this same business number from a WhatsApp number that hasn't already started a reading. It does not have to be their own permanent number — any WhatsApp account not already in use for a reading works (e.g. a relative's phone temporarily, if the person doesn't have their own WhatsApp). Once they message in, they'll be asked for exactly three things: പേര് (name), ജനനത്തീയതി (date of birth), and ലിംഗം (gender) — always use precisely these three Malayalam words, never ലൈംഗികത (a different, unrelated word meaning sexuality — do not use it) — followed by a clear photo of their palm. The fee is ₹99, same as before. Do not attempt to interpret a second person's hand in this conversation.
 - If they're asking about price for an additional or repeat reading, the fee is ₹99 per person, same as before.
 - If it's a greeting, thanks, or general conversation unrelated to the reading, respond warmly and briefly in the same authoritative but personal voice, without forcing it back to palm topics.
 
@@ -1183,7 +1270,7 @@ async function handleImageMessage(phone, mediaId, session) {
       reportError: null,
     });
     log("Report scheduled (via DB, no setTimeout) for", phone, "due at", dueAt.toISOString());
-    await sendText(phone, paymentReceivedMessage(session.name || ""));
+    await sendText(phone, paymentReceivedMessage(session.name || "", (session.orderCount || 1) > 1));
     return;
   }
 
