@@ -486,6 +486,61 @@ async function getMediaBase64(mediaId) {
   }
 }
 
+// Quick, cheap vision check: is this actually a photo of a human palm/hand?
+// Run BEFORE sending the QR/payment ask, so a wrong photo (a wall, tiles,
+// a face, etc.) gets caught immediately instead of only being discovered
+// during report generation — after the customer has already paid ₹99.
+// Fails OPEN (treats as valid) on any error, so an infrastructure hiccup
+// on our end never blocks a genuine customer from proceeding.
+async function isPalmPhoto(imageDataUrl) {
+  if (!imageDataUrl) {
+    return { valid: true, reason: "no image data to check — defaulting to accept" };
+  }
+  if (!OPENAI_API_KEY) {
+    return { valid: true, reason: "OPENAI_API_KEY missing — defaulting to accept" };
+  }
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Look at this image. Is it a clear photo of a human hand showing the palm (suitable for a palm reading)? Reply with ONLY one word: YES or NO.",
+              },
+              { type: "image_url", image_url: { url: imageDataUrl } },
+            ],
+          },
+        ],
+        max_completion_tokens: 10,
+      }),
+    });
+    const data = await res.json();
+    log("Palm photo validation -> HTTP status:", res.status, "response:", JSON.stringify(data));
+
+    if (!res.ok) {
+      return { valid: true, reason: "validation call failed (HTTP " + res.status + ") — defaulting to accept" };
+    }
+
+    const answer = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
+    if (!answer) {
+      return { valid: true, reason: "empty validation response — defaulting to accept" };
+    }
+    return { valid: answer.startsWith("YES"), reason: answer };
+  } catch (err) {
+    log("Palm photo validation crashed (caught):", err.message);
+    return { valid: true, reason: "exception — defaulting to accept" };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Voice message support (transcription) — feeds into the SAME text pipeline
 // as typed messages. Does not touch report generation in any way.
@@ -1073,10 +1128,32 @@ Earlier reading:\n${session.reportText || ""}`,
   }
 }
 
+const NOT_A_PALM_MESSAGE_TEMPLATE = (gender) =>
+  `ക്ഷമിക്കണം, അയച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. ദയവായി നിങ്ങളുടെ ${
+    gender === "female" ? "ഇടത്" : "വലത്"
+  } കൈയുടെ താളത്തിൽ നിന്ന്, നല്ല വെളിച്ചത്തിൽ എടുത്ത വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയച്ചുതരാമോ?`;
+
+const PHOTO_REPLACED_MESSAGE =
+  "പുതിയ ഫോട്ടോ ലഭിച്ചു, നന്ദി. ഇത് ഉപയോഗിച്ച് നിങ്ങളുടെ കൈരേഖാ വിശകലനം വീണ്ടും തയ്യാറാക്കുന്നു. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
+
 async function handleImageMessage(phone, mediaId, session) {
   log("Current session state for", phone, "->", JSON.stringify({ stage: session.stage }));
 
   if (session.stage === "awaiting_photo") {
+    // Validate BEFORE sending QR/payment — catches a wrong photo (wall,
+    // face, tiles, etc.) immediately instead of only discovering it during
+    // report generation, after the customer has already paid ₹99.
+    const imageDataUrl = await getMediaBase64(mediaId);
+    const validation = await isPalmPhoto(imageDataUrl);
+    log("Palm photo validation result for", phone, "->", JSON.stringify(validation));
+
+    if (!validation.valid) {
+      await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
+      // Stage stays "awaiting_photo", nothing saved — customer just sends
+      // another photo and we validate again.
+      return;
+    }
+
     session = await db.updateSession(phone, { palmMediaId: mediaId });
 
     const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
@@ -1093,7 +1170,10 @@ async function handleImageMessage(phone, mediaId, session) {
 
   if (session.stage === "awaiting_payment") {
     log("Payment screenshot received from", phone);
-    const dueAt = new Date(Date.now() + (25 + Math.random() * 5) * 60 * 1000); // 25-30 min from now
+    // Actual wait is 10-15 min — shorter than what we tell the customer
+    // (still "25-30 minutes" in every customer-facing message, unchanged)
+    // so delivery reliably beats their expectation instead of risking it.
+    const dueAt = new Date(Date.now() + (10 + Math.random() * 5) * 60 * 1000);
     await db.updateSession(phone, {
       paymentReceived: true,
       stage: "awaiting_report",
@@ -1104,6 +1184,26 @@ async function handleImageMessage(phone, mediaId, session) {
     });
     log("Report scheduled (via DB, no setTimeout) for", phone, "due at", dueAt.toISOString());
     await sendText(phone, paymentReceivedMessage(session.name || ""));
+    return;
+  }
+
+  if (session.stage === "awaiting_report") {
+    // Previously: any photo sent here fell through to a generic "photo
+    // received, thanks" with NO session update at all — so if the report
+    // failed because the original photo wasn't a valid palm, a corrected
+    // photo sent afterward was silently ignored forever, and every retry
+    // kept re-using the original bad photo. Now: treat this as a genuine
+    // replacement and actually reschedule using the new photo.
+    log("New photo received while awaiting_report for", phone, "— treating as a corrected palm photo submission.");
+    const retryDueAt = new Date(Date.now() + 2 * 60 * 1000);
+    await db.updateSession(phone, {
+      palmMediaId: mediaId,
+      reportStatus: "pending",
+      reportAttempts: 0,
+      reportDueAt: retryDueAt,
+      reportError: null,
+    });
+    await sendText(phone, PHOTO_REPLACED_MESSAGE);
     return;
   }
 
