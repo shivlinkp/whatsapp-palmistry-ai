@@ -576,7 +576,16 @@ async function wantsAnotherPersonReading(text) {
         messages: [
           {
             role: "user",
-            content: `The customer already received their own palm reading in this WhatsApp chat. Does this NEW message clearly indicate they now want to start ANOTHER palm reading for a DIFFERENT person (a friend, family member, etc.) — in this same chat, not a general question about their own reading? Reply with ONLY one word: YES or NO.\n\nMessage: """${text}"""`,
+            content: `The customer already received their own palm reading in this WhatsApp chat (and possibly a reading for one other person too, in the same chat). Does this NEW message clearly indicate they now want to START a NEW palm reading for a DIFFERENT person? Reply YES only if they are clearly asking to begin/order a new reading for someone else.
+
+Reply NO if the message is instead:
+- A question ABOUT an existing reading or reply (even if it mentions another person by name/relation) — e.g. "Ente karyamano wifeinte karyamano" ("is this about me or my wife?") is asking to CLARIFY which existing reading a reply refers to — that is NO, not a new-reading request.
+- A general question, thanks, or comment.
+- Ambiguous in any way.
+
+Reply with ONLY one word: YES or NO.
+
+Message: """${text}"""`,
           },
         ],
         max_completion_tokens: 5,
@@ -1179,6 +1188,15 @@ Customers write casually and in Manglish (Malayalam typed in English letters). R
 - If they're asking a question about THEIR OWN earlier reading, answer using the reading context below.
 - If they're asking about price for an additional or repeat reading, the fee is ₹99 per person, same as before.
 - If it's a greeting, thanks, or general conversation unrelated to the reading, respond warmly and briefly in the same authoritative but personal voice, without forcing it back to palm topics.
+${
+  (session.orderCount || 1) > 1
+    ? `\nIMPORTANT: this customer has ordered more than one reading in this chat (this is order #${
+        session.orderCount
+      }, most recently for ${
+        session.name || "the person below"
+      }). The reading below belongs to that most recent order specifically. If the customer's message is at all ambiguous about WHICH person's reading you're discussing (e.g. "is this about me or about my wife?"), explicitly clarify by naming whose reading this is before answering — do not answer generically as if there's only one reading in this chat.`
+    : ""
+}
 
 Earlier reading:\n${session.reportText || ""}`,
       },
