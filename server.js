@@ -74,7 +74,19 @@ const qrMessageIdsByPhone = new Map();
 // WhatsApp send helpers
 // ---------------------------------------------------------------------------
 
+// Human-like pacing between outgoing messages: 10-15 seconds. This ONLY
+// affects how quickly consecutive WhatsApp messages are sent — it has no
+// effect on report/assessment scheduling (report_due_at), which is
+// computed separately via real Date math and stays exactly as configured.
+function randomSendDelayMs() {
+  return 10000 + Math.random() * 5000; // 10-15 seconds
+}
+
 async function sendWhatsAppRequest(payload) {
+  const delay = randomSendDelayMs();
+  log(`Waiting ${(delay / 1000).toFixed(1)}s before sending (human-like pacing)`);
+  await new Promise((resolve) => setTimeout(resolve, delay));
+
   log("Outgoing WhatsApp API payload:", JSON.stringify(payload));
 
   try {
@@ -260,6 +272,7 @@ const PHOTO_RECEIVED_PAYMENT_MESSAGE = `ഫോട്ടോ ലഭിച്ചു
 Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`;
 
 const SUPPORT_EMAIL = "contact@boldwordsmedia.com";
+const SUPPORT_EMAIL_INQUIRY_THRESHOLD = 3; // offer support email after this many messages while awaiting_report
 
 const QR_FAILURE_MESSAGE =
   `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ഞങ്ങളെ ബന്ധപ്പെടാം.`;
@@ -1011,6 +1024,25 @@ async function progressCollectingStage(phone, session) {
   return updated;
 }
 
+// Shared by all three ways a customer can confirm payment: screenshot image,
+// PDF receipt, or (if they can't send either) typing a transaction ID.
+// Real scheduling stays 10-15 min regardless of source — unaffected by the
+// per-message send delay, which is a separate concern.
+async function confirmPaymentAndScheduleReport(phone, session, sourceLabel) {
+  const dueAt = new Date(Date.now() + (10 + Math.random() * 5) * 60 * 1000);
+  await db.updateSession(phone, {
+    paymentReceived: true,
+    stage: "awaiting_report",
+    reportStatus: "pending",
+    reportDueAt: dueAt,
+    reportAttempts: 0,
+    reportError: null,
+    awaitingTransactionId: false,
+  });
+  log(`Payment confirmed via ${sourceLabel} for`, phone, "— report scheduled (via DB, no setTimeout), due at", dueAt.toISOString());
+  await sendText(phone, paymentReceivedMessage(session.name || "", (session.orderCount || 1) > 1));
+}
+
 // Hidden testing command — wipes a phone number's session back to a fresh
 // state so the same test number(s) can be reused indefinitely instead of
 // needing a new number for every test run. Not documented to customers;
@@ -1122,18 +1154,7 @@ End by asking them to share their പേര് (name), ജനനത്തീയ�
       // send a screenshot — accept whatever they send now, unverified, and
       // proceed exactly as if a payment screenshot had arrived.
       log("Transaction ID received (unverified) for", phone, "-> treating as payment confirmation. Text was:", text);
-      const dueAt = new Date(Date.now() + (10 + Math.random() * 5) * 60 * 1000);
-      await db.updateSession(phone, {
-        paymentReceived: true,
-        stage: "awaiting_report",
-        reportStatus: "pending",
-        reportDueAt: dueAt,
-        reportAttempts: 0,
-        reportError: null,
-        awaitingTransactionId: false,
-      });
-      log("Report scheduled (via transaction id text, no setTimeout) for", phone, "due at", dueAt.toISOString());
-      await sendText(phone, paymentReceivedMessage(session.name || "", (session.orderCount || 1) > 1));
+      await confirmPaymentAndScheduleReport(phone, session, "transaction ID text");
       return;
     }
 
@@ -1180,8 +1201,17 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
   }
 
   if (session.stage === "awaiting_report") {
+    // Track how many times this customer has messaged while still waiting.
+    // After several inquiries with no report yet, proactively offer the
+    // support email rather than waiting for them to ask for it.
+    const inquiryCount = (session.awaitingReportInquiryCount || 0) + 1;
+    await db.updateSession(phone, { awaitingReportInquiryCount: inquiryCount });
+    const offerSupport = inquiryCount >= SUPPORT_EMAIL_INQUIRY_THRESHOLD;
+    const withSupport = (msg) =>
+      offerSupport ? `${msg}\n\nകൂടുതൽ സഹായത്തിന് ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ഞങ്ങളെ ബന്ധപ്പെടാം.` : msg;
+
     if (!isReportStatusQuery(text)) {
-      await sendText(phone, REPORT_STILL_PENDING_MESSAGE);
+      await sendText(phone, withSupport(REPORT_STILL_PENDING_MESSAGE));
       return;
     }
 
@@ -1190,7 +1220,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
 
     if (fresh.reportStatus === "sent" && fresh.reportText) {
       // Self-heal an edge case where stage didn't get updated in sync.
-      await db.updateSession(phone, { stage: "report_sent" });
+      await db.updateSession(phone, { stage: "report_sent", awaitingReportInquiryCount: 0 });
       await sendLongText(phone, fresh.reportText);
       return;
     }
@@ -1200,13 +1230,15 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
       const resetSession = await db.updateSession(phone, { reportAttempts: 0, reportStatus: "pending" });
       const result = await generateAndDeliverReport(resetSession);
       if (!result.success) {
-        await sendText(phone, result.exhausted ? REPORT_EXHAUSTED_MESSAGE : REPORT_STILL_PENDING_MESSAGE);
+        await sendText(phone, withSupport(result.exhausted ? REPORT_EXHAUSTED_MESSAGE : REPORT_STILL_PENDING_MESSAGE));
+      } else {
+        await db.updateSession(phone, { awaitingReportInquiryCount: 0 });
       }
       return;
     }
 
     // status === 'pending'
-    await sendText(phone, REPORT_STILL_PENDING_MESSAGE);
+    await sendText(phone, withSupport(REPORT_STILL_PENDING_MESSAGE));
     return;
   }
 
@@ -1347,20 +1379,7 @@ async function handleImageMessage(phone, mediaId, session) {
 
   if (session.stage === "awaiting_payment") {
     log("Payment screenshot received from", phone);
-    // Actual wait is 10-15 min — shorter than what we tell the customer
-    // (still "25-30 minutes" in every customer-facing message, unchanged)
-    // so delivery reliably beats their expectation instead of risking it.
-    const dueAt = new Date(Date.now() + (10 + Math.random() * 5) * 60 * 1000);
-    await db.updateSession(phone, {
-      paymentReceived: true,
-      stage: "awaiting_report",
-      reportStatus: "pending",
-      reportDueAt: dueAt,
-      reportAttempts: 0,
-      reportError: null,
-    });
-    log("Report scheduled (via DB, no setTimeout) for", phone, "due at", dueAt.toISOString());
-    await sendText(phone, paymentReceivedMessage(session.name || "", (session.orderCount || 1) > 1));
+    await confirmPaymentAndScheduleReport(phone, session, "screenshot image");
     return;
   }
 
@@ -1566,6 +1585,16 @@ async function processWebhookBody(body) {
     const mediaId = message.image?.id || message.document?.id;
     log("Photo received as", message.type, "-> mediaId:", mediaId);
     await handleImageMessage(phone, mediaId, session);
+  } else if (
+    message.type === "document" &&
+    message.document?.mime_type === "application/pdf" &&
+    session.stage === "awaiting_payment"
+  ) {
+    // Payment receipt sent as a PDF (some UPI apps/banks do this instead of
+    // a screenshot) — accepted unconditionally, same trust model as the
+    // transaction-ID fallback: no parsing/verification, just proceed.
+    log("Payment PDF receipt received from", phone, "-> accepting unconditionally, proceeding to report scheduling.");
+    await confirmPaymentAndScheduleReport(phone, session, "PDF receipt");
   } else if (message.type === "unsupported") {
     // WhatsApp sends a transient "unsupported" placeholder event a few
     // milliseconds before the real "image"/"document" event for HD media
