@@ -441,6 +441,8 @@ The customer may send the details in ANY order, on separate lines, comma-separat
 "പേര് Shivlin ജനനത്തീയതി 07-11-1992 ലിംഗം Male"
 "This is for my brother, Shivlin, 07-11-1992, Male"
 
+If gender is not explicitly stated as a word (male/female/ആൺ/പെൺ etc.), but the given name is a common Indian name with a clear, widely-recognized conventional gender in Indian naming convention (e.g. Satheesh, Ramesh, Suresh, Anil, Vijay, Rahul, Shivlin → male; Priya, Anitha, Divya, Lakshmi, Meera, Nidhiya → female), infer that gender confidently instead of leaving it null — do not force the customer to state the obvious. Only do this when you are genuinely confident the name is unambiguous; if the name could plausibly be used for either gender, or is unfamiliar to you, leave gender null so it gets asked explicitly instead of guessed.
+
 Already known (do not change unless the new message clearly overrides it): ${JSON.stringify(known)}
 Customer message: """${text}"""
 
