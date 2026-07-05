@@ -969,6 +969,17 @@ async function progressCollectingStage(phone, session) {
     await sendText(phone, ASK_ALL_DETAILS_MESSAGE);
     return session;
   }
+
+  if (session.palmMediaId) {
+    // A photo was already sent earlier (before all details were known) and
+    // stashed — don't ask for it again, just process it now.
+    log("progressCollectingStage: details complete AND a photo was already stashed for", phone, "— processing it now instead of re-asking.");
+    const updated = await db.updateSession(phone, { stage: "awaiting_photo" });
+    await sendText(phone, `നന്ദി ${updated.name}.`);
+    await processReceivedPalmPhoto(phone, session.palmMediaId, updated);
+    return updated;
+  }
+
   const updated = await db.updateSession(phone, { stage: "awaiting_photo" });
   await sendText(phone, handRequestMessage(updated.name, updated.gender));
   return updated;
@@ -1241,35 +1252,41 @@ const NOT_A_PALM_MESSAGE_TEMPLATE = (gender) =>
 const PHOTO_REPLACED_MESSAGE =
   "പുതിയ ഫോട്ടോ ലഭിച്ചു, നന്ദി. ഇത് ഉപയോഗിച്ച് നിങ്ങളുടെ കൈരേഖാ വിശകലനം വീണ്ടും തയ്യാറാക്കുന്നു. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
 
+// Validates a palm photo and either sends the QR (moving to
+// awaiting_payment) or asks for a proper resend (staying in awaiting_photo).
+// Shared between the normal awaiting_photo flow and the case where a photo
+// arrives BEFORE name/DOB/gender are known (see handleImageMessage and
+// progressCollectingStage) — previously that second case silently
+// discarded the photo entirely.
+async function processReceivedPalmPhoto(phone, mediaId, session) {
+  const imageDataUrl = await getMediaBase64(mediaId);
+  const validation = await isPalmPhoto(imageDataUrl);
+  log("Palm photo validation result for", phone, "->", JSON.stringify(validation));
+
+  if (!validation.valid) {
+    await db.updateSession(phone, { stage: "awaiting_photo", palmMediaId: null });
+    await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
+    return;
+  }
+
+  await db.updateSession(phone, { palmMediaId: mediaId, stage: "awaiting_photo" });
+
+  const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+  if (!qrSent) {
+    log("QR image failed to send to", phone, "— NOT sending payment message. Staying in awaiting_photo for retry.");
+    await sendText(phone, QR_FAILURE_MESSAGE);
+    return;
+  }
+
+  await db.updateSession(phone, { stage: "awaiting_payment" });
+  await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
+}
+
 async function handleImageMessage(phone, mediaId, session) {
   log("Current session state for", phone, "->", JSON.stringify({ stage: session.stage }));
 
   if (session.stage === "awaiting_photo") {
-    // Validate BEFORE sending QR/payment — catches a wrong photo (wall,
-    // face, tiles, etc.) immediately instead of only discovering it during
-    // report generation, after the customer has already paid ₹99.
-    const imageDataUrl = await getMediaBase64(mediaId);
-    const validation = await isPalmPhoto(imageDataUrl);
-    log("Palm photo validation result for", phone, "->", JSON.stringify(validation));
-
-    if (!validation.valid) {
-      await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
-      // Stage stays "awaiting_photo", nothing saved — customer just sends
-      // another photo and we validate again.
-      return;
-    }
-
-    session = await db.updateSession(phone, { palmMediaId: mediaId });
-
-    const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
-    if (!qrSent) {
-      log("QR image failed to send to", phone, "— NOT sending payment message. Staying in awaiting_photo for retry.");
-      await sendText(phone, QR_FAILURE_MESSAGE);
-      return;
-    }
-
-    await db.updateSession(phone, { stage: "awaiting_payment" });
-    await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
+    await processReceivedPalmPhoto(phone, mediaId, session);
     return;
   }
 
@@ -1313,12 +1330,22 @@ async function handleImageMessage(phone, mediaId, session) {
   }
 
   if (session.stage === "new" || session.stage === "collecting") {
-    await sendText(phone, ASK_ALL_DETAILS_MESSAGE);
+    // Previously: a photo sent before name/DOB/gender were known was
+    // completely discarded — not saved anywhere — and the customer would
+    // later be asked for "a photo" again during awaiting_photo as if it
+    // had never been sent. Now: stash it, and acknowledge that it's saved.
+    log("Photo received early (stage", session.stage, ") for", phone, "— stashing mediaId for later, not discarding.");
+    await db.updateSession(phone, { palmMediaId: mediaId });
+    await sendText(
+      phone,
+      "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_ALL_DETAILS_MESSAGE
+    );
     return;
   }
 
   await sendText(phone, "ഫോട്ടോ ലഭിച്ചു, നന്ദി.");
 }
+
 
 // ---------------------------------------------------------------------------
 // Polling worker — replaces setTimeout for report delivery. Runs every 60s,
