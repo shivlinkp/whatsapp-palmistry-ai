@@ -294,7 +294,10 @@ function matchFaq(text) {
   const whatGet = /(what.*get|enthanu kittu|entha kittunnath|what do i|what will i)/i;
   const howMuch = /(how much|price|cost|fee|rate|entha vila|entra vila|₹)/i;
   const howLong = /(how long|when.*report|time.*report|eppo kittum|how many min)/i;
+  const asksForNumber = /(phone number|mobile number|upi number|payment number|account number|your number|number tharo|number parayo|number koodukumo|number tharuo)/i;
 
+  if (asksForNumber.test(t))
+    return "ഇത് ഒരു കമ്പനി അക്കൗണ്ട് ആണ്; വ്യക്തിഗത payment നമ്പർ ഇല്ല. മുകളിൽ നൽകിയിരിക്കുന്ന QR Code സ്കാൻ ചെയ്ത്, ഏത് UPI ആപ്പ് ഉപയോഗിച്ചും (Google Pay, PhonePe, Paytm etc.) ₹99 payment ചെയ്യാം. Payment കഴിഞ്ഞാൽ screenshot ഇവിടെ അയച്ചാൽ മതി.";
   if (howMuch.test(t)) return "ഫീസ് ₹99 മാത്രം.";
   if (howLong.test(t)) return "Payment screenshot അയച്ചതിന് ശേഷം ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ report ലഭിക്കും.";
   if (whatGet.test(t)) return "നിങ്ങളുടെ സ്വഭാവം, ബന്ധങ്ങൾ, വിവാഹം, കരിയർ, സാമ്പത്തികം, ഭാവി എന്നിവയെക്കുറിച്ചുള്ള വിശദമായ കൈരേഖാ വിശകലനം ലഭിക്കും.";
@@ -964,9 +967,20 @@ function applyExtractedPatch(session, extracted) {
 }
 
 async function progressCollectingStage(phone, session) {
-  const missing = !session.name || !session.dob || !session.gender;
-  if (missing) {
-    await sendText(phone, ASK_ALL_DETAILS_MESSAGE);
+  const missingFields = [];
+  if (!session.name) missingFields.push("പേര്");
+  if (!session.dob) missingFields.push("ജനനത്തീയതി");
+  if (!session.gender) missingFields.push("ലിംഗം");
+
+  if (missingFields.length > 0) {
+    // Only ask for what's actually still missing — previously this always
+    // sent the full "please send name/DOB/gender" message even when some
+    // fields (e.g. name and gender) had already been provided.
+    const message =
+      missingFields.length === 3
+        ? ASK_ALL_DETAILS_MESSAGE
+        : `നന്ദി! ദയവായി ${missingFields.join(", ")} കൂടി അയച്ചുതരാമോ?`;
+    await sendText(phone, message);
     return session;
   }
 
@@ -1335,6 +1349,15 @@ async function handleImageMessage(phone, mediaId, session) {
     // later be asked for "a photo" again during awaiting_photo as if it
     // had never been sent. Now: stash it, and acknowledge that it's saved.
     log("Photo received early (stage", session.stage, ") for", phone, "— stashing mediaId for later, not discarding.");
+
+    if (session.stage === "new") {
+      // This is genuinely the customer's first-ever contact — send the
+      // "Hi" welcome/service intro FIRST, before anything else, exactly
+      // as if their first message had been text instead of a photo.
+      await sendText(phone, WELCOME_MESSAGE);
+      await db.updateSession(phone, { stage: "collecting" });
+    }
+
     await db.updateSession(phone, { palmMediaId: mediaId });
     await sendText(
       phone,
