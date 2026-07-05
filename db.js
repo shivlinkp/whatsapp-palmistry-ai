@@ -59,6 +59,7 @@ async function initDb() {
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS relation TEXT;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS order_count INTEGER NOT NULL DEFAULT 1;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_transaction_id BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_report_inquiry_count INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_sessions_report_due
     ON sessions (report_status, report_due_at);
@@ -86,6 +87,7 @@ function rowToSession(row) {
     relation: row.relation,
     orderCount: row.order_count,
     awaitingTransactionId: row.awaiting_transaction_id,
+    awaitingReportInquiryCount: row.awaiting_report_inquiry_count,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -125,6 +127,7 @@ const FIELD_MAP = {
   relation: "relation",
   orderCount: "order_count",
   awaitingTransactionId: "awaiting_transaction_id",
+  awaitingReportInquiryCount: "awaiting_report_inquiry_count",
 };
 
 // Updates only the given fields for a phone number's session, bumps
