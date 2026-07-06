@@ -539,6 +539,41 @@ async function getMediaBase64(mediaId) {
 // during report generation — after the customer has already paid ₹99.
 // Fails OPEN (treats as valid) on any error, so an infrastructure hiccup
 // on our end never blocks a genuine customer from proceeding.
+const PALM_VALIDATION_MODEL_PRIMARY = "gpt-5.5";
+const PALM_VALIDATION_MODEL_FALLBACK = "gpt-4o";
+
+async function callPalmValidation(imageDataUrl, model) {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Look at this image. Is it a clear photo of a human hand showing the palm (suitable for a palm reading)? Reply with ONLY one word: YES or NO.",
+            },
+            { type: "image_url", image_url: { url: imageDataUrl } },
+          ],
+        },
+      ],
+      // Was 10 — too tight a budget risked truncating the answer mid-word
+      // (e.g. cutting off before the model could correct/clarify itself),
+      // which could leave a stray "NO" fragment as the entire response.
+      // 30 gives enough room for a short sentence to complete normally.
+      max_completion_tokens: 30,
+    }),
+  });
+  const data = await res.json();
+  return { res, data };
+}
+
 async function isPalmPhoto(imageDataUrl) {
   if (!imageDataUrl) {
     return { valid: true, reason: "no image data to check — defaulting to accept" };
@@ -547,41 +582,71 @@ async function isPalmPhoto(imageDataUrl) {
     return { valid: true, reason: "OPENAI_API_KEY missing — defaulting to accept" };
   }
   try {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: "Look at this image. Is it a clear photo of a human hand showing the palm (suitable for a palm reading)? Reply with ONLY one word: YES or NO.",
-              },
-              { type: "image_url", image_url: { url: imageDataUrl } },
-            ],
-          },
-        ],
-        max_completion_tokens: 10,
-      }),
-    });
-    const data = await res.json();
-    log("Palm photo validation -> HTTP status:", res.status, "response:", JSON.stringify(data));
+    // Use the account's flagship model for the best vision judgment —
+    // real customer logs showed clear, valid palm photos being wrongly
+    // rejected on gpt-4o-mini. Only fall back to gpt-4o if gpt-5.5 itself
+    // is unavailable on this account (not for a genuine YES/NO answer,
+    // which should be trusted either way).
+    let { res, data } = await callPalmValidation(imageDataUrl, PALM_VALIDATION_MODEL_PRIMARY);
+    log(
+      `Palm photo validation (model "${PALM_VALIDATION_MODEL_PRIMARY}") -> HTTP status:`,
+      res.status,
+      "response:",
+      JSON.stringify(data)
+    );
+
+    const modelUnavailable =
+      !res.ok &&
+      data?.error &&
+      /model/i.test(data.error.code || "") &&
+      /not found|does not exist|invalid|unknown/i.test(data.error.message || data.error.code || "");
+
+    if (modelUnavailable) {
+      log(
+        `Palm photo validation: model "${PALM_VALIDATION_MODEL_PRIMARY}" appears unavailable on this account — falling back to "${PALM_VALIDATION_MODEL_FALLBACK}"`
+      );
+      ({ res, data } = await callPalmValidation(imageDataUrl, PALM_VALIDATION_MODEL_FALLBACK));
+      log(
+        `Palm photo validation (model "${PALM_VALIDATION_MODEL_FALLBACK}") -> HTTP status:`,
+        res.status,
+        "response:",
+        JSON.stringify(data)
+      );
+    }
 
     if (!res.ok) {
       return { valid: true, reason: "validation call failed (HTTP " + res.status + ") — defaulting to accept" };
     }
 
-    const answer = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
-    if (!answer) {
+    const rawAnswer = (data.choices?.[0]?.message?.content || "").trim();
+    const upper = rawAnswer.toUpperCase();
+    if (!upper) {
       return { valid: true, reason: "empty validation response — defaulting to accept" };
     }
-    return { valid: answer.startsWith("YES"), reason: answer };
+
+    // Smaller vision models don't always follow strict "reply with ONLY
+    // one word" instructions — e.g. "Yes, this looks like a palm" or "The
+    // image shows a hand, so yes" are both genuine affirmative answers that
+    // don't literally START with "YES". Checking for YES/NO anywhere (as a
+    // whole word) is far more robust than requiring an exact prefix match,
+    // which was silently rejecting real palm photos whenever the model
+    // phrased its answer even slightly differently than instructed.
+    const saysYes = /\bYES\b/.test(upper);
+    const saysNo = /\bNO\b/.test(upper);
+
+    let valid;
+    if (saysYes && !saysNo) {
+      valid = true;
+    } else if (saysNo && !saysYes) {
+      valid = false;
+    } else {
+      // Both, neither, or genuinely unclear — fail open. Blocking a real
+      // customer over an ambiguous validation answer is a worse outcome
+      // than occasionally letting a borderline photo through.
+      valid = true;
+    }
+
+    return { valid, reason: rawAnswer };
   } catch (err) {
     log("Palm photo validation crashed (caught):", err.message);
     return { valid: true, reason: "exception — defaulting to accept" };
@@ -771,7 +836,20 @@ function isLikelyRefusal(text) {
   const trimmed = text.trim();
   if (trimmed.length > 400) return false;
   const refusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
-  return refusalPatterns.test(trimmed);
+  if (refusalPatterns.test(trimmed)) return true;
+
+  // A real report is 2000+ words of flowing Malayalam narrative. A short
+  // Malayalam response commenting on the IMAGE itself — e.g. saying it
+  // can't see a palm, or that what was sent looks like a payment
+  // screenshot rather than a hand photo — is the model declining to write
+  // a reading, not a reading. This was previously slipping through
+  // uncaught (the English-only regex above missed it entirely) and being
+  // sent to the customer as if it were their paid report.
+  const malayalamRefusalPatterns =
+    /കൈരേഖ.{0,20}(കാണാൻ കഴിയു|വ്യക്തമല്ല|ഇല്ല)|സ്ക്രീൻഷോട്ട്|കൈപ്പത്തി.{0,20}(കാണാൻ കഴിയു|അല്ല)|ചിത്രം.{0,20}(അല്ല|വ്യക്തമല്ല)|വീണ്ടും അയച്ചുതരാമോ|അപ്ലോഡ് ചെയ്യുക/;
+  if (malayalamRefusalPatterns.test(trimmed)) return true;
+
+  return false;
 }
 
 // Dedicated OpenAI call for report generation, logging the full request
