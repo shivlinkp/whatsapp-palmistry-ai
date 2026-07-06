@@ -1483,6 +1483,49 @@ async function handleImageMessage(phone, mediaId, session) {
     return;
   }
 
+  if (session.stage === "report_sent") {
+    // Previously: any photo sent here fell through to the generic
+    // catch-all ("photo received, thanks") with no session change at all —
+    // the photo was never stored or used anywhere. Any follow-up text
+    // about it (e.g. "this is someone else's hand, take a look") then hit
+    // the post-report Q&A model, which only has the ORIGINAL report text
+    // to work from and no access to the new image — so it could only
+    // produce generic filler asking the customer to "send a clear photo,"
+    // on repeat, even though a clear photo had already been sent (often
+    // more than once). A customer sending a new hand photo after already
+    // receiving their own reading is, in practice, reliably a request to
+    // start a reading for a DIFFERENT person — so treat it as exactly
+    // that: start the second-person flow immediately and stash the photo,
+    // the same way an early photo is stashed during collecting/new.
+    log(
+      "Photo received while in report_sent for",
+      phone,
+      "— treating as a request for a new reading for a different person (order #",
+      (session.orderCount || 1) + 1,
+      ") and stashing the photo instead of discarding it."
+    );
+    await db.updateSession(phone, {
+      stage: "collecting",
+      name: null,
+      dob: null,
+      gender: null,
+      relation: null,
+      palmMediaId: mediaId,
+      paymentReceived: false,
+      reportText: null,
+      reportStatus: "none",
+      reportDueAt: null,
+      reportAttempts: 0,
+      reportError: null,
+      orderCount: (session.orderCount || 1) + 1,
+    });
+    await sendText(
+      phone,
+      "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_SECOND_PERSON_DETAILS_MESSAGE
+    );
+    return;
+  }
+
   if (session.stage === "new" || session.stage === "collecting") {
     // Previously: a photo sent before name/DOB/gender were known was
     // completely discarded — not saved anywhere — and the customer would
