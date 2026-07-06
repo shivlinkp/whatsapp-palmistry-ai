@@ -79,19 +79,12 @@ const qrMessageIdsByPhone = new Map();
 // WhatsApp send helpers
 // ---------------------------------------------------------------------------
 
-// Human-like pacing between outgoing messages: 10-15 seconds. This ONLY
-// affects how quickly consecutive WhatsApp messages are sent — it has no
-// effect on report/assessment scheduling (report_due_at), which is
-// computed separately via real Date math and stays exactly as configured.
-function randomSendDelayMs() {
-  return 10000 + Math.random() * 5000; // 10-15 seconds
-}
+// Human-like pacing between outgoing messages was here (10-15s delay via
+// randomSendDelayMs) — removed per explicit instruction. Messages now send
+// immediately. Report/assessment scheduling (report_due_at) is unaffected
+// either way, since it's computed separately via real Date math.
 
 async function sendWhatsAppRequest(payload) {
-  const delay = randomSendDelayMs();
-  log(`Waiting ${(delay / 1000).toFixed(1)}s before sending (human-like pacing)`);
-  await new Promise((resolve) => setTimeout(resolve, delay));
-
   log("Outgoing WhatsApp API payload:", JSON.stringify(payload));
 
   try {
@@ -1454,6 +1447,28 @@ async function processReceivedPalmPhoto(phone, mediaId, session) {
   await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
 }
 
+// Guards against a specific WhatsApp delivery quirk: a single photo send
+// can arrive as TWO separate real webhook events with genuinely different
+// message ids — e.g. a compressed "image" version and a follow-up HD
+// "document" version — rather than a retry of the same id. Message-id
+// dedup (see db.markMessageProcessedIfNew) correctly treats both as new,
+// since they ARE different ids, so without this guard the customer gets
+// the same "photo received, thanks" + ask-details block sent twice for
+// what was, from their side, a single photo. Short in-memory window (not
+// DB-backed) is fine here — this is about two deliveries arriving
+// seconds apart in real time, not about surviving a restart.
+const recentPhotoStashByPhone = new Map();
+const RECENT_PHOTO_STASH_WINDOW_MS = 20 * 1000;
+
+function wasPhotoJustStashed(phone) {
+  const last = recentPhotoStashByPhone.get(phone);
+  return typeof last === "number" && Date.now() - last < RECENT_PHOTO_STASH_WINDOW_MS;
+}
+
+function markPhotoJustStashed(phone) {
+  recentPhotoStashByPhone.set(phone, Date.now());
+}
+
 async function handleImageMessage(phone, mediaId, session) {
   log("Current session state for", phone, "->", JSON.stringify({ stage: session.stage }));
 
@@ -1547,6 +1562,17 @@ async function handleImageMessage(phone, mediaId, session) {
     }
 
     await db.updateSession(phone, { palmMediaId: mediaId });
+
+    if (wasPhotoJustStashed(phone)) {
+      // Almost certainly the second half of a compressed+HD duplicate
+      // delivery of the same physical photo — update the stored media id
+      // (the later delivery, often the HD one, is preferable) but don't
+      // send the acknowledgment/ask-details block again.
+      log("Suppressing duplicate photo-stash acknowledgment for", phone, "— photo already acknowledged moments ago.");
+      return;
+    }
+    markPhotoJustStashed(phone);
+
     await sendText(
       phone,
       "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_ALL_DETAILS_MESSAGE
