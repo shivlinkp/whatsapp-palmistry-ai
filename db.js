@@ -60,6 +60,19 @@ async function initDb() {
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS order_count INTEGER NOT NULL DEFAULT 1;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_transaction_id BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_report_inquiry_count INTEGER NOT NULL DEFAULT 0;`);
+  // Durable message-dedup table. Previously dedup was an in-memory Set,
+  // which is wiped on every restart/redeploy — Railway auto-redeploys on
+  // every push, so a WhatsApp webhook retry landing around a deploy would
+  // be treated as brand new and fully reprocessed, causing the customer to
+  // see the same reply (welcome message, ask-details prompt, etc.) sent
+  // more than once. Moving this to Postgres makes it survive restarts,
+  // the same way report delivery already does.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS processed_messages (
+      message_id    TEXT PRIMARY KEY,
+      processed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_sessions_report_due
     ON sessions (report_status, report_due_at);
@@ -168,10 +181,38 @@ async function findDueReports() {
   return result.rows.map(rowToSession);
 }
 
+// Atomically records a WhatsApp message id as processed. Returns true if
+// this is the FIRST time we've seen this id (i.e. the caller should go
+// ahead and process it), or false if it's a duplicate (already recorded,
+// so the caller should skip it). Using INSERT ... ON CONFLICT DO NOTHING
+// makes this safe even if two overlapping requests raced on the same id.
+async function markMessageProcessedIfNew(messageId) {
+  const result = await pool.query(
+    `INSERT INTO processed_messages (message_id) VALUES ($1)
+     ON CONFLICT (message_id) DO NOTHING
+     RETURNING message_id`,
+    [messageId]
+  );
+  return result.rows.length > 0;
+}
+
+// Keeps the processed_messages table from growing forever — dedup only
+// ever needs to look back far enough to cover realistic WhatsApp retry
+// windows (minutes/hours, not weeks), so anything older than 30 days is
+// safe to drop.
+async function cleanupOldProcessedMessages() {
+  const result = await pool.query(
+    `DELETE FROM processed_messages WHERE processed_at < now() - interval '30 days'`
+  );
+  return result.rowCount;
+}
+
 module.exports = {
   pool,
   initDb,
   getOrCreateSession,
   updateSession,
   findDueReports,
+  markMessageProcessedIfNew,
+  cleanupOldProcessedMessages,
 };
