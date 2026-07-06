@@ -44,10 +44,15 @@ function log(...args) {
 // In-memory state that's safe to lose on restart (not customer data)
 // ---------------------------------------------------------------------------
 
-// Dedup of processed WhatsApp message ids (capped ring buffer). Not
-// persisted — worst case after a restart is a very recent duplicate being
-// reprocessed once, which is an acceptable tradeoff and wasn't part of the
-// data the person asked to persist.
+// Fast in-memory pre-check only — NOT the source of truth for dedup
+// anymore. This used to be the only dedup layer, but it's wiped on every
+// restart/redeploy, and Railway auto-redeploys on every push. A WhatsApp
+// webhook retry landing around a deploy was being treated as brand new
+// and fully reprocessed, sending the customer duplicate replies (welcome
+// message, ask-details prompt, etc. sent twice). The durable check is now
+// db.markMessageProcessedIfNew() (Postgres-backed, survives restarts);
+// this in-memory Set is kept only to skip a DB round-trip for the common
+// case of an exact same-process duplicate arriving milliseconds apart.
 const processedMessageIds = new Set();
 const processedMessageOrder = [];
 const MAX_PROCESSED_IDS = 2000;
@@ -1681,10 +1686,19 @@ async function processWebhookBody(body) {
   if (!message) return;
 
   if (isDuplicate(message.id)) {
-    log("Duplicate message ignored:", message.id);
+    log("Duplicate message ignored (in-memory pre-check):", message.id);
     return;
   }
   markProcessed(message.id);
+
+  // Durable check — this is what actually protects against reprocessing
+  // after a restart/redeploy, since the in-memory check above is wiped
+  // whenever the process restarts but this table isn't.
+  const isNewMessage = await db.markMessageProcessedIfNew(message.id);
+  if (!isNewMessage) {
+    log("Duplicate message ignored (DB-backed dedup, survives restarts):", message.id);
+    return;
+  }
 
   const phone = message.from;
   const session = await db.getOrCreateSession(phone);
@@ -1776,6 +1790,21 @@ async function start() {
   // Run one immediately at boot too, in case reports were already due
   // while the container was restarting.
   pollDueReports();
+
+  // Keeps the durable message-dedup table from growing forever. Runs once
+  // at boot, then once every 24h — dedup only ever needs to cover realistic
+  // WhatsApp retry windows (minutes/hours), so this is safe to prune often.
+  const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+  async function runProcessedMessagesCleanup() {
+    try {
+      const deleted = await db.cleanupOldProcessedMessages();
+      log("Processed-messages cleanup: removed", deleted, "row(s) older than 30 days");
+    } catch (err) {
+      log("Processed-messages cleanup FAILED (caught):", err.message);
+    }
+  }
+  setInterval(runProcessedMessagesCleanup, CLEANUP_INTERVAL_MS);
+  runProcessedMessagesCleanup();
 }
 
 start();
