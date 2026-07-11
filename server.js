@@ -1731,7 +1731,103 @@ app.get("/admin/chats", async (req, res) => {
   }
 });
 
-// Admin chat viewer — GET /admin/chats/view?phone=917736236010&key=resetmybot123
+// Admin insights — GET /admin/insights?key=resetmybot123
+// Surfaces likely-broken conversations for a human to review, instead of
+// relying on someone happening to notice a bad chat and pasting its URL.
+// Three READ-ONLY flags, each pointing straight at the underlying chat:
+//   1. Trust/scam language from the customer (e.g. "is this a scam")
+//   2. Stuck report delivery (failed outright, or awaiting_report >1hr)
+//   3. Suspiciously short "sent" reports — catches the Malayalam-decline-
+//      accepted-as-report bug (see db.js findShortReportSessions) even for
+//      PAST orders that happened before that bug was fixed in code.
+// This doesn't change any bot behavior — it's purely a triage view.
+app.get("/admin/insights", async (req, res) => {
+  const { key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+
+  try {
+    const [trustFlags, stuckReports, shortReports] = await Promise.all([
+      db.findTrustFlagSessions(),
+      db.findStuckReportSessions(),
+      db.findShortReportSessions(),
+    ]);
+
+    const chatLink = (phone) => `/admin/chats/view?phone=${encodeURIComponent(phone)}&key=${encodeURIComponent(key)}`;
+    const timeStr = (t) => (t ? new Date(t).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "—");
+
+    const section = (title, count, rowsHtml, emptyMsg) => `
+      <div style="padding:16px;font-size:18px;font-weight:bold;border-bottom:1px solid #333;background:#181818;">
+        ${title} (${count})
+      </div>
+      ${rowsHtml || `<div style="padding:16px;color:#888;">${emptyMsg}</div>`}
+    `;
+
+    const trustRows = trustFlags
+      .map((r) => {
+        const preview = escapeHtml((r.body || "").slice(0, 100));
+        return `<a href="${chatLink(r.phone)}" style="text-decoration:none;color:inherit;">
+          <div style="padding:12px 16px;border-bottom:1px solid #333;">
+            <div style="display:flex;justify-content:space-between;">
+              <strong>${escapeHtml(r.phone)}</strong>
+              <span style="color:#888;font-size:12px;">${timeStr(r.created_at)}</span>
+            </div>
+            <div style="color:#aaa;font-size:14px;">${escapeHtml(r.name || "(no name)")} · ${escapeHtml(r.stage || "")}</div>
+            <div style="color:#f88;font-size:14px;margin-top:2px;">"${preview}"</div>
+          </div>
+        </a>`;
+      })
+      .join("");
+
+    const stuckRows = stuckReports
+      .map((r) => {
+        return `<a href="${chatLink(r.phone)}" style="text-decoration:none;color:inherit;">
+          <div style="padding:12px 16px;border-bottom:1px solid #333;">
+            <div style="display:flex;justify-content:space-between;">
+              <strong>${escapeHtml(r.phone)}</strong>
+              <span style="color:#888;font-size:12px;">${timeStr(r.updated_at)}</span>
+            </div>
+            <div style="color:#aaa;font-size:14px;">${escapeHtml(r.name || "(no name)")} · report_status: ${escapeHtml(
+              r.report_status
+            )} · attempts: ${r.report_attempts}</div>
+          </div>
+        </a>`;
+      })
+      .join("");
+
+    const shortRows = shortReports
+      .map((r) => {
+        return `<a href="${chatLink(r.phone)}" style="text-decoration:none;color:inherit;">
+          <div style="padding:12px 16px;border-bottom:1px solid #333;">
+            <div style="display:flex;justify-content:space-between;">
+              <strong>${escapeHtml(r.phone)}</strong>
+              <span style="color:#888;font-size:12px;">${timeStr(r.updated_at)}</span>
+            </div>
+            <div style="color:#aaa;font-size:14px;">${escapeHtml(r.name || "(no name)")} · report length: ${
+              r.report_length
+            } chars (expected thousands)</div>
+          </div>
+        </a>`;
+      })
+      .join("");
+
+    res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Insights</title></head>
+<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
+  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">
+    Flagged Conversations
+    <a href="/admin/chats?key=${encodeURIComponent(key)}" style="float:right;color:#8af;font-size:14px;font-weight:normal;">All chats →</a>
+  </div>
+  ${section("ߚ Trust/scam language from customer", trustFlags.length, trustRows, "None found.")}
+  ${section("⏳ Stuck or failed report delivery", stuckReports.length, stuckRows, "None found.")}
+  ${section("ߓ Suspiciously short \"sent\" reports", shortReports.length, shortRows, "None found.")}
+</body></html>`);
+  } catch (err) {
+    log("Admin insights failed (caught):", err.message);
+    res.status(500).send("Failed to load insights: " + err.message);
+  }
+});
 // Shows the full message history for one phone number, WhatsApp-bubble style.
 app.get("/admin/chats/view", async (req, res) => {
   const { phone, key } = req.query;
