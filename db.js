@@ -237,4 +237,69 @@ module.exports = {
   logMessage,
   getMessagesForPhone,
   listConversations,
+  findTrustFlagSessions,
+  findStuckReportSessions,
+  findShortReportSessions,
 };
+
+// ---------------------------------------------------------------------------
+// /admin/insights queries — surfaces likely-broken conversations for a
+// human to review, instead of relying on someone happening to notice a bad
+// chat and pasting the URL manually. These are READ-ONLY and change
+// nothing; they exist purely to point a human at the right chats to look
+// at (see server.js "/admin/insights").
+// ---------------------------------------------------------------------------
+
+// Finds customers whose messages contain trust/scam language (English,
+// Malayalam script, or common Manglish spellings). One row per phone (most
+// recent matching message), so a customer who says it multiple times only
+// shows up once. This is exactly the kind of message that flagged Navas's
+// stuck order ("Niganl pattikuka yano") — surfacing it automatically means
+// it doesn't require someone to happen to read that specific chat.
+async function findTrustFlagSessions() {
+  const result = await pool.query(`
+    SELECT DISTINCT ON (m.phone)
+      m.phone, m.body, m.created_at, s.name, s.stage
+    FROM messages m
+    LEFT JOIN sessions s ON s.phone = m.phone
+    WHERE m.direction = 'in'
+      AND m.body ~* '(pattikk|vanchich|വഞ്ചന|പറ്റിക്ക|\\mscam\\M|\\mfraud\\M|\\mcheat(ing)?\\M|\\mfake\\M)'
+    ORDER BY m.phone, m.created_at DESC
+  `);
+  return result.rows;
+}
+
+// Finds sessions stuck waiting on a report: either the report generation
+// has already exhausted all retries and failed outright, or the customer
+// has been sitting in awaiting_report for over an hour with no resolution
+// (report_due_at passed, poller should have acted by now).
+async function findStuckReportSessions() {
+  const result = await pool.query(`
+    SELECT phone, name, stage, report_status, report_attempts, report_due_at, updated_at
+    FROM sessions
+    WHERE report_status = 'failed'
+       OR (stage = 'awaiting_report' AND updated_at < now() - interval '1 hour')
+    ORDER BY updated_at DESC
+  `);
+  return result.rows;
+}
+
+// Finds sessions marked report_status='sent' whose report_text is
+// suspiciously short. A genuine reading is required (by the report prompt)
+// to be 2000+ words / thousands of characters of Malayalam — anything far
+// shorter and marked "sent" almost certainly means a model decline/
+// explanation got wrongly accepted as a real report (exactly what happened
+// to Shefija's second order before the isLikelyRefusal() word-count fix).
+// This lets you find any OTHER past orders with the same silent corruption
+// across the whole database, not just ones a human happened to reread.
+async function findShortReportSessions() {
+  const result = await pool.query(`
+    SELECT phone, name, stage, length(report_text) AS report_length, updated_at
+    FROM sessions
+    WHERE report_status = 'sent'
+      AND report_text IS NOT NULL
+      AND length(report_text) < 3000
+    ORDER BY updated_at DESC
+  `);
+  return result.rows;
+}
