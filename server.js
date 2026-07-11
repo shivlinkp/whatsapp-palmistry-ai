@@ -44,15 +44,10 @@ function log(...args) {
 // In-memory state that's safe to lose on restart (not customer data)
 // ---------------------------------------------------------------------------
 
-// Fast in-memory pre-check only — NOT the source of truth for dedup
-// anymore. This used to be the only dedup layer, but it's wiped on every
-// restart/redeploy, and Railway auto-redeploys on every push. A WhatsApp
-// webhook retry landing around a deploy was being treated as brand new
-// and fully reprocessed, sending the customer duplicate replies (welcome
-// message, ask-details prompt, etc. sent twice). The durable check is now
-// db.markMessageProcessedIfNew() (Postgres-backed, survives restarts);
-// this in-memory Set is kept only to skip a DB round-trip for the common
-// case of an exact same-process duplicate arriving milliseconds apart.
+// Dedup of processed WhatsApp message ids (capped ring buffer). Not
+// persisted — worst case after a restart is a very recent duplicate being
+// reprocessed once, which is an acceptable tradeoff and wasn't part of the
+// data the person asked to persist.
 const processedMessageIds = new Set();
 const processedMessageOrder = [];
 const MAX_PROCESSED_IDS = 2000;
@@ -79,12 +74,19 @@ const qrMessageIdsByPhone = new Map();
 // WhatsApp send helpers
 // ---------------------------------------------------------------------------
 
-// Human-like pacing between outgoing messages was here (10-15s delay via
-// randomSendDelayMs) — removed per explicit instruction. Messages now send
-// immediately. Report/assessment scheduling (report_due_at) is unaffected
-// either way, since it's computed separately via real Date math.
+// Human-like pacing between outgoing messages: 10-15 seconds. This ONLY
+// affects how quickly consecutive WhatsApp messages are sent — it has no
+// effect on report/assessment scheduling (report_due_at), which is
+// computed separately via real Date math and stays exactly as configured.
+function randomSendDelayMs() {
+  return 10000 + Math.random() * 5000; // 10-15 seconds
+}
 
 async function sendWhatsAppRequest(payload) {
+  const delay = randomSendDelayMs();
+  log(`Waiting ${(delay / 1000).toFixed(1)}s before sending (human-like pacing)`);
+  await new Promise((resolve) => setTimeout(resolve, delay));
+
   log("Outgoing WhatsApp API payload:", JSON.stringify(payload));
 
   try {
@@ -117,6 +119,7 @@ async function sendWhatsAppRequest(payload) {
 
 async function sendText(to, body) {
   log("Sending text to", to, "->", body.slice(0, 60).replace(/\n/g, " "));
+  db.logMessage(to, "out", body, "text");
   const result = await sendWhatsAppRequest({
     messaging_product: "whatsapp",
     to,
@@ -139,6 +142,7 @@ async function sendImageByUrl(to, link, caption) {
   }
 
   console.log("Using QR URL:", QR_IMAGE_URL);
+  db.logMessage(to, "out", "[QR code image]", "qr_image");
 
   const payload = {
     messaging_product: "whatsapp",
@@ -537,41 +541,6 @@ async function getMediaBase64(mediaId) {
 // during report generation — after the customer has already paid ₹99.
 // Fails OPEN (treats as valid) on any error, so an infrastructure hiccup
 // on our end never blocks a genuine customer from proceeding.
-const PALM_VALIDATION_MODEL_PRIMARY = "gpt-5.5";
-const PALM_VALIDATION_MODEL_FALLBACK = "gpt-4o";
-
-async function callPalmValidation(imageDataUrl, model) {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: "Look at this image. Is it a clear photo of a human hand showing the palm (suitable for a palm reading)? Reply with ONLY one word: YES or NO.",
-            },
-            { type: "image_url", image_url: { url: imageDataUrl } },
-          ],
-        },
-      ],
-      // Was 10 — too tight a budget risked truncating the answer mid-word
-      // (e.g. cutting off before the model could correct/clarify itself),
-      // which could leave a stray "NO" fragment as the entire response.
-      // 30 gives enough room for a short sentence to complete normally.
-      max_completion_tokens: 30,
-    }),
-  });
-  const data = await res.json();
-  return { res, data };
-}
-
 async function isPalmPhoto(imageDataUrl) {
   if (!imageDataUrl) {
     return { valid: true, reason: "no image data to check — defaulting to accept" };
@@ -580,37 +549,31 @@ async function isPalmPhoto(imageDataUrl) {
     return { valid: true, reason: "OPENAI_API_KEY missing — defaulting to accept" };
   }
   try {
-    // Use the account's flagship model for the best vision judgment —
-    // real customer logs showed clear, valid palm photos being wrongly
-    // rejected on gpt-4o-mini. Only fall back to gpt-4o if gpt-5.5 itself
-    // is unavailable on this account (not for a genuine YES/NO answer,
-    // which should be trusted either way).
-    let { res, data } = await callPalmValidation(imageDataUrl, PALM_VALIDATION_MODEL_PRIMARY);
-    log(
-      `Palm photo validation (model "${PALM_VALIDATION_MODEL_PRIMARY}") -> HTTP status:`,
-      res.status,
-      "response:",
-      JSON.stringify(data)
-    );
-
-    const modelUnavailable =
-      !res.ok &&
-      data?.error &&
-      /model/i.test(data.error.code || "") &&
-      /not found|does not exist|invalid|unknown/i.test(data.error.message || data.error.code || "");
-
-    if (modelUnavailable) {
-      log(
-        `Palm photo validation: model "${PALM_VALIDATION_MODEL_PRIMARY}" appears unavailable on this account — falling back to "${PALM_VALIDATION_MODEL_FALLBACK}"`
-      );
-      ({ res, data } = await callPalmValidation(imageDataUrl, PALM_VALIDATION_MODEL_FALLBACK));
-      log(
-        `Palm photo validation (model "${PALM_VALIDATION_MODEL_FALLBACK}") -> HTTP status:`,
-        res.status,
-        "response:",
-        JSON.stringify(data)
-      );
-    }
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Look at this image. Is it a clear photo of a human hand showing the palm (suitable for a palm reading)? Reply with ONLY one word: YES or NO.",
+              },
+              { type: "image_url", image_url: { url: imageDataUrl } },
+            ],
+          },
+        ],
+        max_completion_tokens: 10,
+      }),
+    });
+    const data = await res.json();
+    log("Palm photo validation -> HTTP status:", res.status, "response:", JSON.stringify(data));
 
     if (!res.ok) {
       return { valid: true, reason: "validation call failed (HTTP " + res.status + ") — defaulting to accept" };
@@ -822,6 +785,7 @@ async function handleVoiceMessage(phone, mediaId, session) {
   }
 
   log("Voice message transcribed for", phone, "-> treating as text:", transcript);
+  db.logMessage(phone, "in", `[Voice] ${transcript}`, "voice");
   await handleTextMessage(phone, transcript, session);
 }
 
@@ -834,20 +798,7 @@ function isLikelyRefusal(text) {
   const trimmed = text.trim();
   if (trimmed.length > 400) return false;
   const refusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
-  if (refusalPatterns.test(trimmed)) return true;
-
-  // A real report is 2000+ words of flowing Malayalam narrative. A short
-  // Malayalam response commenting on the IMAGE itself — e.g. saying it
-  // can't see a palm, or that what was sent looks like a payment
-  // screenshot rather than a hand photo — is the model declining to write
-  // a reading, not a reading. This was previously slipping through
-  // uncaught (the English-only regex above missed it entirely) and being
-  // sent to the customer as if it were their paid report.
-  const malayalamRefusalPatterns =
-    /കൈരേഖ.{0,20}(കാണാൻ കഴിയു|വ്യക്തമല്ല|ഇല്ല)|സ്ക്രീൻഷോട്ട്|കൈപ്പത്തി.{0,20}(കാണാൻ കഴിയു|അല്ല)|ചിത്രം.{0,20}(അല്ല|വ്യക്തമല്ല)|വീണ്ടും അയച്ചുതരാമോ|അപ്ലോഡ് ചെയ്യുക/;
-  if (malayalamRefusalPatterns.test(trimmed)) return true;
-
-  return false;
+  return refusalPatterns.test(trimmed);
 }
 
 // Dedicated OpenAI call for report generation, logging the full request
@@ -1447,28 +1398,6 @@ async function processReceivedPalmPhoto(phone, mediaId, session) {
   await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
 }
 
-// Guards against a specific WhatsApp delivery quirk: a single photo send
-// can arrive as TWO separate real webhook events with genuinely different
-// message ids — e.g. a compressed "image" version and a follow-up HD
-// "document" version — rather than a retry of the same id. Message-id
-// dedup (see db.markMessageProcessedIfNew) correctly treats both as new,
-// since they ARE different ids, so without this guard the customer gets
-// the same "photo received, thanks" + ask-details block sent twice for
-// what was, from their side, a single photo. Short in-memory window (not
-// DB-backed) is fine here — this is about two deliveries arriving
-// seconds apart in real time, not about surviving a restart.
-const recentPhotoStashByPhone = new Map();
-const RECENT_PHOTO_STASH_WINDOW_MS = 20 * 1000;
-
-function wasPhotoJustStashed(phone) {
-  const last = recentPhotoStashByPhone.get(phone);
-  return typeof last === "number" && Date.now() - last < RECENT_PHOTO_STASH_WINDOW_MS;
-}
-
-function markPhotoJustStashed(phone) {
-  recentPhotoStashByPhone.set(phone, Date.now());
-}
-
 async function handleImageMessage(phone, mediaId, session) {
   log("Current session state for", phone, "->", JSON.stringify({ stage: session.stage }));
 
@@ -1503,49 +1432,6 @@ async function handleImageMessage(phone, mediaId, session) {
     return;
   }
 
-  if (session.stage === "report_sent") {
-    // Previously: any photo sent here fell through to the generic
-    // catch-all ("photo received, thanks") with no session change at all —
-    // the photo was never stored or used anywhere. Any follow-up text
-    // about it (e.g. "this is someone else's hand, take a look") then hit
-    // the post-report Q&A model, which only has the ORIGINAL report text
-    // to work from and no access to the new image — so it could only
-    // produce generic filler asking the customer to "send a clear photo,"
-    // on repeat, even though a clear photo had already been sent (often
-    // more than once). A customer sending a new hand photo after already
-    // receiving their own reading is, in practice, reliably a request to
-    // start a reading for a DIFFERENT person — so treat it as exactly
-    // that: start the second-person flow immediately and stash the photo,
-    // the same way an early photo is stashed during collecting/new.
-    log(
-      "Photo received while in report_sent for",
-      phone,
-      "— treating as a request for a new reading for a different person (order #",
-      (session.orderCount || 1) + 1,
-      ") and stashing the photo instead of discarding it."
-    );
-    await db.updateSession(phone, {
-      stage: "collecting",
-      name: null,
-      dob: null,
-      gender: null,
-      relation: null,
-      palmMediaId: mediaId,
-      paymentReceived: false,
-      reportText: null,
-      reportStatus: "none",
-      reportDueAt: null,
-      reportAttempts: 0,
-      reportError: null,
-      orderCount: (session.orderCount || 1) + 1,
-    });
-    await sendText(
-      phone,
-      "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_SECOND_PERSON_DETAILS_MESSAGE
-    );
-    return;
-  }
-
   if (session.stage === "new" || session.stage === "collecting") {
     // Previously: a photo sent before name/DOB/gender were known was
     // completely discarded — not saved anywhere — and the customer would
@@ -1562,17 +1448,6 @@ async function handleImageMessage(phone, mediaId, session) {
     }
 
     await db.updateSession(phone, { palmMediaId: mediaId });
-
-    if (wasPhotoJustStashed(phone)) {
-      // Almost certainly the second half of a compressed+HD duplicate
-      // delivery of the same physical photo — update the stored media id
-      // (the later delivery, often the HD one, is preferable) but don't
-      // send the acknowledgment/ask-details block again.
-      log("Suppressing duplicate photo-stash acknowledgment for", phone, "— photo already acknowledged moments ago.");
-      return;
-    }
-    markPhotoJustStashed(phone);
-
     await sendText(
       phone,
       "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_ALL_DETAILS_MESSAGE
@@ -1674,6 +1549,97 @@ app.get("/admin/reset-session", async (req, res) => {
   }
 });
 
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// Admin chat list — GET /admin/chats?key=resetmybot123
+// Shows every phone number with any message activity, most recent first.
+app.get("/admin/chats", async (req, res) => {
+  const { key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+
+  try {
+    const conversations = await db.listConversations();
+    const rows = conversations
+      .map((c) => {
+        const preview = escapeHtml((c.last_message || "").slice(0, 80));
+        const name = escapeHtml(c.name || "(no name yet)");
+        const stage = escapeHtml(c.stage || "");
+        const time = new Date(c.last_activity).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+        return `<a href="/admin/chats/view?phone=${encodeURIComponent(c.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
+          <div style="padding:12px 16px;border-bottom:1px solid #333;">
+            <div style="display:flex;justify-content:space-between;">
+              <strong>${escapeHtml(c.phone)}</strong>
+              <span style="color:#888;font-size:12px;">${time}</span>
+            </div>
+            <div style="color:#aaa;font-size:14px;">${name} · ${stage} · ${c.message_count} messages</div>
+            <div style="color:#ccc;font-size:14px;margin-top:2px;">${preview}</div>
+          </div>
+        </a>`;
+      })
+      .join("");
+
+    res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chats</title></head>
+<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
+  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Customer Conversations (${conversations.length})</div>
+  ${rows || '<div style="padding:16px;color:#888;">No conversations logged yet.</div>'}
+</body></html>`);
+  } catch (err) {
+    log("Admin chat list failed (caught):", err.message);
+    res.status(500).send("Failed to load conversations: " + err.message);
+  }
+});
+
+// Admin chat viewer — GET /admin/chats/view?phone=917736236010&key=resetmybot123
+// Shows the full message history for one phone number, WhatsApp-bubble style.
+app.get("/admin/chats/view", async (req, res) => {
+  const { phone, key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+  if (!phone) {
+    return res.status(400).send("Missing ?phone=");
+  }
+
+  try {
+    const messages = await db.getMessagesForPhone(phone);
+    const bubbles = messages
+      .map((m) => {
+        const isOut = m.direction === "out";
+        const time = new Date(m.created_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+        const body = escapeHtml(m.body).replace(/\n/g, "<br>");
+        return `<div style="display:flex;justify-content:${isOut ? "flex-end" : "flex-start"};margin:6px 12px;">
+          <div style="max-width:75%;background:${isOut ? "#005c4b" : "#202c33"};color:#eee;padding:8px 12px;border-radius:8px;">
+            <div style="font-size:15px;">${body}</div>
+            <div style="font-size:11px;color:#aaa;margin-top:4px;text-align:right;">${escapeHtml(m.message_type)} · ${time}</div>
+          </div>
+        </div>`;
+      })
+      .join("");
+
+    res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(phone)}</title></head>
+<body style="background:#0b141a;margin:0;font-family:sans-serif;">
+  <div style="padding:14px 16px;background:#202c33;color:#eee;font-weight:bold;position:sticky;top:0;">
+    <a href="/admin/chats?key=${encodeURIComponent(key)}" style="color:#aaa;text-decoration:none;margin-right:12px;">←</a>
+    ${escapeHtml(phone)} (${messages.length} messages)
+  </div>
+  <div style="padding:12px 0;">${bubbles || '<div style="padding:16px;color:#888;">No messages logged yet.</div>'}</div>
+</body></html>`);
+  } catch (err) {
+    log("Admin chat view failed (caught):", err.message);
+    res.status(500).send("Failed to load chat: " + err.message);
+  }
+});
+
 app.post("/webhook", (req, res) => {
   res.sendStatus(200); // Ack immediately so Meta doesn't retry/timeout
 
@@ -1712,19 +1678,10 @@ async function processWebhookBody(body) {
   if (!message) return;
 
   if (isDuplicate(message.id)) {
-    log("Duplicate message ignored (in-memory pre-check):", message.id);
+    log("Duplicate message ignored:", message.id);
     return;
   }
   markProcessed(message.id);
-
-  // Durable check — this is what actually protects against reprocessing
-  // after a restart/redeploy, since the in-memory check above is wiped
-  // whenever the process restarts but this table isn't.
-  const isNewMessage = await db.markMessageProcessedIfNew(message.id);
-  if (!isNewMessage) {
-    log("Duplicate message ignored (DB-backed dedup, survives restarts):", message.id);
-    return;
-  }
 
   const phone = message.from;
   const session = await db.getOrCreateSession(phone);
@@ -1733,10 +1690,12 @@ async function processWebhookBody(body) {
 
   if (message.type === "text") {
     const text = message.text?.body || "";
+    db.logMessage(phone, "in", text, "text");
     await handleTextMessage(phone, text, session);
   } else if (message.type === "audio") {
     // Voice messages/voice notes — transcribed and then handled exactly
-    // like a normal text message (see handleVoiceMessage above).
+    // like a normal text message (see handleVoiceMessage above). The
+    // transcript itself gets logged inside handleVoiceMessage once known.
     const mediaId = message.audio?.id;
     await handleVoiceMessage(phone, mediaId, session);
   } else if (
@@ -1747,6 +1706,7 @@ async function processWebhookBody(body) {
     // a standard image message — treat both the same way.
     const mediaId = message.image?.id || message.document?.id;
     log("Photo received as", message.type, "-> mediaId:", mediaId);
+    db.logMessage(phone, "in", "[Photo]", "photo");
     await handleImageMessage(phone, mediaId, session);
   } else if (
     message.type === "document" &&
@@ -1757,6 +1717,7 @@ async function processWebhookBody(body) {
     // a screenshot) — accepted unconditionally, same trust model as the
     // transaction-ID fallback: no parsing/verification, just proceed.
     log("Payment PDF receipt received from", phone, "-> accepting unconditionally, proceeding to report scheduling.");
+    db.logMessage(phone, "in", "[Payment PDF receipt]", "pdf");
     await confirmPaymentAndScheduleReport(phone, session, "PDF receipt");
   } else if (message.type === "unsupported") {
     // WhatsApp sends a transient "unsupported" placeholder event a few
@@ -1816,21 +1777,6 @@ async function start() {
   // Run one immediately at boot too, in case reports were already due
   // while the container was restarting.
   pollDueReports();
-
-  // Keeps the durable message-dedup table from growing forever. Runs once
-  // at boot, then once every 24h — dedup only ever needs to cover realistic
-  // WhatsApp retry windows (minutes/hours), so this is safe to prune often.
-  const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-  async function runProcessedMessagesCleanup() {
-    try {
-      const deleted = await db.cleanupOldProcessedMessages();
-      log("Processed-messages cleanup: removed", deleted, "row(s) older than 30 days");
-    } catch (err) {
-      log("Processed-messages cleanup FAILED (caught):", err.message);
-    }
-  }
-  setInterval(runProcessedMessagesCleanup, CLEANUP_INTERVAL_MS);
-  runProcessedMessagesCleanup();
 }
 
 start();
