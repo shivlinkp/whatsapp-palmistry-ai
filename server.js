@@ -71,6 +71,43 @@ function isDuplicate(id) {
 const qrMessageIdsByPhone = new Map();
 
 // ---------------------------------------------------------------------------
+// Per-phone serialization
+// ---------------------------------------------------------------------------
+// Express acks each webhook immediately and processes it in the background
+// (see app.post("/webhook", ...)), so if a customer sends two photos a few
+// seconds apart, both webhook calls can end up running fully concurrently.
+// Each one independently fetches the session, so both can see the SAME
+// stale stage (e.g. "awaiting_photo") and both act on it — this caused
+// duplicate QR sends, duplicate "please pay" texts, and — worse — a later
+// photo landing after the stage had already flipped to "awaiting_payment"
+// due to the race, getting silently misread as a payment screenshot with
+// zero actual payment made.
+//
+// runExclusive() chains a promise per phone number so that everything for
+// one phone (session fetch + handling + DB writes) fully completes before
+// the next message for that SAME phone starts. Different phone numbers are
+// unaffected and continue to run fully in parallel.
+const phoneLocks = new Map();
+
+function runExclusive(phone, task) {
+  const prior = phoneLocks.get(phone) || Promise.resolve();
+  // Run task regardless of whether the prior task succeeded or failed, so
+  // one crashed message never permanently jams the queue for that phone.
+  const result = prior.then(task, task);
+  // Store a version of the chain that never rejects, so a failure here
+  // doesn't poison every future message for this phone either.
+  const tracked = result.catch((err) => {
+    log("runExclusive: task for", phone, "threw (caught):", err.message);
+  });
+  phoneLocks.set(phone, tracked);
+  // Simple cleanup so the map doesn't grow forever for phones that go quiet.
+  tracked.finally(() => {
+    if (phoneLocks.get(phone) === tracked) phoneLocks.delete(phone);
+  });
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // WhatsApp send helpers
 // ---------------------------------------------------------------------------
 
@@ -1407,6 +1444,39 @@ async function handleImageMessage(phone, mediaId, session) {
   }
 
   if (session.stage === "awaiting_payment") {
+    // Defense in depth, on top of the per-phone lock above: don't blindly
+    // assume every image received here is a payment screenshot. A confused
+    // customer sometimes resends their palm photo instead (thinking it
+    // didn't go through, or unsure what to send next) — previously that
+    // was silently accepted AS payment confirmation, with zero actual
+    // payment made, which then broke report generation downstream with no
+    // clear way to recover. Run the same cheap hand/palm check used in
+    // awaiting_photo; if it looks like a palm again (not a screenshot),
+    // treat it as a re-sent palm photo and re-prompt for payment instead
+    // of falsely confirming it.
+    const imageDataUrl = await getMediaBase64(mediaId);
+    const palmCheck = await isPalmPhoto(imageDataUrl);
+    log("Image received in awaiting_payment for", phone, "-> palm-likeness check:", JSON.stringify(palmCheck));
+
+    // isPalmPhoto() deliberately fails OPEN (valid: true) on errors/timeouts/
+    // ambiguous answers, because in ITS original context that protects a
+    // real customer from being wrongly blocked. Reused here for the opposite
+    // purpose, that same fail-open default would wrongly treat a genuine
+    // payment screenshot as a palm photo on any vision-check hiccup — so
+    // only redirect on a genuine, confident "YES" from the model, not on
+    // the fail-open default (whose reason text never contains YES).
+    const genuinelyLooksLikePalm = palmCheck.valid && /\bYES\b/i.test(palmCheck.reason || "");
+
+    if (genuinelyLooksLikePalm) {
+      log("Image in awaiting_payment looks like ANOTHER palm photo, not a payment screenshot — re-prompting for payment instead of confirming it.");
+      await db.updateSession(phone, { palmMediaId: mediaId });
+      await sendText(
+        phone,
+        "ഇത് കൈരേഖയുടെ ഫോട്ടോ ആണെന്ന് തോന്നുന്നു — അത് സേവ് ചെയ്തിട്ടുണ്ട്.\n\n" + PHOTO_RECEIVED_PAYMENT_MESSAGE
+      );
+      return;
+    }
+
     log("Payment screenshot received from", phone);
     await confirmPaymentAndScheduleReport(phone, session, "screenshot image");
     return;
@@ -1417,8 +1487,26 @@ async function handleImageMessage(phone, mediaId, session) {
     // received, thanks" with NO session update at all — so if the report
     // failed because the original photo wasn't a valid palm, a corrected
     // photo sent afterward was silently ignored forever, and every retry
-    // kept re-using the original bad photo. Now: treat this as a genuine
-    // replacement and actually reschedule using the new photo.
+    // kept re-using the original bad photo. That was fixed by treating any
+    // photo here as a genuine replacement — but that fix was itself too
+    // trusting: a customer sometimes re-sends a payment screenshot instead
+    // (habit, or confusion after an earlier payment mix-up), which then got
+    // used AS the "corrected" palm photo, burned a real generation attempt,
+    // and produced the "am I being scammed" confusion. Now: run the same
+    // palm/hand check used in awaiting_photo first. This uses isPalmPhoto()
+    // in its ORIGINAL fail-open sense (defaults to accept on error/timeout/
+    // ambiguity) — same as everywhere else it's used for actual palm-photo
+    // validation — so a vision-check hiccup never blocks a genuine customer.
+    const imageDataUrl = await getMediaBase64(mediaId);
+    const validation = await isPalmPhoto(imageDataUrl);
+    log("New photo received while awaiting_report for", phone, "-> palm validation:", JSON.stringify(validation));
+
+    if (!validation.valid) {
+      log("Photo in awaiting_report does NOT look like a palm — NOT touching report scheduling, just asking for a proper resend.");
+      await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
+      return;
+    }
+
     log("New photo received while awaiting_report for", phone, "— treating as a corrected palm photo submission.");
     const retryDueAt = new Date(Date.now() + 2 * 60 * 1000);
     await db.updateSession(phone, {
@@ -1684,53 +1772,62 @@ async function processWebhookBody(body) {
   markProcessed(message.id);
 
   const phone = message.from;
-  const session = await db.getOrCreateSession(phone);
 
-  log("Message type:", message.type, "from", phone);
+  // Everything below — fetching the session, dispatching on its stage, and
+  // any DB writes that result — runs inside the per-phone lock. This
+  // guarantees that if WhatsApp fires two events for the same customer
+  // close together (e.g. two photos sent a few seconds apart), the second
+  // one only starts once the first has fully finished and the session
+  // state in the DB is fully up to date. See runExclusive() above for why.
+  await runExclusive(phone, async () => {
+    const session = await db.getOrCreateSession(phone);
 
-  if (message.type === "text") {
-    const text = message.text?.body || "";
-    db.logMessage(phone, "in", text, "text");
-    await handleTextMessage(phone, text, session);
-  } else if (message.type === "audio") {
-    // Voice messages/voice notes — transcribed and then handled exactly
-    // like a normal text message (see handleVoiceMessage above). The
-    // transcript itself gets logged inside handleVoiceMessage once known.
-    const mediaId = message.audio?.id;
-    await handleVoiceMessage(phone, mediaId, session);
-  } else if (
-    message.type === "image" ||
-    (message.type === "document" && message.document?.mime_type?.startsWith("image/"))
-  ) {
-    // WhatsApp sometimes sends HD-quality photos as a document instead of
-    // a standard image message — treat both the same way.
-    const mediaId = message.image?.id || message.document?.id;
-    log("Photo received as", message.type, "-> mediaId:", mediaId);
-    db.logMessage(phone, "in", "[Photo]", "photo");
-    await handleImageMessage(phone, mediaId, session);
-  } else if (
-    message.type === "document" &&
-    message.document?.mime_type === "application/pdf" &&
-    session.stage === "awaiting_payment"
-  ) {
-    // Payment receipt sent as a PDF (some UPI apps/banks do this instead of
-    // a screenshot) — accepted unconditionally, same trust model as the
-    // transaction-ID fallback: no parsing/verification, just proceed.
-    log("Payment PDF receipt received from", phone, "-> accepting unconditionally, proceeding to report scheduling.");
-    db.logMessage(phone, "in", "[Payment PDF receipt]", "pdf");
-    await confirmPaymentAndScheduleReport(phone, session, "PDF receipt");
-  } else if (message.type === "unsupported") {
-    // WhatsApp sends a transient "unsupported" placeholder event a few
-    // milliseconds before the real "image"/"document" event for HD media
-    // sends (confirmed repeatedly in logs — same phone, same moment,
-    // always immediately followed by the real photo event). This is not
-    // real customer content, so we log it and say nothing, letting the
-    // follow-up event that arrives right after handle the actual photo —
-    // replying here just confuses the customer mid-send.
-    log("Ignoring transient 'unsupported' placeholder event from", phone, "(real event should follow immediately)");
-  } else {
-    await sendText(phone, "ദയവായി text ആയോ photo ആയോ അയക്കൂ.");
-  }
+    log("Message type:", message.type, "from", phone);
+
+    if (message.type === "text") {
+      const text = message.text?.body || "";
+      db.logMessage(phone, "in", text, "text");
+      await handleTextMessage(phone, text, session);
+    } else if (message.type === "audio") {
+      // Voice messages/voice notes — transcribed and then handled exactly
+      // like a normal text message (see handleVoiceMessage above). The
+      // transcript itself gets logged inside handleVoiceMessage once known.
+      const mediaId = message.audio?.id;
+      await handleVoiceMessage(phone, mediaId, session);
+    } else if (
+      message.type === "image" ||
+      (message.type === "document" && message.document?.mime_type?.startsWith("image/"))
+    ) {
+      // WhatsApp sometimes sends HD-quality photos as a document instead of
+      // a standard image message — treat both the same way.
+      const mediaId = message.image?.id || message.document?.id;
+      log("Photo received as", message.type, "-> mediaId:", mediaId);
+      db.logMessage(phone, "in", "[Photo]", "photo");
+      await handleImageMessage(phone, mediaId, session);
+    } else if (
+      message.type === "document" &&
+      message.document?.mime_type === "application/pdf" &&
+      session.stage === "awaiting_payment"
+    ) {
+      // Payment receipt sent as a PDF (some UPI apps/banks do this instead of
+      // a screenshot) — accepted unconditionally, same trust model as the
+      // transaction-ID fallback: no parsing/verification, just proceed.
+      log("Payment PDF receipt received from", phone, "-> accepting unconditionally, proceeding to report scheduling.");
+      db.logMessage(phone, "in", "[Payment PDF receipt]", "pdf");
+      await confirmPaymentAndScheduleReport(phone, session, "PDF receipt");
+    } else if (message.type === "unsupported") {
+      // WhatsApp sends a transient "unsupported" placeholder event a few
+      // milliseconds before the real "image"/"document" event for HD media
+      // sends (confirmed repeatedly in logs — same phone, same moment,
+      // always immediately followed by the real photo event). This is not
+      // real customer content, so we log it and say nothing, letting the
+      // follow-up event that arrives right after handle the actual photo —
+      // replying here just confuses the customer mid-send.
+      log("Ignoring transient 'unsupported' placeholder event from", phone, "(real event should follow immediately)");
+    } else {
+      await sendText(phone, "ദയവായി text ആയോ photo ആയോ അയക്കൂ.");
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
