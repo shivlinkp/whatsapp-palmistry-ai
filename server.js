@@ -826,13 +826,39 @@ async function handleVoiceMessage(phone, mediaId, session) {
   await handleTextMessage(phone, transcript, session);
 }
 
-// Detects short English-language decline/apology text, which is what the
-// model outputs on the rare occasions it refuses instead of writing the
-// Malayalam reading. A real report is 2000+ words of Malayalam script, so
-// any short response matching these patterns is treated as a failure.
+// Detects when the model declined to write a real report instead of
+// producing one. Originally this only matched short English-language
+// apology phrases (e.g. "i'm sorry", "as an ai") — but the report prompt is
+// entirely in Malayalam, so when the model declines (e.g. because the
+// "palm" image it was given is actually a payment screenshot), it quite
+// naturally declines IN MALAYALAM too, explaining what's wrong with the
+// image. That Malayalam decline never matched the English-only patterns,
+// so it was silently accepted as a real report — flipping the session to
+// report_sent and permanently orphaning the customer's actual palm photos
+// (nothing in handleImageMessage handles new photos once report_sent).
+//
+// The system prompt requires a minimum of 2000 words for a real report. A
+// genuine decline/explanation — in ANY language — is always dramatically
+// shorter than that. So length is a much more reliable, language-agnostic
+// signal than pattern-matching specific refusal phrases. We keep the
+// English pattern check too (belt and suspenders), but the word-count
+// check is what actually catches the Malayalam-decline case.
+const MIN_PLAUSIBLE_REPORT_WORDS = 500; // real reports are 2000+; declines/explanations are typically under 150
+
 function isLikelyRefusal(text) {
   if (!text) return false;
   const trimmed = text.trim();
+
+  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+  if (wordCount < MIN_PLAUSIBLE_REPORT_WORDS) {
+    log(
+      "isLikelyRefusal: content is only",
+      wordCount,
+      `words (< ${MIN_PLAUSIBLE_REPORT_WORDS}) — far too short to be a real report, treating as a failure/decline regardless of language.`
+    );
+    return true;
+  }
+
   if (trimmed.length > 400) return false;
   const refusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
   return refusalPatterns.test(trimmed);
@@ -1539,6 +1565,25 @@ async function handleImageMessage(phone, mediaId, session) {
     await sendText(
       phone,
       "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_ALL_DETAILS_MESSAGE
+    );
+    return;
+  }
+
+  if (session.stage === "report_sent") {
+    // Previously: any photo sent here (customer already has a completed
+    // report) fell through to the generic catch-all below — a bare "photo
+    // received, thanks" with NO real handling. Combined with the
+    // Malayalam-refusal detection gap fixed above, this is exactly what
+    // silently orphaned Shefija's real palm photos after her order was
+    // wrongly marked report_sent from a bad image. Even though that root
+    // cause is now fixed, this stage still has no legitimate use for a raw
+    // photo (starting a new person's order goes through TEXT details
+    // first, via wantsAnotherPersonReading() in handleTextMessage) — so
+    // give the customer a clear, actionable message instead of silence.
+    log("Photo received while stage=report_sent for", phone, "— no active order expects a photo here; guiding customer instead of silently acking.");
+    await sendText(
+      phone,
+      "ഫോട്ടോ ലഭിച്ചു.\n\nനിങ്ങളുടെ റിപ്പോർട്ട് നേരത്തെ അയച്ചിട്ടുണ്ട്. മറ്റൊരു വ്യക്തിയുടെ കൈരേഖാ വിശകലനം വേണമെങ്കിൽ ആ വ്യക്തിയുടെ പേര്, ജനനത്തീയതി, Gender എന്നിവ ടെക്സ്റ്റ് ആയി അയച്ചുതരൂ — അതിന് ശേഷം ഫോട്ടോ ചോദിക്കാം. നിങ്ങളുടെ റിപ്പോർട്ടിൽ എന്തെങ്കിലും പ്രശ്നമുണ്ടെങ്കിൽ അത് ടൈപ്പ് ചെയ്ത് അയക്കൂ."
     );
     return;
   }
