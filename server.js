@@ -71,43 +71,6 @@ function isDuplicate(id) {
 const qrMessageIdsByPhone = new Map();
 
 // ---------------------------------------------------------------------------
-// Per-phone serialization
-// ---------------------------------------------------------------------------
-// Express acks each webhook immediately and processes it in the background
-// (see app.post("/webhook", ...)), so if a customer sends two photos a few
-// seconds apart, both webhook calls can end up running fully concurrently.
-// Each one independently fetches the session, so both can see the SAME
-// stale stage (e.g. "awaiting_photo") and both act on it — this caused
-// duplicate QR sends, duplicate "please pay" texts, and — worse — a later
-// photo landing after the stage had already flipped to "awaiting_payment"
-// due to the race, getting silently misread as a payment screenshot with
-// zero actual payment made.
-//
-// runExclusive() chains a promise per phone number so that everything for
-// one phone (session fetch + handling + DB writes) fully completes before
-// the next message for that SAME phone starts. Different phone numbers are
-// unaffected and continue to run fully in parallel.
-const phoneLocks = new Map();
-
-function runExclusive(phone, task) {
-  const prior = phoneLocks.get(phone) || Promise.resolve();
-  // Run task regardless of whether the prior task succeeded or failed, so
-  // one crashed message never permanently jams the queue for that phone.
-  const result = prior.then(task, task);
-  // Store a version of the chain that never rejects, so a failure here
-  // doesn't poison every future message for this phone either.
-  const tracked = result.catch((err) => {
-    log("runExclusive: task for", phone, "threw (caught):", err.message);
-  });
-  phoneLocks.set(phone, tracked);
-  // Simple cleanup so the map doesn't grow forever for phones that go quiet.
-  tracked.finally(() => {
-    if (phoneLocks.get(phone) === tracked) phoneLocks.delete(phone);
-  });
-  return result;
-}
-
-// ---------------------------------------------------------------------------
 // WhatsApp send helpers
 // ---------------------------------------------------------------------------
 
@@ -826,39 +789,13 @@ async function handleVoiceMessage(phone, mediaId, session) {
   await handleTextMessage(phone, transcript, session);
 }
 
-// Detects when the model declined to write a real report instead of
-// producing one. Originally this only matched short English-language
-// apology phrases (e.g. "i'm sorry", "as an ai") — but the report prompt is
-// entirely in Malayalam, so when the model declines (e.g. because the
-// "palm" image it was given is actually a payment screenshot), it quite
-// naturally declines IN MALAYALAM too, explaining what's wrong with the
-// image. That Malayalam decline never matched the English-only patterns,
-// so it was silently accepted as a real report — flipping the session to
-// report_sent and permanently orphaning the customer's actual palm photos
-// (nothing in handleImageMessage handles new photos once report_sent).
-//
-// The system prompt requires a minimum of 2000 words for a real report. A
-// genuine decline/explanation — in ANY language — is always dramatically
-// shorter than that. So length is a much more reliable, language-agnostic
-// signal than pattern-matching specific refusal phrases. We keep the
-// English pattern check too (belt and suspenders), but the word-count
-// check is what actually catches the Malayalam-decline case.
-const MIN_PLAUSIBLE_REPORT_WORDS = 500; // real reports are 2000+; declines/explanations are typically under 150
-
+// Detects short English-language decline/apology text, which is what the
+// model outputs on the rare occasions it refuses instead of writing the
+// Malayalam reading. A real report is 2000+ words of Malayalam script, so
+// any short response matching these patterns is treated as a failure.
 function isLikelyRefusal(text) {
   if (!text) return false;
   const trimmed = text.trim();
-
-  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
-  if (wordCount < MIN_PLAUSIBLE_REPORT_WORDS) {
-    log(
-      "isLikelyRefusal: content is only",
-      wordCount,
-      `words (< ${MIN_PLAUSIBLE_REPORT_WORDS}) — far too short to be a real report, treating as a failure/decline regardless of language.`
-    );
-    return true;
-  }
-
   if (trimmed.length > 400) return false;
   const refusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
   return refusalPatterns.test(trimmed);
@@ -1155,6 +1092,7 @@ async function handleTextMessage(phone, text, session) {
       reportDueAt: null,
       reportAttempts: 0,
       reportError: null,
+      pendingSecondPerson: false,
     });
     log("Session RESET for", phone, "via hidden test command");
     await sendText(phone, "സെഷൻ റീസെറ്റ് ചെയ്തു. വീണ്ടും തുടങ്ങാൻ 'Hi' എന്ന് അയക്കൂ.");
@@ -1335,32 +1273,77 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
   }
 
   if (session.stage === "report_sent") {
-    const wantsAnother = await wantsAnotherPersonReading(text);
-    if (wantsAnother) {
+    // Two-step flow for "reading for someone else in this chat":
+    //   Step 1 — classifier says this message wants a new order. We ask for
+    //   the next person's name/DOB/gender, but do NOT touch the current
+    //   (paid) session yet — nothing is wiped at this point.
+    //   Step 2 — this specific reply, sent to the sole hidden question above.
+    //   We treat it as a genuine new order and reset the session ONLY if it
+    //   actually contains person details (name/dob/gender). If it doesn't
+    //   (e.g. the customer asks something else, or says "never mind"), we
+    //   drop back to the normal follow-up flow instead of forcing a reset.
+    //
+    // This still always asks for the next person's details when someone
+    // wants a second reading (same as before) — it just moves the
+    // destructive part (wiping the paid session) to only happen once we
+    // have confirmed real details in hand, instead of firing off a single
+    // classifier call against an arbitrary message. Fixes a real incident
+    // where the old single-step version misfired on a customer answering
+    // an unrelated follow-up question, wiped his paid session, and made
+    // him think it was a scam.
+    if (session.pendingSecondPerson) {
+      const nextPerson = await extractFields(text, {}); // fresh — do not inherit the previous person's details
+      if (nextPerson.name || nextPerson.dob || nextPerson.gender) {
+        log(
+          "Customer at",
+          phone,
+          "provided next-person details — restarting collection flow in the same chat (order #",
+          (session.orderCount || 1) + 1,
+          ")"
+        );
+        const reset = await db.updateSession(phone, {
+          stage: "collecting",
+          name: nextPerson.name || null,
+          dob: nextPerson.dob || null,
+          gender: nextPerson.gender || null,
+          relation: nextPerson.relation || null,
+          palmMediaId: null,
+          paymentReceived: false,
+          reportText: null,
+          reportStatus: "none",
+          reportDueAt: null,
+          reportAttempts: 0,
+          reportError: null,
+          orderCount: (session.orderCount || 1) + 1,
+          pendingSecondPerson: false,
+        });
+        // Reuses the normal collecting-stage logic — it will ask for
+        // whatever's still missing, or move straight to asking for a
+        // photo if this one reply already had everything.
+        await progressCollectingStage(phone, reset);
+        return;
+      }
+      // Didn't look like person details — clear the pending flag and fall
+      // through to the normal follow-up Q&A below instead of resetting.
+      await db.updateSession(phone, { pendingSecondPerson: false });
       log(
-        "Customer at",
+        "pendingSecondPerson reply for",
         phone,
-        "wants a reading for another person — restarting collection flow in the same chat (order #",
-        (session.orderCount || 1) + 1,
-        ")"
+        "didn't contain any name/dob/gender — treating as a normal follow-up instead of resetting. Message was:",
+        text
       );
-      await db.updateSession(phone, {
-        stage: "collecting",
-        name: null,
-        dob: null,
-        gender: null,
-        relation: null,
-        palmMediaId: null,
-        paymentReceived: false,
-        reportText: null,
-        reportStatus: "none",
-        reportDueAt: null,
-        reportAttempts: 0,
-        reportError: null,
-        orderCount: (session.orderCount || 1) + 1,
-      });
-      await sendText(phone, ASK_SECOND_PERSON_DETAILS_MESSAGE);
-      return;
+    } else {
+      const wantsAnother = await wantsAnotherPersonReading(text);
+      if (wantsAnother) {
+        log(
+          "Customer at",
+          phone,
+          "indicated they want a reading for another person — asking for that person's details before touching anything."
+        );
+        await db.updateSession(phone, { pendingSecondPerson: true });
+        await sendText(phone, ASK_SECOND_PERSON_DETAILS_MESSAGE);
+        return;
+      }
     }
 
     const todayStr = new Date().toISOString().slice(0, 10); // e.g. "2026-07-03"
@@ -1470,39 +1453,6 @@ async function handleImageMessage(phone, mediaId, session) {
   }
 
   if (session.stage === "awaiting_payment") {
-    // Defense in depth, on top of the per-phone lock above: don't blindly
-    // assume every image received here is a payment screenshot. A confused
-    // customer sometimes resends their palm photo instead (thinking it
-    // didn't go through, or unsure what to send next) — previously that
-    // was silently accepted AS payment confirmation, with zero actual
-    // payment made, which then broke report generation downstream with no
-    // clear way to recover. Run the same cheap hand/palm check used in
-    // awaiting_photo; if it looks like a palm again (not a screenshot),
-    // treat it as a re-sent palm photo and re-prompt for payment instead
-    // of falsely confirming it.
-    const imageDataUrl = await getMediaBase64(mediaId);
-    const palmCheck = await isPalmPhoto(imageDataUrl);
-    log("Image received in awaiting_payment for", phone, "-> palm-likeness check:", JSON.stringify(palmCheck));
-
-    // isPalmPhoto() deliberately fails OPEN (valid: true) on errors/timeouts/
-    // ambiguous answers, because in ITS original context that protects a
-    // real customer from being wrongly blocked. Reused here for the opposite
-    // purpose, that same fail-open default would wrongly treat a genuine
-    // payment screenshot as a palm photo on any vision-check hiccup — so
-    // only redirect on a genuine, confident "YES" from the model, not on
-    // the fail-open default (whose reason text never contains YES).
-    const genuinelyLooksLikePalm = palmCheck.valid && /\bYES\b/i.test(palmCheck.reason || "");
-
-    if (genuinelyLooksLikePalm) {
-      log("Image in awaiting_payment looks like ANOTHER palm photo, not a payment screenshot — re-prompting for payment instead of confirming it.");
-      await db.updateSession(phone, { palmMediaId: mediaId });
-      await sendText(
-        phone,
-        "ഇത് കൈരേഖയുടെ ഫോട്ടോ ആണെന്ന് തോന്നുന്നു — അത് സേവ് ചെയ്തിട്ടുണ്ട്.\n\n" + PHOTO_RECEIVED_PAYMENT_MESSAGE
-      );
-      return;
-    }
-
     log("Payment screenshot received from", phone);
     await confirmPaymentAndScheduleReport(phone, session, "screenshot image");
     return;
@@ -1513,26 +1463,8 @@ async function handleImageMessage(phone, mediaId, session) {
     // received, thanks" with NO session update at all — so if the report
     // failed because the original photo wasn't a valid palm, a corrected
     // photo sent afterward was silently ignored forever, and every retry
-    // kept re-using the original bad photo. That was fixed by treating any
-    // photo here as a genuine replacement — but that fix was itself too
-    // trusting: a customer sometimes re-sends a payment screenshot instead
-    // (habit, or confusion after an earlier payment mix-up), which then got
-    // used AS the "corrected" palm photo, burned a real generation attempt,
-    // and produced the "am I being scammed" confusion. Now: run the same
-    // palm/hand check used in awaiting_photo first. This uses isPalmPhoto()
-    // in its ORIGINAL fail-open sense (defaults to accept on error/timeout/
-    // ambiguity) — same as everywhere else it's used for actual palm-photo
-    // validation — so a vision-check hiccup never blocks a genuine customer.
-    const imageDataUrl = await getMediaBase64(mediaId);
-    const validation = await isPalmPhoto(imageDataUrl);
-    log("New photo received while awaiting_report for", phone, "-> palm validation:", JSON.stringify(validation));
-
-    if (!validation.valid) {
-      log("Photo in awaiting_report does NOT look like a palm — NOT touching report scheduling, just asking for a proper resend.");
-      await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
-      return;
-    }
-
+    // kept re-using the original bad photo. Now: treat this as a genuine
+    // replacement and actually reschedule using the new photo.
     log("New photo received while awaiting_report for", phone, "— treating as a corrected palm photo submission.");
     const retryDueAt = new Date(Date.now() + 2 * 60 * 1000);
     await db.updateSession(phone, {
@@ -1565,25 +1497,6 @@ async function handleImageMessage(phone, mediaId, session) {
     await sendText(
       phone,
       "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_ALL_DETAILS_MESSAGE
-    );
-    return;
-  }
-
-  if (session.stage === "report_sent") {
-    // Previously: any photo sent here (customer already has a completed
-    // report) fell through to the generic catch-all below — a bare "photo
-    // received, thanks" with NO real handling. Combined with the
-    // Malayalam-refusal detection gap fixed above, this is exactly what
-    // silently orphaned Shefija's real palm photos after her order was
-    // wrongly marked report_sent from a bad image. Even though that root
-    // cause is now fixed, this stage still has no legitimate use for a raw
-    // photo (starting a new person's order goes through TEXT details
-    // first, via wantsAnotherPersonReading() in handleTextMessage) — so
-    // give the customer a clear, actionable message instead of silence.
-    log("Photo received while stage=report_sent for", phone, "— no active order expects a photo here; guiding customer instead of silently acking.");
-    await sendText(
-      phone,
-      "ഫോട്ടോ ലഭിച്ചു.\n\nനിങ്ങളുടെ റിപ്പോർട്ട് നേരത്തെ അയച്ചിട്ടുണ്ട്. മറ്റൊരു വ്യക്തിയുടെ കൈരേഖാ വിശകലനം വേണമെങ്കിൽ ആ വ്യക്തിയുടെ പേര്, ജനനത്തീയതി, Gender എന്നിവ ടെക്സ്റ്റ് ആയി അയച്ചുതരൂ — അതിന് ശേഷം ഫോട്ടോ ചോദിക്കാം. നിങ്ങളുടെ റിപ്പോർട്ടിൽ എന്തെങ്കിലും പ്രശ്നമുണ്ടെങ്കിൽ അത് ടൈപ്പ് ചെയ്ത് അയക്കൂ."
     );
     return;
   }
@@ -1673,6 +1586,7 @@ app.get("/admin/reset-session", async (req, res) => {
       reportDueAt: null,
       reportAttempts: 0,
       reportError: null,
+      pendingSecondPerson: false,
     });
     log("Session RESET for", phone, "via admin HTTP endpoint");
     res.status(200).send(`Session reset for ${phone}. Send "Hi" from that number on WhatsApp to start fresh.`);
@@ -1731,103 +1645,7 @@ app.get("/admin/chats", async (req, res) => {
   }
 });
 
-// Admin insights — GET /admin/insights?key=resetmybot123
-// Surfaces likely-broken conversations for a human to review, instead of
-// relying on someone happening to notice a bad chat and pasting its URL.
-// Three READ-ONLY flags, each pointing straight at the underlying chat:
-//   1. Trust/scam language from the customer (e.g. "is this a scam")
-//   2. Stuck report delivery (failed outright, or awaiting_report >1hr)
-//   3. Suspiciously short "sent" reports — catches the Malayalam-decline-
-//      accepted-as-report bug (see db.js findShortReportSessions) even for
-//      PAST orders that happened before that bug was fixed in code.
-// This doesn't change any bot behavior — it's purely a triage view.
-app.get("/admin/insights", async (req, res) => {
-  const { key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-
-  try {
-    const [trustFlags, stuckReports, shortReports] = await Promise.all([
-      db.findTrustFlagSessions(),
-      db.findStuckReportSessions(),
-      db.findShortReportSessions(),
-    ]);
-
-    const chatLink = (phone) => `/admin/chats/view?phone=${encodeURIComponent(phone)}&key=${encodeURIComponent(key)}`;
-    const timeStr = (t) => (t ? new Date(t).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "—");
-
-    const section = (title, count, rowsHtml, emptyMsg) => `
-      <div style="padding:16px;font-size:18px;font-weight:bold;border-bottom:1px solid #333;background:#181818;">
-        ${title} (${count})
-      </div>
-      ${rowsHtml || `<div style="padding:16px;color:#888;">${emptyMsg}</div>`}
-    `;
-
-    const trustRows = trustFlags
-      .map((r) => {
-        const preview = escapeHtml((r.body || "").slice(0, 100));
-        return `<a href="${chatLink(r.phone)}" style="text-decoration:none;color:inherit;">
-          <div style="padding:12px 16px;border-bottom:1px solid #333;">
-            <div style="display:flex;justify-content:space-between;">
-              <strong>${escapeHtml(r.phone)}</strong>
-              <span style="color:#888;font-size:12px;">${timeStr(r.created_at)}</span>
-            </div>
-            <div style="color:#aaa;font-size:14px;">${escapeHtml(r.name || "(no name)")} · ${escapeHtml(r.stage || "")}</div>
-            <div style="color:#f88;font-size:14px;margin-top:2px;">"${preview}"</div>
-          </div>
-        </a>`;
-      })
-      .join("");
-
-    const stuckRows = stuckReports
-      .map((r) => {
-        return `<a href="${chatLink(r.phone)}" style="text-decoration:none;color:inherit;">
-          <div style="padding:12px 16px;border-bottom:1px solid #333;">
-            <div style="display:flex;justify-content:space-between;">
-              <strong>${escapeHtml(r.phone)}</strong>
-              <span style="color:#888;font-size:12px;">${timeStr(r.updated_at)}</span>
-            </div>
-            <div style="color:#aaa;font-size:14px;">${escapeHtml(r.name || "(no name)")} · report_status: ${escapeHtml(
-              r.report_status
-            )} · attempts: ${r.report_attempts}</div>
-          </div>
-        </a>`;
-      })
-      .join("");
-
-    const shortRows = shortReports
-      .map((r) => {
-        return `<a href="${chatLink(r.phone)}" style="text-decoration:none;color:inherit;">
-          <div style="padding:12px 16px;border-bottom:1px solid #333;">
-            <div style="display:flex;justify-content:space-between;">
-              <strong>${escapeHtml(r.phone)}</strong>
-              <span style="color:#888;font-size:12px;">${timeStr(r.updated_at)}</span>
-            </div>
-            <div style="color:#aaa;font-size:14px;">${escapeHtml(r.name || "(no name)")} · report length: ${
-              r.report_length
-            } chars (expected thousands)</div>
-          </div>
-        </a>`;
-      })
-      .join("");
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Insights</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
-  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">
-    Flagged Conversations
-    <a href="/admin/chats?key=${encodeURIComponent(key)}" style="float:right;color:#8af;font-size:14px;font-weight:normal;">All chats →</a>
-  </div>
-  ${section("ߚ Trust/scam language from customer", trustFlags.length, trustRows, "None found.")}
-  ${section("⏳ Stuck or failed report delivery", stuckReports.length, stuckRows, "None found.")}
-  ${section("ߓ Suspiciously short \"sent\" reports", shortReports.length, shortRows, "None found.")}
-</body></html>`);
-  } catch (err) {
-    log("Admin insights failed (caught):", err.message);
-    res.status(500).send("Failed to load insights: " + err.message);
-  }
-});
+// Admin chat viewer — GET /admin/chats/view?phone=917736236010&key=resetmybot123
 // Shows the full message history for one phone number, WhatsApp-bubble style.
 app.get("/admin/chats/view", async (req, res) => {
   const { phone, key } = req.query;
@@ -1866,6 +1684,52 @@ app.get("/admin/chats/view", async (req, res) => {
   } catch (err) {
     log("Admin chat view failed (caught):", err.message);
     res.status(500).send("Failed to load chat: " + err.message);
+  }
+});
+
+// Admin: paid-but-not-delivered list — GET /admin/failed-payments?key=resetmybot123
+// Shows every session where report_status='failed' (payment was received,
+// generation retried MAX_REPORT_ATTEMPTS times, and every attempt failed).
+// This is the direct, DB-backed answer to "did anyone pay and not get a
+// report" — no need to scan chat transcripts by hand. Sessions in this
+// state already received REPORT_EXHAUSTED_MESSAGE telling them you'll
+// follow up directly, so this list is exactly who still needs that
+// follow-up.
+app.get("/admin/failed-payments", async (req, res) => {
+  const { key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+
+  try {
+    const failed = await db.findFailedPayments();
+    const rows = failed
+      .map((s) => {
+        const time = new Date(s.updatedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+        const name = escapeHtml(s.name || "(no name)");
+        return `<a href="/admin/chats/view?phone=${encodeURIComponent(s.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
+          <div style="padding:12px 16px;border-bottom:1px solid #333;">
+            <div style="display:flex;justify-content:space-between;">
+              <strong>${escapeHtml(s.phone)}</strong>
+              <span style="color:#888;font-size:12px;">last update: ${time}</span>
+            </div>
+            <div style="color:#aaa;font-size:14px;">${name} · payment_received: ${s.paymentReceived} · ${s.reportAttempts} failed attempt(s)</div>
+            <div style="color:#ccc;font-size:13px;margin-top:2px;">${escapeHtml(s.reportError || "")}</div>
+          </div>
+        </a>`;
+      })
+      .join("");
+
+    res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Failed Payments</title></head>
+<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
+  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Paid but report generation gave up (${failed.length})</div>
+  <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat. Each of these already received a message telling them you'll follow up directly.</div>
+  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. ߎ</div>'}
+</body></html>`);
+  } catch (err) {
+    log("Admin failed-payments list failed (caught):", err.message);
+    res.status(500).send("Failed to load: " + err.message);
   }
 });
 
@@ -1913,62 +1777,53 @@ async function processWebhookBody(body) {
   markProcessed(message.id);
 
   const phone = message.from;
+  const session = await db.getOrCreateSession(phone);
 
-  // Everything below — fetching the session, dispatching on its stage, and
-  // any DB writes that result — runs inside the per-phone lock. This
-  // guarantees that if WhatsApp fires two events for the same customer
-  // close together (e.g. two photos sent a few seconds apart), the second
-  // one only starts once the first has fully finished and the session
-  // state in the DB is fully up to date. See runExclusive() above for why.
-  await runExclusive(phone, async () => {
-    const session = await db.getOrCreateSession(phone);
+  log("Message type:", message.type, "from", phone);
 
-    log("Message type:", message.type, "from", phone);
-
-    if (message.type === "text") {
-      const text = message.text?.body || "";
-      db.logMessage(phone, "in", text, "text");
-      await handleTextMessage(phone, text, session);
-    } else if (message.type === "audio") {
-      // Voice messages/voice notes — transcribed and then handled exactly
-      // like a normal text message (see handleVoiceMessage above). The
-      // transcript itself gets logged inside handleVoiceMessage once known.
-      const mediaId = message.audio?.id;
-      await handleVoiceMessage(phone, mediaId, session);
-    } else if (
-      message.type === "image" ||
-      (message.type === "document" && message.document?.mime_type?.startsWith("image/"))
-    ) {
-      // WhatsApp sometimes sends HD-quality photos as a document instead of
-      // a standard image message — treat both the same way.
-      const mediaId = message.image?.id || message.document?.id;
-      log("Photo received as", message.type, "-> mediaId:", mediaId);
-      db.logMessage(phone, "in", "[Photo]", "photo");
-      await handleImageMessage(phone, mediaId, session);
-    } else if (
-      message.type === "document" &&
-      message.document?.mime_type === "application/pdf" &&
-      session.stage === "awaiting_payment"
-    ) {
-      // Payment receipt sent as a PDF (some UPI apps/banks do this instead of
-      // a screenshot) — accepted unconditionally, same trust model as the
-      // transaction-ID fallback: no parsing/verification, just proceed.
-      log("Payment PDF receipt received from", phone, "-> accepting unconditionally, proceeding to report scheduling.");
-      db.logMessage(phone, "in", "[Payment PDF receipt]", "pdf");
-      await confirmPaymentAndScheduleReport(phone, session, "PDF receipt");
-    } else if (message.type === "unsupported") {
-      // WhatsApp sends a transient "unsupported" placeholder event a few
-      // milliseconds before the real "image"/"document" event for HD media
-      // sends (confirmed repeatedly in logs — same phone, same moment,
-      // always immediately followed by the real photo event). This is not
-      // real customer content, so we log it and say nothing, letting the
-      // follow-up event that arrives right after handle the actual photo —
-      // replying here just confuses the customer mid-send.
-      log("Ignoring transient 'unsupported' placeholder event from", phone, "(real event should follow immediately)");
-    } else {
-      await sendText(phone, "ദയവായി text ആയോ photo ആയോ അയക്കൂ.");
-    }
-  });
+  if (message.type === "text") {
+    const text = message.text?.body || "";
+    db.logMessage(phone, "in", text, "text");
+    await handleTextMessage(phone, text, session);
+  } else if (message.type === "audio") {
+    // Voice messages/voice notes — transcribed and then handled exactly
+    // like a normal text message (see handleVoiceMessage above). The
+    // transcript itself gets logged inside handleVoiceMessage once known.
+    const mediaId = message.audio?.id;
+    await handleVoiceMessage(phone, mediaId, session);
+  } else if (
+    message.type === "image" ||
+    (message.type === "document" && message.document?.mime_type?.startsWith("image/"))
+  ) {
+    // WhatsApp sometimes sends HD-quality photos as a document instead of
+    // a standard image message — treat both the same way.
+    const mediaId = message.image?.id || message.document?.id;
+    log("Photo received as", message.type, "-> mediaId:", mediaId);
+    db.logMessage(phone, "in", "[Photo]", "photo");
+    await handleImageMessage(phone, mediaId, session);
+  } else if (
+    message.type === "document" &&
+    message.document?.mime_type === "application/pdf" &&
+    session.stage === "awaiting_payment"
+  ) {
+    // Payment receipt sent as a PDF (some UPI apps/banks do this instead of
+    // a screenshot) — accepted unconditionally, same trust model as the
+    // transaction-ID fallback: no parsing/verification, just proceed.
+    log("Payment PDF receipt received from", phone, "-> accepting unconditionally, proceeding to report scheduling.");
+    db.logMessage(phone, "in", "[Payment PDF receipt]", "pdf");
+    await confirmPaymentAndScheduleReport(phone, session, "PDF receipt");
+  } else if (message.type === "unsupported") {
+    // WhatsApp sends a transient "unsupported" placeholder event a few
+    // milliseconds before the real "image"/"document" event for HD media
+    // sends (confirmed repeatedly in logs — same phone, same moment,
+    // always immediately followed by the real photo event). This is not
+    // real customer content, so we log it and say nothing, letting the
+    // follow-up event that arrives right after handle the actual photo —
+    // replying here just confuses the customer mid-send.
+    log("Ignoring transient 'unsupported' placeholder event from", phone, "(real event should follow immediately)");
+  } else {
+    await sendText(phone, "ദയവായി text ആയോ photo ആയോ അയക്കൂ.");
+  }
 }
 
 // ---------------------------------------------------------------------------
