@@ -801,6 +801,21 @@ function isLikelyRefusal(text) {
   return refusalPatterns.test(trimmed);
 }
 
+// Language-agnostic safety net alongside isLikelyRefusal(): the system
+// prompt requires a genuine report to be 2000+ words. A real incident
+// showed the model can decline in MALAYALAM instead of English (e.g. "this
+// doesn't look like a proper hand photo, please send a clearer one") —
+// isLikelyRefusal() only matches English apology phrasing, so that
+// Malayalam decline was treated as a valid "report" and delivered to a
+// paying customer. This threshold is set well below the real 2000-word
+// minimum (as a safety margin for genuinely shorter-but-valid edge cases)
+// but far above anything a refusal/decline message could plausibly reach.
+function isTooShortToBeReport(text) {
+  if (!text) return true;
+  const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+  return wordCount < 600;
+}
+
 // Dedicated OpenAI call for report generation, logging the full request
 // payload (image truncated) and full raw response.
 async function callOpenAIForReport(messages, maxTokens, model) {
@@ -945,6 +960,12 @@ Do not include any disclaimers. Do not say you are unable to see or analyze an i
 
   if (report && isLikelyRefusal(report)) {
     log("generateReport: model output looks like a refusal, not a report. Treating as failure. Content was:", report);
+    report = null;
+  } else if (report && isTooShortToBeReport(report)) {
+    log(
+      "generateReport: model output is far too short to be a real report (likely a non-English decline/refusal, or some other malformed output). Treating as failure. Content was:",
+      report
+    );
     report = null;
   }
 
