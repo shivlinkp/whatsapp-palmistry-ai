@@ -205,6 +205,27 @@ async function findFailedPayments() {
   return result.rows.map(rowToSession);
 }
 
+// Finds sessions where report_status='sent' (looks like a success) but the
+// stored report_text is far shorter than a genuine report could be (2000+
+// words required). This is the exact signature of a real incident: the
+// model declined in Malayalam instead of English, wasn't caught by the
+// English-only refusal check, and got delivered to a paying customer as if
+// it were their actual reading. report_status='failed' alone does NOT
+// catch this — the session looks like a success in the DB. Character
+// count is used (not word count) since it's a simple, fast SQL condition;
+// 3000 characters is well below what any genuine 2000+ word Malayalam
+// report reaches, but comfortably above anything a refusal message could.
+async function findSuspiciouslyShortReports() {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE report_status = 'sent'
+       AND report_text IS NOT NULL
+       AND length(report_text) < 3000
+     ORDER BY updated_at DESC`
+  );
+  return result.rows.map(rowToSession);
+}
+
 // Logs one message (inbound or outbound) to the permanent conversation log.
 // Never throws — a logging failure should never break the actual bot flow.
 async function logMessage(phone, direction, body, messageType) {
@@ -253,6 +274,7 @@ module.exports = {
   updateSession,
   findDueReports,
   findFailedPayments,
+  findSuspiciouslyShortReports,
   logMessage,
   getMessagesForPhone,
   listConversations,
