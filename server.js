@@ -1847,7 +1847,7 @@ app.get("/admin/failed-payments", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Paid but report generation gave up (${failed.length})</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat. Each of these already received a message telling them you'll follow up directly.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. ߎ</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. 🎉</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin failed-payments list failed (caught):", err.message);
@@ -1860,6 +1860,17 @@ app.post("/webhook", (req, res) => {
 
   processWebhookBody(req.body).catch((err) => log("Webhook handler crashed (caught):", err.message));
 });
+
+// Phone numbers the bot should stop replying to entirely — spam, abuse, or
+// someone just playing around rather than a genuine customer. Messages from
+// these numbers are still logged (so there's a record if needed later), but
+// no reply is sent and no session/report processing happens. Add/remove
+// numbers here as E.164-style digits with no leading "+", matching
+// WhatsApp's `message.from` format (same format phone numbers show up in
+// throughout /admin/chats).
+const BLOCKED_PHONES = new Set([
+  "918943281958", // Ajmal ms — not a genuine customer, just messing around after report_sent
+]);
 
 async function processWebhookBody(body) {
   log("Webhook received");
@@ -1899,6 +1910,13 @@ async function processWebhookBody(body) {
   markProcessed(message.id);
 
   const phone = message.from;
+
+  if (BLOCKED_PHONES.has(phone)) {
+    log("Message from blocked phone", phone, "-> ignoring, no reply sent.");
+    db.logMessage(phone, "in", "[Message from blocked number — no reply sent]", message.type || "unknown");
+    return;
+  }
+
   const session = await db.getOrCreateSession(phone);
 
   log("Message type:", message.type, "from", phone);
@@ -1966,7 +1984,7 @@ async function processWebhookBody(body) {
     db.logMessage(phone, "in", "[Contact card]", "contacts");
     await sendText(phone, "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
   } else if (message.type === "reaction") {
-    // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
+    // Emoji reactions to a previous message (👍, ❤️ etc.) — not something
     // that needs (or should get) a reply; replying here would be spammy.
     log("Reaction received from", phone, "-> acknowledging silently, no reply needed.");
     db.logMessage(phone, "in", "[Reaction]", "reaction");
