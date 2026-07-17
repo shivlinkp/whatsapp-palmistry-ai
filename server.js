@@ -789,63 +789,65 @@ async function handleVoiceMessage(phone, mediaId, session) {
   await handleTextMessage(phone, transcript, session);
 }
 
-// Detects short English-language decline/apology text AND Malayalam-language
-// refusals, which is what the model outputs on the rare occasions it refuses
-// instead of writing the Malayalam reading. A real report is 2000+ words of
-// Malayalam script, so any short response matching these patterns — in
-// either language — is treated as a failure.
+// Detects short refusal/apology text, in English or Malayalam, which is
+// what the model outputs on the rare occasions it refuses or wrongly
+// claims it can't read the image, instead of writing the actual Malayalam
+// reading. A real report is 2000+ words, so any short response matching
+// these patterns is treated as a failure and retried — instead of being
+// sent to the customer as if it were their finished report.
+//
+// The Malayalam branch was added after two real production incidents
+// (Ancy, 14/7; നിഷിത, 16/7) where the model refused in Malayalam — e.g.
+// claiming a valid palm photo "is a payment screenshot, not a palm image"
+// — and that refusal text slipped past the English-only check, got
+// accepted as a finished report, and flipped the session to report_sent.
+// The customer was then stuck: every real photo they resent afterward hit
+// the report_sent branch instead of a retry, with no way back in short of
+// a manual reset/refund.
 function isLikelyRefusal(text) {
-  if (!text) return true; // empty output is definitely a failure
-
+  if (!text) return false;
   const trimmed = text.trim();
+  if (trimmed.length > 400) return false;
 
-  // Classic short English refusal.
-  if (trimmed.length <= 400) {
-    const englishRefusal = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
-    if (englishRefusal.test(trimmed)) return true;
-  }
+  const englishRefusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
+  if (englishRefusalPatterns.test(trimmed)) return true;
 
-  // Malayalam-language refusal/apology — the model declines but writes the
-  // decline in Malayalam instead of English, so the regex above never
-  // catches it. Real incident: this exact phrasing ("ക്ഷമിക്കണം... ചിത്രം
-  // ലഭ്യമായിട്ടില്ല... വ്യക്തമായ കൈരേഖാ ചിത്രം അപ്‌ലോഡ് ചെയ്യുക") was sent to
-  // a paying customer as their finished report on 14/7/2026 because it
-  // matched neither the English pattern nor got caught by anything else.
-  // Restricted to shortish text so a 2000-word real report that happens to
-  // contain ക്ഷമിക്കണം in one sentence doesn't get misflagged.
-  if (trimmed.length < 600) {
-    const malayalamRefusal =
-      /ക്ഷമിക്കണം[\s\S]{0,200}?(ലഭ്യമല്ല|ലഭ്യമായിട്ടില്ല|സാധ്യമല്ല|സാധിക്കില്ല|കഴിയില്ല|അപ്‌ലോഡ് ചെയ്യുക|വീണ്ടും അയച്ചു|വ്യക്തമായ.{0,20}ചിത്രം)/;
-    if (malayalamRefusal.test(trimmed)) return true;
+  // Malayalam refusal shape: an apology word, combined with a negation,
+  // combined with a reference to the image — this is the pattern the model
+  // uses when it (sometimes wrongly) claims the palm photo is invalid or
+  // missing instead of writing the reading.
+  const malayalamApology = /ക്ഷമിക്കണം|ക്ഷമിക്കൂ/;
+  const malayalamNegation = /അല്ല\b|ലഭ്യമല്ല|ലഭ്യമായിട്ടില്ല|കഴിയില്ല|കഴിഞ്ഞില്ല|കഴിയാത്ത/;
+  const malayalamImageRef = /ചിത്രം|ഫോട്ടോ|കൈരേഖ|പാം|palm/i;
+
+  if (malayalamApology.test(trimmed) && malayalamNegation.test(trimmed) && malayalamImageRef.test(trimmed)) {
+    return true;
   }
 
   return false;
 }
 
-// Detects a model output that degenerated into a repetition loop — distinct
-// from a refusal, since the model isn't declining, it's just stuck repeating
-// a short phrase (e.g. "palm-ന്റെ records, palm-ന്റെ records, ...") for
-// thousands of tokens. Real incident: this happened mid-report on
-// 14/7/2026 and was sent across 5 separate WhatsApp messages to a paying
-// customer as their finished reading, because it's neither short (fails the
-// isLikelyRefusal length check) nor an apology (fails the refusal regex).
-function isDegenerateRepetition(text) {
+// Detects degenerate/looping model output — the model gets stuck repeating
+// the same short phrase hundreds of times instead of writing a real
+// reading. Real incident: Subin jose, 14/7 — report collapsed into endless
+// repetitions of "palm-ന്റെ records" and was sent to the customer in full
+// as their finished ₹99 reading. A normal 2000+ word report naturally
+// reuses short phrases a handful of times, but not dozens — this catches
+// the pathological case cheaply without needing another API call.
+function isLikelyDegenerateRepetition(text) {
   if (!text) return false;
+  const words = text.trim().split(/\s+/);
+  if (words.length < 200) return false; // only check reports of plausible length
 
-  const words = text.split(/[\s,]+/).filter((w) => w.length > 1);
-  if (words.length < 150) return false; // only worth checking on longer output
-
-  const counts = {};
-  for (const w of words) {
-    counts[w] = (counts[w] || 0) + 1;
+  const phraseCounts = new Map();
+  const windowSize = 4;
+  for (let i = 0; i <= words.length - windowSize; i++) {
+    const phrase = words.slice(i, i + windowSize).join(" ");
+    phraseCounts.set(phrase, (phraseCounts.get(phrase) || 0) + 1);
   }
-  const maxCount = Math.max(...Object.values(counts));
-  const ratio = maxCount / words.length;
 
-  // A healthy 2000+ word Malayalam report naturally repeats connector words
-  // (എന്നിവ, ഇത്, കൈരേഖയിൽ etc.), but no single content token should ever
-  // account for more than ~12% of the whole report and appear 30+ times.
-  return maxCount > 30 && ratio > 0.12;
+  const maxCount = Math.max(...phraseCounts.values());
+  return maxCount >= 15;
 }
 
 // Dedicated OpenAI call for report generation, logging the full request
@@ -990,13 +992,11 @@ Do not include any disclaimers. Do not say you are unable to see or analyze an i
 
   let report = result.content;
 
-  if (report && isLikelyRefusal(report)) {
-    log("generateReport: model output looks like a refusal, not a report. Treating as failure. Content was:", report);
-    report = null;
-  }
-
-  if (report && isDegenerateRepetition(report)) {
-    log("generateReport: model output looks like a degenerate repetition loop, not a real report. Treating as failure. First 300 chars:", report.slice(0, 300));
+  if (report && (isLikelyRefusal(report) || isLikelyDegenerateRepetition(report))) {
+    log(
+      "generateReport: model output looks like a refusal or degenerate repetition, not a report. Treating as failure. First 300 chars:",
+      report.slice(0, 300)
+    );
     report = null;
   }
 
@@ -1119,7 +1119,6 @@ async function confirmPaymentAndScheduleReport(phone, session, sourceLabel) {
     reportAttempts: 0,
     reportError: null,
     awaitingTransactionId: false,
-    paymentConfirmedAt: new Date(), // exact moment of conversion — powers db.countPaymentsToday(), independent of stage/updated_at drift from later follow-up messages
   });
   log(`Payment confirmed via ${sourceLabel} for`, phone, "— report scheduled (via DB, no setTimeout), due at", dueAt.toISOString());
   await sendText(phone, paymentReceivedMessage(session.name || "", (session.orderCount || 1) > 1));
@@ -1360,7 +1359,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
           dob: nextPerson.dob || null,
           gender: nextPerson.gender || null,
           relation: nextPerson.relation || null,
-          palmMediaId: session.palmMediaId || null, // preserve a photo already stashed for this new order (see report_sent photo handling in handleImageMessage) instead of unconditionally wiping it
+          palmMediaId: null,
           paymentReceived: false,
           reportText: null,
           reportStatus: "none",
@@ -1528,37 +1527,6 @@ async function handleImageMessage(phone, mediaId, session) {
       reportError: null,
     });
     await sendText(phone, PHOTO_REPLACED_MESSAGE);
-    return;
-  }
-
-  if (session.stage === "report_sent") {
-    if (session.pendingSecondPerson) {
-      // We already asked for the next person's name/DOB/gender, but they
-      // sent a photo instead of text. extractFields() can't read a photo,
-      // so doing nothing here repeats the exact "photo silently discarded"
-      // failure as bug #16 in the fixed-bugs log — just at a different
-      // stage. Stash it and ask for the text details we still need.
-      log("Photo received for", phone, "while pendingSecondPerson — stashing, asking for text details.");
-      await db.updateSession(phone, { palmMediaId: mediaId });
-      await sendText(
-        phone,
-        "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_SECOND_PERSON_DETAILS_MESSAGE
-      );
-      return;
-    }
-
-    // No pending second-person flow yet — a photo here is ambiguous: could
-    // be the start of ordering another reading (customer sent the photo
-    // before saying so in words), or something unrelated. Stash it rather
-    // than swallowing it silently, and ask them to confirm in text so
-    // wantsAnotherPersonReading()/extractFields() has something to work
-    // with on their next message.
-    log("Photo received for", phone, "in report_sent (no pending flow) — stashing, asking for clarification.");
-    await db.updateSession(phone, { palmMediaId: mediaId });
-    await sendText(
-      phone,
-      "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\nഇത് മറ്റൊരു വ്യക്തിയുടെ കൈരേഖാ വിശകലനത്തിനുള്ള ഫോട്ടോ ആണെങ്കിൽ, ദയവായി ആ വ്യക്തിയുടെ പേര്, ജനനത്തീയതി, Gender (ലിംഗം) കൂടി ഒരുമിച്ച് അയച്ചുതരാമോ?"
-    );
     return;
   }
 
@@ -1814,24 +1782,6 @@ app.get("/admin/failed-payments", async (req, res) => {
   } catch (err) {
     log("Admin failed-payments list failed (caught):", err.message);
     res.status(500).send("Failed to load: " + err.message);
-  }
-});
-
-// Admin: quick stats — GET /admin/stats?key=resetmybot123
-// Currently just today's confirmed-payment count, driven by
-// payment_confirmed_at (set once, exactly at conversion) rather than stage
-// or updated_at, which drift as old customers send later follow-up messages.
-app.get("/admin/stats", async (req, res) => {
-  const { key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-  try {
-    const paidToday = await db.countPaymentsToday();
-    res.status(200).json({ paidToday });
-  } catch (err) {
-    log("Admin stats failed (caught):", err.message);
-    res.status(500).send("Failed to load stats: " + err.message);
   }
 });
 
