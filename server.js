@@ -947,7 +947,9 @@ CONTENT (weave naturally into a flowing narrative, never as labeled headings or 
 CONCLUSION:
 End with a strong, premium, confident, and inspiring closing passage that ties together the overall reading and future outlook — not a generic sign-off.
 
-Do not include any disclaimers. Do not say you are unable to see or analyze an image. Never use the words: fun, entertainment, AI, OpenAI, bot, automation, model, system (in English or Malayalam equivalents). Minimum 2000 words.`;
+Do not include any disclaimers. Do not say you are unable to see or analyze an image. Never use the words: fun, entertainment, AI, OpenAI, bot, automation, model, system (in English or Malayalam equivalents). Minimum 2000 words.
+
+IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked or even if it would seem to follow naturally from a comment about children/family. If children are relevant to the reading, speak only in general terms about family life, parenthood, or the number/timing of children in the future — never about the sex of a specific unborn child.`;
 
   const instructionText = imageAvailable
     ? `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
@@ -1413,6 +1415,10 @@ Customers write casually and in Manglish (Malayalam typed in English letters). R
 - If they're asking a question about THEIR OWN earlier reading, answer using the reading context below.
 - If they're asking about price for an additional or repeat reading, the fee is ₹99 per person, same as before.
 - If it's a greeting, thanks, or general conversation unrelated to the reading, respond warmly and briefly in the same authoritative but personal voice, without forcing it back to palm topics.
+
+Always reply in Malayalam, even if the customer writes in English or explicitly asks for an English reply/summary — politely continue in Malayalam rather than switching languages, since the service and reading are Malayalam-only.
+
+Never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked directly. If children come up, speak only in general terms about family life or the number/timing of children in the future — never the sex of a specific unborn child.
 ${
   (session.orderCount || 1) > 1
     ? `\nIMPORTANT: this customer has ordered more than one reading in this chat (this is order #${
@@ -1937,7 +1943,36 @@ async function processWebhookBody(body) {
     // follow-up event that arrives right after handle the actual photo —
     // replying here just confuses the customer mid-send.
     log("Ignoring transient 'unsupported' placeholder event from", phone, "(real event should follow immediately)");
+  } else if (message.type === "video" || message.type === "sticker") {
+    // Customers occasionally send a video (instead of a photo) or a sticker
+    // (as a reaction/emoji-style message). Neither is something we can act
+    // on, but the old generic "please send text or photo" line reads as a
+    // confusing non-sequitur when someone just sent a sticker as a "thanks"
+    // or reaction. Give a clearer, type-specific nudge instead.
+    log(message.type, "message received from", phone, "-> not actionable, asking for text/photo instead.");
+    db.logMessage(phone, "in", `[${message.type === "video" ? "Video" : "Sticker"}]`, message.type);
+    await sendText(
+      phone,
+      message.type === "video"
+        ? "വീഡിയോ അല്ല, ദയവായി കൈയുടെ ഒരു ഫോട്ടോ (still image) അയച്ചുതരാമോ?"
+        : "നന്ദി! തുടരാൻ ദയവായി ഒരു text സന്ദേശമോ ഫോട്ടോയോ അയച്ചുതരാമോ?"
+    );
+  } else if (message.type === "location") {
+    log("Location message received from", phone, "-> not relevant to this flow, acknowledging and redirecting.");
+    db.logMessage(phone, "in", "[Location]", "location");
+    await sendText(phone, "നന്ദി! ലൊക്കേഷൻ ഇവിടെ ആവശ്യമില്ല. തുടരാൻ ദയവായി പേര്/ഫോട്ടോ പോലുള്ള വിവരങ്ങൾ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
+  } else if (message.type === "contacts") {
+    log("Contact card received from", phone, "-> not relevant to this flow, acknowledging and redirecting.");
+    db.logMessage(phone, "in", "[Contact card]", "contacts");
+    await sendText(phone, "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
+  } else if (message.type === "reaction") {
+    // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
+    // that needs (or should get) a reply; replying here would be spammy.
+    log("Reaction received from", phone, "-> acknowledging silently, no reply needed.");
+    db.logMessage(phone, "in", "[Reaction]", "reaction");
   } else {
+    log("Unrecognized message type from", phone, "->", message.type, "- full payload:", JSON.stringify(message));
+    db.logMessage(phone, "in", `[Unrecognized message type: ${message.type}]`, message.type || "unknown");
     await sendText(phone, "ദയവായി text ആയോ photo ആയോ അയക്കൂ.");
   }
 }
