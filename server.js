@@ -1657,39 +1657,103 @@ function escapeHtml(str) {
 }
 
 // Admin chat list — GET /admin/chats?key=resetmybot123
-// Shows every phone number with any message activity, most recent first.
+// Shows every phone number with any message activity, grouped by IST
+// calendar day (most recent day first). Add &date=YYYY-MM-DD to jump
+// straight to one day's chats only, e.g. &date=2026-07-16.
 app.get("/admin/chats", async (req, res) => {
-  const { key } = req.query;
+  const { key, date } = req.query;
   if (key !== RESET_COMMAND) {
     return res.status(403).send("Forbidden — missing or wrong key.");
   }
 
   try {
     const conversations = await db.listConversations();
-    const rows = conversations
-      .map((c) => {
-        const preview = escapeHtml((c.last_message || "").slice(0, 80));
-        const name = escapeHtml(c.name || "(no name yet)");
-        const stage = escapeHtml(c.stage || "");
-        const time = new Date(c.last_activity).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-        return `<a href="/admin/chats/view?phone=${encodeURIComponent(c.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
-          <div style="padding:12px 16px;border-bottom:1px solid #333;">
-            <div style="display:flex;justify-content:space-between;">
-              <strong>${escapeHtml(c.phone)}</strong>
-              <span style="color:#888;font-size:12px;">${time}</span>
-            </div>
-            <div style="color:#aaa;font-size:14px;">${name} · ${stage} · ${c.message_count} messages</div>
-            <div style="color:#ccc;font-size:14px;margin-top:2px;">${preview}</div>
+
+    // IST calendar date (YYYY-MM-DD) for a given timestamp — used both for
+    // grouping and for the ?date= filter, so they always agree with each
+    // other regardless of the server's own timezone.
+    const istDateKey = (ts) => {
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).formatToParts(new Date(ts));
+      const get = (type) => parts.find((p) => p.type === type).value;
+      return `${get("year")}-${get("month")}-${get("day")}`; // e.g. "2026-07-16"
+    };
+
+    const filtered = date
+      ? conversations.filter((c) => istDateKey(c.last_activity) === date)
+      : conversations;
+
+    // Group into { "2026-07-16": [...], "2026-07-15": [...] }, preserving
+    // the existing most-recent-first order from listConversations().
+    const groups = new Map();
+    for (const c of filtered) {
+      const dateKey = istDateKey(c.last_activity);
+      if (!groups.has(dateKey)) groups.set(dateKey, []);
+      groups.get(dateKey).push(c);
+    }
+
+    const rowHtml = (c) => {
+      const preview = escapeHtml((c.last_message || "").slice(0, 80));
+      const name = escapeHtml(c.name || "(no name yet)");
+      const stage = escapeHtml(c.stage || "");
+      const time = new Date(c.last_activity).toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
+      });
+      return `<a href="/admin/chats/view?phone=${encodeURIComponent(c.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
+        <div style="padding:12px 16px;border-bottom:1px solid #333;">
+          <div style="display:flex;justify-content:space-between;">
+            <strong>${escapeHtml(c.phone)}</strong>
+            <span style="color:#888;font-size:12px;">${time}</span>
           </div>
-        </a>`;
-      })
-      .join("");
+          <div style="color:#aaa;font-size:14px;">${name} · ${stage} · ${c.message_count} messages</div>
+          <div style="color:#ccc;font-size:14px;margin-top:2px;">${preview}</div>
+        </div>
+      </a>`;
+    };
+
+    const dayHeader = (dateKey, count) => {
+      const label = new Date(dateKey + "T12:00:00+05:30").toLocaleDateString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      });
+      return `<div style="position:sticky;top:0;background:#1a1a1a;color:#eee;padding:10px 16px;font-weight:bold;border-bottom:1px solid #333;">
+        <a href="/admin/chats?key=${encodeURIComponent(key)}&date=${dateKey}" style="color:inherit;text-decoration:none;">${label}</a>
+        <span style="color:#888;font-weight:normal;font-size:13px;"> · ${count} chat${count === 1 ? "" : "s"}</span>
+      </div>`;
+    };
+
+    let bodyHtml = "";
+    for (const [dateKey, chats] of groups) {
+      bodyHtml += dayHeader(dateKey, chats.length);
+      bodyHtml += chats.map(rowHtml).join("");
+    }
+
+    const filterBar = date
+      ? `<div style="padding:10px 16px;background:#222;color:#aaa;font-size:13px;">Showing only ${escapeHtml(
+          date
+        )} — <a href="/admin/chats?key=${encodeURIComponent(key)}" style="color:#4fc3f7;">clear filter</a></div>`
+      : `<div style="padding:10px 16px;background:#222;color:#aaa;font-size:13px;">Tip: add &date=YYYY-MM-DD to the URL to jump to one day, e.g. &date=${istDateKey(
+          Date.now()
+        )}</div>`;
 
     res.status(200).send(`<!DOCTYPE html>
 <html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chats</title></head>
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
-  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Customer Conversations (${conversations.length})</div>
-  ${rows || '<div style="padding:16px;color:#888;">No conversations logged yet.</div>'}
+  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Customer Conversations (${filtered.length}${
+      date ? ` of ${conversations.length}` : ""
+    })</div>
+  ${filterBar}
+  ${bodyHtml || '<div style="padding:16px;color:#888;">No conversations logged yet.</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin chat list failed (caught):", err.message);
