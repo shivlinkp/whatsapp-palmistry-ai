@@ -535,19 +535,38 @@ async function getMediaBase64(mediaId) {
   }
 }
 
-// Quick, cheap vision check: is this actually a photo of a human palm/hand?
-// Run BEFORE sending the QR/payment ask, so a wrong photo (a wall, tiles,
-// a face, etc.) gets caught immediately instead of only being discovered
-// during report generation — after the customer has already paid ₹99.
-// Fails OPEN (treats as valid) on any error, so an infrastructure hiccup
-// on our end never blocks a genuine customer from proceeding.
-async function isPalmPhoto(imageDataUrl) {
-  if (!imageDataUrl) {
-    return { valid: true, reason: "no image data to check — defaulting to accept" };
-  }
-  if (!OPENAI_API_KEY) {
-    return { valid: true, reason: "OPENAI_API_KEY missing — defaulting to accept" };
-  }
+// Cheap vision classifier: what KIND of image is this? Distinguishes a
+// palm photo from a payment screenshot from anything else, instead of a
+// plain YES/NO "is this a palm" check. This is the single check reused at
+// every point a photo can arrive that might feed into report generation —
+// the original awaiting_photo submission AND the awaiting_report
+// "corrected photo" resubmission AND any photo arriving after report_sent.
+//
+// Why this replaces the old isPalmPhoto(): payment-screenshot confusion
+// was consistently the actual failure mode in real incidents (Vijay
+// Philip, Kamarunnisa, Abhilash Soman, Manoj Kumar P.C., Sajan M S — all
+// 11-18/7), but the old binary check only ran once, at the very first
+// photo. Every LATER photo (replacements, retries, post-report resends)
+// went straight into report generation with NO pre-check at all, so a
+// payment screenshot sent by mistake at that stage only surfaced as an
+// inconsistent, freely-worded model refusal deep inside report
+// generation — which is exactly what bugs #23/#28 and the negation-regex
+// gap were chasing after the fact. Classifying up front means the bot can
+// give an immediate, correctly-worded, TYPE-SPECIFIC reply ("that looks
+// like a payment screenshot, send your palm photo instead") without ever
+// spending a report-generation attempt or depending on refusal-text
+// pattern-matching at all.
+//
+// Fails OPEN (treats as a valid palm photo) on any error, empty/ambiguous
+// response, or infrastructure hiccup — never blocks a genuine customer
+// over an uncertain classification. Only an unambiguous, single-category
+// PAYMENT or OTHER answer is treated as invalid.
+async function classifyPalmImage(imageDataUrl) {
+  const openReason = (why) => ({ category: "unclear", valid: true, reason: why });
+
+  if (!imageDataUrl) return openReason("no image data to check — defaulting to accept");
+  if (!OPENAI_API_KEY) return openReason("OPENAI_API_KEY missing — defaulting to accept");
+
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -563,7 +582,12 @@ async function isPalmPhoto(imageDataUrl) {
             content: [
               {
                 type: "text",
-                text: "Look at this image. Is it a clear photo of a human hand showing the palm (suitable for a palm reading)? Reply with ONLY one word: YES or NO.",
+                text: `Look at this image and classify it into exactly ONE of these three categories:
+PALM — a clear photo of a human hand/palm, suitable for a palm reading.
+PAYMENT — a screenshot of a payment/UPI app, a QR code, a transaction confirmation, a bank/receipt screen, or similar payment-related image.
+OTHER — anything else (not a hand, not a payment-related image — e.g. a face, a wall, an unrelated object, a blank/blurry image).
+
+Reply with ONLY one word: PALM or PAYMENT or OTHER.`,
               },
               { type: "image_url", image_url: { url: imageDataUrl } },
             ],
@@ -573,44 +597,35 @@ async function isPalmPhoto(imageDataUrl) {
       }),
     });
     const data = await res.json();
-    log("Palm photo validation -> HTTP status:", res.status, "response:", JSON.stringify(data));
+    log("Palm image classification -> HTTP status:", res.status, "response:", JSON.stringify(data));
 
-    if (!res.ok) {
-      return { valid: true, reason: "validation call failed (HTTP " + res.status + ") — defaulting to accept" };
-    }
+    if (!res.ok) return openReason("classification call failed (HTTP " + res.status + ") — defaulting to accept");
 
     const rawAnswer = (data.choices?.[0]?.message?.content || "").trim();
     const upper = rawAnswer.toUpperCase();
-    if (!upper) {
-      return { valid: true, reason: "empty validation response — defaulting to accept" };
+    if (!upper) return openReason("empty classification response — defaulting to accept");
+
+    // As with the old check, smaller vision models don't always follow a
+    // strict "ONLY one word" instruction — match whole-word anywhere
+    // rather than requiring an exact match, and only commit to a
+    // rejection when exactly one category word is present with no others.
+    const saysPalm = /\bPALM\b/.test(upper);
+    const saysPayment = /\bPAYMENT\b/.test(upper);
+    const saysOther = /\bOTHER\b/.test(upper);
+    const hitCount = [saysPalm, saysPayment, saysOther].filter(Boolean).length;
+
+    if (hitCount !== 1) {
+      // None, or more than one category word present — genuinely
+      // ambiguous. Fail open exactly as before.
+      return openReason("ambiguous classification (\"" + rawAnswer + "\") — defaulting to accept");
     }
 
-    // Smaller vision models don't always follow strict "reply with ONLY
-    // one word" instructions — e.g. "Yes, this looks like a palm" or "The
-    // image shows a hand, so yes" are both genuine affirmative answers that
-    // don't literally START with "YES". Checking for YES/NO anywhere (as a
-    // whole word) is far more robust than requiring an exact prefix match,
-    // which was silently rejecting real palm photos whenever the model
-    // phrased its answer even slightly differently than instructed.
-    const saysYes = /\bYES\b/.test(upper);
-    const saysNo = /\bNO\b/.test(upper);
-
-    let valid;
-    if (saysYes && !saysNo) {
-      valid = true;
-    } else if (saysNo && !saysYes) {
-      valid = false;
-    } else {
-      // Both, neither, or genuinely unclear — fail open. Blocking a real
-      // customer over an ambiguous validation answer is a worse outcome
-      // than occasionally letting a borderline photo through.
-      valid = true;
-    }
-
-    return { valid, reason: rawAnswer };
+    if (saysPalm) return { category: "palm", valid: true, reason: rawAnswer };
+    if (saysPayment) return { category: "payment_screenshot", valid: false, reason: rawAnswer };
+    return { category: "other", valid: false, reason: rawAnswer };
   } catch (err) {
-    log("Palm photo validation crashed (caught):", err.message);
-    return { valid: true, reason: "exception — defaulting to accept" };
+    log("Palm image classification crashed (caught):", err.message);
+    return openReason("exception — defaulting to accept");
   }
 }
 
@@ -825,7 +840,15 @@ function isLikelyRefusal(text) {
   // uses when it (sometimes wrongly) claims the palm photo is invalid or
   // missing instead of writing the reading.
   const malayalamApology = /ക്ഷമിക്കണം|ക്ഷമിക്കൂ/;
-  const malayalamNegation = /അല്ല\b|ലഭ്യമല്ല|ലഭ്യമായിട്ടില്ല|കഴിയില്ല|കഴിഞ്ഞില്ല|കഴിയാത്ത/;
+  // "ഇല്ല" (illa — "there is no/doesn't have", e.g. "ചിത്രമില്ല" = "no
+  // image") is a completely different, extremely common negation word from
+  // "അല്ല" (alla — "is not") and was missing entirely — real incident:
+  // Kamarunnisa, 918921559922, 18/7, whose refusal used exactly this word
+  // and slipped through uncaught. Also dropped the \b on അല്ല itself:
+  // Malayalam characters aren't \w in JS regex, so \b doesn't reliably
+  // land inside/after Malayalam script — a plain substring match is more
+  // robust than relying on a boundary that may never actually fire.
+  const malayalamNegation = /അല്ല|ഇല്ല|ലഭ്യമല്ല|ലഭ്യമായിട്ടില്ല|കഴിയില്ല|കഴിഞ്ഞില്ല|കഴിയാത്ത/;
   const malayalamImageRef = /ചിത്രം|ഫോട്ടോ|കൈരേഖ|പാം|palm/i;
 
   if (malayalamApology.test(trimmed) && malayalamNegation.test(trimmed) && malayalamImageRef.test(trimmed)) {
@@ -1427,6 +1450,12 @@ Customers write casually and in Manglish (Malayalam typed in English letters). R
 Always reply in Malayalam, even if the customer writes in English or explicitly asks for an English reply/summary — politely continue in Malayalam rather than switching languages, since the service and reading are Malayalam-only.
 
 Never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked directly. If children come up, speak only in general terms about family life or the number/timing of children in the future — never the sex of a specific unborn child.
+
+This same caution extends to any other confident-sounding claim about fertility or children that isn't really something a palm reading can responsibly promise — e.g. stating as fact that the customer will have twins, will/won't be able to conceive, or a specific number of children. Speak only in general, hopeful terms about family and children (ഭാവിയിൽ കുടുംബവളർച്ചയ്ക്ക് നല്ല സാധ്യത കാണുന്നു, and similar) rather than a specific, certain claim — this applies even if the customer asks a direct yes/no question on the topic.
+
+More broadly, when a customer asks about a SPECIFIC future event with a SPECIFIC timeline (e.g. "will I get the job by such-and-such year", "will the house be finished in X months", "will this relationship last"), give the general direction/tendency the palm suggests, but avoid stating a specific year, month count, or outcome with full certainty, the same way the original reading avoids absolute guarantees. Prefer phrasing like "സാധ്യത ശക്തമായി കാണുന്നു" (a strong likelihood) over a flatly stated fact.
+
+If the customer's messages, across the conversation so far, show signs of real and ongoing emotional distress or heaviness (not just a single passing comment), continue to gently include a brief note encouraging them to talk to someone they trust or a professional if it persists — do not include this only once early on and then drop it as the conversation moves to other topics.
 ${
   (session.orderCount || 1) > 1
     ? `\nIMPORTANT: this customer has ordered more than one reading in this chat (this is order #${
@@ -1477,8 +1506,31 @@ const NOT_A_PALM_MESSAGE_TEMPLATE = (gender) =>
     gender === "female" ? "ഇടത്" : "വലത്"
   } കൈയുടെ താളത്തിൽ നിന്ന്, നല്ല വെളിച്ചത്തിൽ എടുത്ത വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയച്ചുതരാമോ?`;
 
+// Distinct, specific message for when the classifier is confident the
+// image is a payment screenshot rather than a palm photo — this is the
+// exact confusion behind every real incident so far (Vijay Philip,
+// Kamarunnisa, Abhilash Soman, Manoj Kumar P.C., Sajan M S), so it gets
+// its own clear, correctly-diagnosed message instead of the generic
+// "can't see the palm clearly" line, which read as evasive/repetitive to
+// customers who could see perfectly well that they'd sent something.
+const PAYMENT_SCREENSHOT_INSTEAD_OF_PALM_MESSAGE_TEMPLATE = (gender) =>
+  `ഇത് ഒരു payment screenshot ആണ്, കൈരേഖയുടെ ഫോട്ടോ അല്ല. കൈരേഖാ വിശകലനത്തിന് നിങ്ങളുടെ ${
+    gender === "female" ? "ഇടത്" : "വലത്"
+  } കൈയുടെ ഉള്ളംഭാഗം വ്യക്തമായി കാണുന്ന ഒരു ഫോട്ടോ അയച്ചുതരാമോ?`;
+
 const PHOTO_REPLACED_MESSAGE =
   "പുതിയ ഫോട്ടോ ലഭിച്ചു, നന്ദി. ഇത് ഉപയോഗിച്ച് നിങ്ങളുടെ കൈരേഖാ വിശകലനം വീണ്ടും തയ്യാറാക്കുന്നു. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
+
+// Shared helper: given a classification result, send the right
+// type-specific rejection message. Returns nothing — caller decides what
+// (if anything) to update in the session afterward.
+async function sendClassificationRejection(phone, category, gender) {
+  if (category === "payment_screenshot") {
+    await sendText(phone, PAYMENT_SCREENSHOT_INSTEAD_OF_PALM_MESSAGE_TEMPLATE(gender));
+  } else {
+    await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(gender));
+  }
+}
 
 // Validates a palm photo and either sends the QR (moving to
 // awaiting_payment) or asks for a proper resend (staying in awaiting_photo).
@@ -1488,12 +1540,12 @@ const PHOTO_REPLACED_MESSAGE =
 // discarded the photo entirely.
 async function processReceivedPalmPhoto(phone, mediaId, session) {
   const imageDataUrl = await getMediaBase64(mediaId);
-  const validation = await isPalmPhoto(imageDataUrl);
-  log("Palm photo validation result for", phone, "->", JSON.stringify(validation));
+  const validation = await classifyPalmImage(imageDataUrl);
+  log("Palm photo classification result for", phone, "->", JSON.stringify(validation));
 
   if (!validation.valid) {
     await db.updateSession(phone, { stage: "awaiting_photo", palmMediaId: null });
-    await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
+    await sendClassificationRejection(phone, validation.category, session.gender);
     return;
   }
 
@@ -1508,6 +1560,48 @@ async function processReceivedPalmPhoto(phone, mediaId, session) {
 
   await db.updateSession(phone, { stage: "awaiting_payment" });
   await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
+}
+
+// After report_sent, a photo can arrive for several genuine reasons: the
+// customer misunderstood and re-sent their payment proof, they're trying
+// to trigger a correction to an already-delivered report, or they're
+// starting a second person's order without using the expected text-first
+// flow. Previously this whole case fell through to a silent generic
+// "photo received, thanks" — no classification, no session change, no
+// real answer — which is exactly what stranded every customer in the
+// real incidents once a bad report got accepted (Vijay Philip,
+// Kamarunnisa, Abhilash Soman, Manoj Kumar P.C., Sajan M S, all 11-18/7).
+// Now: classify it and give a real, specific answer every time.
+async function handlePhotoAfterReportSent(phone, mediaId, session) {
+  const imageDataUrl = await getMediaBase64(mediaId);
+  const classification = await classifyPalmImage(imageDataUrl);
+  log("Photo received after report_sent for", phone, "-> classification:", JSON.stringify(classification));
+  db.logMessage(phone, "in", `[Photo after report_sent, classified: ${classification.category}]`, "photo");
+
+  if (classification.category === "payment_screenshot") {
+    await sendText(
+      phone,
+      `നിങ്ങളുടെ റിപ്പോർട്ട് നേരത്തെ അയച്ചിട്ടുണ്ട്. ഇപ്പോൾ ലഭിച്ചത് payment screenshot ആണ് — ഇത് ഇവിടെ വീണ്ടും ആവശ്യമില്ല.\n\nമറ്റൊരു വ്യക്തിയുടെ കൈരേഖാ വിശകലനം വേണമെങ്കിൽ ആ വ്യക്തിയുടെ പേര്, ജനനത്തീയതി, Gender എന്നിവ ടെക്സ്റ്റ് ആയി അയച്ചുതരൂ. നിങ്ങളുടെ റിപ്പോർട്ടിൽ എന്തെങ്കിലും പ്രശ്നമുണ്ടെങ്കിൽ അത് ടൈപ്പ് ചെയ്ത് അയക്കൂ.`
+    );
+    return;
+  }
+
+  if (classification.category === "palm") {
+    // Looks like a genuine palm photo arriving after a report was already
+    // marked sent — could be a correction request, could be the start of
+    // a second order sent out of the expected order. Give a real path
+    // forward instead of silently discarding it either way.
+    await sendText(
+      phone,
+      `നിങ്ങളുടെ റിപ്പോർട്ട് നേരത്തെ അയച്ചിട്ടുണ്ട്.\n\nഈ ഫോട്ടോ എന്തിനാണ് എന്ന് വ്യക്തമല്ല — നിങ്ങളുടെ റിപ്പോർട്ടിൽ എന്തെങ്കിലും പ്രശ്നമുണ്ടെങ്കിൽ (ഉദാ: ചിത്രം ശരിയായിരുന്നില്ല) അത് ടൈപ്പ് ചെയ്ത് വിശദമായി പറയൂ, ഞങ്ങൾ പരിശോധിക്കാം. മറ്റൊരു വ്യക്തിയുടെ പുതിയ കൈരേഖാ വിശകലനം വേണമെങ്കിൽ ആ വ്യക്തിയുടെ പേര്, ജനനത്തീയതി, Gender എന്നിവ ആദ്യം ടെക്സ്റ്റ് ആയി അയച്ചുതരൂ.`
+    );
+    return;
+  }
+
+  // category === "other" or "unclear" — keep the old, low-key
+  // acknowledgment (still logged with its classification above now, so
+  // it's no longer invisible in the admin chat log).
+  await sendText(phone, "ഫോട്ടോ ലഭിച്ചു, നന്ദി.");
 }
 
 async function handleImageMessage(phone, mediaId, session) {
@@ -1525,13 +1619,28 @@ async function handleImageMessage(phone, mediaId, session) {
   }
 
   if (session.stage === "awaiting_report") {
-    // Previously: any photo sent here fell through to a generic "photo
-    // received, thanks" with NO session update at all — so if the report
-    // failed because the original photo wasn't a valid palm, a corrected
-    // photo sent afterward was silently ignored forever, and every retry
-    // kept re-using the original bad photo. Now: treat this as a genuine
-    // replacement and actually reschedule using the new photo.
-    log("New photo received while awaiting_report for", phone, "— treating as a corrected palm photo submission.");
+    // Previously: any photo sent here was accepted UNCONDITIONALLY as a
+    // "corrected palm photo" and immediately spent a report-generation
+    // attempt on it — with zero pre-check. If the customer actually
+    // resent their payment screenshot by mistake (the single most common
+    // real failure mode — see incidents above), that wasted attempt
+    // could only be caught by refusal-text pattern-matching deep inside
+    // generateReport(), which is exactly the fragile mechanism that kept
+    // developing gaps (bugs #23, #28, the negation-regex miss). Now:
+    // classify BEFORE touching report status at all. Only a genuine palm
+    // (or a genuinely unclear image, kept fail-open) gets scheduled as a
+    // real retry; a payment screenshot or unrelated image gets an
+    // immediate, correctly-worded answer and does NOT burn an attempt.
+    log("New photo received while awaiting_report for", phone, "— classifying before treating as a correction.");
+    const imageDataUrl = await getMediaBase64(mediaId);
+    const classification = await classifyPalmImage(imageDataUrl);
+    log("awaiting_report photo classification for", phone, "->", JSON.stringify(classification));
+
+    if (!classification.valid) {
+      await sendClassificationRejection(phone, classification.category, session.gender);
+      return;
+    }
+
     const retryDueAt = new Date(Date.now() + 2 * 60 * 1000);
     await db.updateSession(phone, {
       palmMediaId: mediaId,
@@ -1567,8 +1676,14 @@ async function handleImageMessage(phone, mediaId, session) {
     return;
   }
 
+  if (session.stage === "report_sent") {
+    await handlePhotoAfterReportSent(phone, mediaId, session);
+    return;
+  }
+
   await sendText(phone, "ഫോട്ടോ ലഭിച്ചു, നന്ദി.");
 }
+
 
 
 // ---------------------------------------------------------------------------
