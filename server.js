@@ -807,7 +807,15 @@ async function handleVoiceMessage(phone, mediaId, session) {
 function isLikelyRefusal(text) {
   if (!text) return false;
   const trimmed = text.trim();
-  if (trimmed.length > 400) return false;
+
+  // Real reports are 2000+ words minimum (enforced in the system prompt),
+  // so anything under ~300 words is certainly not a real report — safe to
+  // check refusal patterns regardless of raw character length. A previous
+  // 400-CHARACTER cutoff was too low and let a verbose ~700-character
+  // Malayalam refusal (with detailed re-submission instructions) slip
+  // through uncaught — real incident: Vijay Philip, 919995974111, 18/7.
+  const wordCount = trimmed.split(/\s+/).length;
+  if (wordCount > 300) return false;
 
   const englishRefusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
   if (englishRefusalPatterns.test(trimmed)) return true;
@@ -1861,17 +1869,6 @@ app.post("/webhook", (req, res) => {
   processWebhookBody(req.body).catch((err) => log("Webhook handler crashed (caught):", err.message));
 });
 
-// Phone numbers the bot should stop replying to entirely — spam, abuse, or
-// someone just playing around rather than a genuine customer. Messages from
-// these numbers are still logged (so there's a record if needed later), but
-// no reply is sent and no session/report processing happens. Add/remove
-// numbers here as E.164-style digits with no leading "+", matching
-// WhatsApp's `message.from` format (same format phone numbers show up in
-// throughout /admin/chats).
-const BLOCKED_PHONES = new Set([
-  "918943281958", // Ajmal ms — not a genuine customer, just messing around after report_sent
-]);
-
 async function processWebhookBody(body) {
   log("Webhook received");
   const entry = body.entry?.[0];
@@ -1910,13 +1907,6 @@ async function processWebhookBody(body) {
   markProcessed(message.id);
 
   const phone = message.from;
-
-  if (BLOCKED_PHONES.has(phone)) {
-    log("Message from blocked phone", phone, "-> ignoring, no reply sent.");
-    db.logMessage(phone, "in", "[Message from blocked number — no reply sent]", message.type || "unknown");
-    return;
-  }
-
   const session = await db.getOrCreateSession(phone);
 
   log("Message type:", message.type, "from", phone);
