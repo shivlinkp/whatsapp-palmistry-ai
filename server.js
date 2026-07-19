@@ -1777,85 +1777,6 @@ app.get("/admin/reset-session", async (req, res) => {
   }
 });
 
-// Admin: block a phone number — GET /admin/block?phone=...&key=resetmybot123
-// A blocked number is fully ignored going forward (see the `blocked` check
-// in processWebhookBody): no replies of any kind are sent, though inbound
-// messages are still logged so the chat history stays complete. This is
-// DB-backed (not a hardcoded list) specifically so it can be managed via
-// these URLs without needing a code change/redeploy for every number.
-app.get("/admin/block", async (req, res) => {
-  const { phone, key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-  if (!phone) {
-    return res.status(400).send("Missing ?phone= (e.g. ?phone=917736236010&key=...)");
-  }
-  try {
-    await db.updateSession(phone, { blocked: true });
-    log("Number BLOCKED via admin HTTP endpoint:", phone);
-    res.status(200).send(`${phone} is now blocked. The bot will not reply to this number until unblocked (see /admin/unblock).`);
-  } catch (err) {
-    log("Admin block failed (caught):", err.message);
-    res.status(500).send("Block failed: " + err.message);
-  }
-});
-
-// Admin: unblock a phone number — GET /admin/unblock?phone=...&key=resetmybot123
-app.get("/admin/unblock", async (req, res) => {
-  const { phone, key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-  if (!phone) {
-    return res.status(400).send("Missing ?phone= (e.g. ?phone=917736236010&key=...)");
-  }
-  try {
-    await db.updateSession(phone, { blocked: false });
-    log("Number UNBLOCKED via admin HTTP endpoint:", phone);
-    res.status(200).send(`${phone} is now unblocked. The bot will respond normally again.`);
-  } catch (err) {
-    log("Admin unblock failed (caught):", err.message);
-    res.status(500).send("Unblock failed: " + err.message);
-  }
-});
-
-// Admin: list all currently blocked numbers — GET /admin/blocked?key=resetmybot123
-app.get("/admin/blocked", async (req, res) => {
-  const { key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-  try {
-    const blocked = await db.listBlockedPhones();
-    const rows = blocked
-      .map((s) => {
-        const time = new Date(s.updated_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-        return `<div style="padding:12px 16px;border-bottom:1px solid #333;">
-          <div style="display:flex;justify-content:space-between;">
-            <strong>${s.phone}</strong>
-            <span style="color:#888;font-size:12px;">blocked as of: ${time}</span>
-          </div>
-          <div style="color:#aaa;font-size:14px;">${s.name || "(no name)"}
-            · <a href="/admin/unblock?phone=${encodeURIComponent(s.phone)}&key=${encodeURIComponent(key)}" style="color:#4fc3f7;">unblock</a>
-          </div>
-        </div>`;
-      })
-      .join("");
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Blocked Numbers</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
-  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Blocked numbers (${blocked.length})</div>
-  ${rows || '<div style="padding:16px;color:#888;">No numbers are currently blocked.</div>'}
-</body></html>`);
-  } catch (err) {
-    log("Admin blocked-list failed (caught):", err.message);
-    res.status(500).send("Failed to load: " + err.message);
-  }
-});
-
-
-
 function escapeHtml(str) {
   return String(str || "")
     .replace(/&/g, "&amp;")
@@ -2049,7 +1970,7 @@ app.get("/admin/failed-payments", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Paid but report generation gave up (${failed.length})</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat. Each of these already received a message telling them you'll follow up directly.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. 🎉</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. ߎ</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin failed-payments list failed (caught):", err.message);
@@ -2104,20 +2025,6 @@ async function processWebhookBody(body) {
   const session = await db.getOrCreateSession(phone);
 
   log("Message type:", message.type, "from", phone);
-
-  if (session.blocked) {
-    // Fully ignore blocked numbers — no reply of any kind is sent, but the
-    // inbound message is still logged so /admin/chats keeps a complete
-    // record (useful if the block ever needs review, or a refund dispute
-    // comes up later). This intentionally sits before any other branch so
-    // a blocked customer can't reach FAQ matching, follow-up chat, or
-    // report generation at all.
-    const bodyPreview =
-      message.type === "text" ? message.text?.body || "" : `[${message.type}]`;
-    db.logMessage(phone, "in", bodyPreview, message.type === "text" ? "text" : message.type || "unknown");
-    log("Message from BLOCKED number", phone, "ignored — no reply sent.");
-    return;
-  }
 
   if (message.type === "text") {
     const text = message.text?.body || "";
@@ -2182,7 +2089,7 @@ async function processWebhookBody(body) {
     db.logMessage(phone, "in", "[Contact card]", "contacts");
     await sendText(phone, "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
   } else if (message.type === "reaction") {
-    // Emoji reactions to a previous message (👍, ❤️ etc.) — not something
+    // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
     // that needs (or should get) a reply; replying here would be spammy.
     log("Reaction received from", phone, "-> acknowledging silently, no reply needed.");
     db.logMessage(phone, "in", "[Reaction]", "reaction");
@@ -2193,4 +2100,50 @@ async function processWebhookBody(body) {
   }
 }
 
-// ------------------------------
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+async function start() {
+  log("Process started. Node version:", process.version);
+  log(
+    "DATABASE_URL is",
+    process.env.DATABASE_URL ? "set (length " + process.env.DATABASE_URL.length + ")" : "MISSING"
+  );
+  if (process.env.DATABASE_URL) {
+    // Log only the shape (scheme + host), never credentials.
+    try {
+      const u = new URL(process.env.DATABASE_URL);
+      log("DATABASE_URL shape -> protocol:", u.protocol, "host:", u.hostname, "port:", u.port || "(default)");
+    } catch (e) {
+      log("DATABASE_URL could not be parsed as a URL — this itself may be the problem. Error:", e.message);
+    }
+  }
+
+  log("Connecting to database...");
+  try {
+    await Promise.race([
+      db.initDb(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("DB connection timed out after 15s — check DATABASE_URL / network")), 15000)
+      ),
+    ]);
+    log("Database connected successfully.");
+  } catch (err) {
+    log("FATAL: could not initialize database:", err.message);
+    process.exit(1);
+  }
+
+  app.listen(PORT, () => {
+    log(`Bot running on port ${PORT}`);
+    console.log("STARTUP QR_IMAGE_URL =", process.env.QR_IMAGE_URL);
+  });
+
+  setInterval(pollDueReports, 60 * 1000);
+  log("Report polling worker started (every 60s)");
+  // Run one immediately at boot too, in case reports were already due
+  // while the container was restarting.
+  pollDueReports();
+}
+
+start();
