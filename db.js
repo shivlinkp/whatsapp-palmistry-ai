@@ -61,12 +61,6 @@ async function initDb() {
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_transaction_id BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_report_inquiry_count INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
-  // Set once, at the exact moment payment is confirmed (see
-  // confirmPaymentAndScheduleReport in server.js) — unlike updated_at
-  // (which is bumped by every message, including unrelated follow-ups),
-  // this lets us accurately answer "how many people paid today" via
-  // countPaymentsToday() below instead of guessing from stage/message counts.
-  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS payment_confirmed_at TIMESTAMPTZ;`);
 
   // Permanent conversation log — every inbound and outbound message, so
   // chats can be reviewed regardless of what Meta/WhatsApp allows and
@@ -115,7 +109,6 @@ function rowToSession(row) {
     awaitingTransactionId: row.awaiting_transaction_id,
     awaitingReportInquiryCount: row.awaiting_report_inquiry_count,
     pendingSecondPerson: row.pending_second_person,
-    paymentConfirmedAt: row.payment_confirmed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -157,7 +150,6 @@ const FIELD_MAP = {
   awaitingTransactionId: "awaiting_transaction_id",
   awaitingReportInquiryCount: "awaiting_report_inquiry_count",
   pendingSecondPerson: "pending_second_person",
-  paymentConfirmedAt: "payment_confirmed_at",
 };
 
 // Updates only the given fields for a phone number's session, bumps
@@ -204,6 +196,22 @@ async function findDueReports() {
 // list — safer than scanning chat transcripts by hand, since it's driven
 // directly by DB state rather than by what a message preview happens to
 // show. Ordered most-recent-first so the newest cases surface first.
+// Fetches every session marked report_status='sent' along with its report
+// text. Used by the one-off /admin/scan-stuck-reports endpoint to find
+// sessions where a refusal or degenerate-output slipped past isLikelyRefusal
+// / isLikelyDegenerateRepetition and got sent to the customer (and marked
+// 'sent' in the DB) as if it were their real report — these sessions never
+// show up in findFailedPayments() because their status isn't 'failed'.
+async function findSentReports() {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE report_status = 'sent'
+       AND report_text IS NOT NULL
+     ORDER BY updated_at DESC`
+  );
+  return result.rows.map(rowToSession);
+}
+
 async function findFailedPayments() {
   const result = await pool.query(
     `SELECT * FROM sessions
@@ -211,21 +219,6 @@ async function findFailedPayments() {
      ORDER BY updated_at DESC`
   );
   return result.rows.map(rowToSession);
-}
-
-// Counts sessions whose payment was confirmed today (server's local date,
-// via Postgres CURRENT_DATE). This is the accurate version of "how many
-// converted today" — driven by a timestamp set exactly once, at the moment
-// payment is confirmed, rather than inferred from current stage or
-// updated_at (both of which get bumped by unrelated later activity, e.g. a
-// customer who paid days ago sending a follow-up question today).
-async function countPaymentsToday() {
-  const result = await pool.query(
-    `SELECT COUNT(*) FROM sessions
-     WHERE payment_confirmed_at IS NOT NULL
-       AND payment_confirmed_at::date = CURRENT_DATE`
-  );
-  return parseInt(result.rows[0].count, 10);
 }
 
 // Logs one message (inbound or outbound) to the permanent conversation log.
@@ -276,7 +269,7 @@ module.exports = {
   updateSession,
   findDueReports,
   findFailedPayments,
-  countPaymentsToday,
+  findSentReports,
   logMessage,
   getMessagesForPhone,
   listConversations,
