@@ -274,10 +274,17 @@ const PHOTO_RECEIVED_PAYMENT_MESSAGE = `ഫോട്ടോ ലഭിച്ചു
 Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`;
 
 const SUPPORT_EMAIL = "contact@boldwordsmedia.com";
+// New WhatsApp helpline for issues (added 24/7/2026) — a customer stuck in
+// any error state now has a human escalation path, not just an email
+// address they may not check. Shown alongside the email everywhere the
+// email already appears, plus in the two new stuck-session recovery
+// messages below.
+const SUPPORT_WHATSAPP = "6360780748";
+const SUPPORT_CONTACT_LINE = `കൂടുതൽ സഹായത്തിന് ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ബന്ധപ്പെടാം, അല്ലെങ്കിൽ ${SUPPORT_WHATSAPP} എന്ന നമ്പറിൽ ഞങ്ങളുടെ WhatsApp helpline-ൽ മെസേജ് ചെയ്യാം.`;
 const SUPPORT_EMAIL_INQUIRY_THRESHOLD = 3; // offer support email after this many messages while awaiting_report
 
 const QR_FAILURE_MESSAGE =
-  `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ഞങ്ങളെ ബന്ധപ്പെടാം.`;
+  `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${SUPPORT_CONTACT_LINE}`;
 
 function paymentReceivedMessage(name, isRepeatOrder) {
   const timingLine = isRepeatOrder
@@ -294,12 +301,19 @@ const REPORT_PREPARING_MESSAGE =
   "നിങ്ങളുടെ റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ അല്പം സമയമെടുക്കുന്നു. ദയവായി അല്പസമയം കൂടി കാത്തിരിക്കൂ, ഞങ്ങൾ ഉടൻ അയയ്ക്കും.";
 
 const REPORT_EXHAUSTED_MESSAGE =
-  `ക്ഷമിക്കണം, റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ കൂടുതൽ സമയമെടുക്കുന്നു. ഞങ്ങൾ ഉടൻ തന്നെ നേരിട്ട് നിങ്ങളെ ബന്ധപ്പെടും. ആവശ്യമെങ്കിൽ ${SUPPORT_EMAIL} എന്ന ഇമെയിലിലും ഞങ്ങളെ ബന്ധപ്പെടാം.`;
+  `ക്ഷമിക്കണം, റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ കൂടുതൽ സമയമെടുക്കുന്നു. ഞങ്ങൾ ഉടൻ തന്നെ നേരിട്ട് നിങ്ങളെ ബന്ധപ്പെടും. ആവശ്യമെങ്കിൽ ${SUPPORT_CONTACT_LINE}`;
 
 const REPORT_STILL_PENDING_MESSAGE =
   "നിങ്ങളുടെ റിപ്പോർട്ട് ഇപ്പോഴും തയ്യാറാക്കുകയാണ്. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
 
 const REPORT_RETRYING_MESSAGE = "ഒരു നിമിഷം, റിപ്പോർട്ട് വീണ്ടും തയ്യാറാക്കാൻ ശ്രമിക്കുന്നു...";
+
+// Sent when we auto-detect that a previously "sent" report was actually a
+// refusal/garbage output (see isLikelyRefusal / isLikelyDegenerateRepetition
+// checks reused below) and a corrected photo has just re-triggered a retry.
+// Distinct from PHOTO_REPLACED_MESSAGE so the customer understands this was
+// on our end, not something wrong with their photo.
+const REPORT_CORRECTION_DETECTED_MESSAGE = `ക്ഷമിക്കണം, മുൻപ് ലഭിച്ച റിപ്പോർട്ട് ശരിയായി തയ്യാറാക്കപ്പെട്ടിരുന്നില്ല എന്ന് ഞങ്ങൾ കണ്ടെത്തി. നിങ്ങളുടെ ₹99 payment നഷ്ടപ്പെട്ടിട്ടില്ല — അയച്ച ഫോട്ടോ ഉപയോഗിച്ച് ഇപ്പോൾ വീണ്ടും ശരിയായ റിപ്പോർട്ട് തയ്യാറാക്കുന്നു, ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ലഭിക്കും. ബുദ്ധിമുട്ടിന് ക്ഷമ ചോദിക്കുന്നു. ${SUPPORT_CONTACT_LINE}`;
 
 // ---------------------------------------------------------------------------
 // FAQ handling (keyword based, no GPT call — keeps pre-payment flow cheap/fast)
@@ -789,49 +803,43 @@ async function handleVoiceMessage(phone, mediaId, session) {
   await handleTextMessage(phone, transcript, session);
 }
 
-// Detects short refusal/apology text, in English or Malayalam, which is
-// what the model outputs on the rare occasions it refuses or wrongly
-// claims it can't read the image, instead of writing the actual Malayalam
-// reading. A real report is 2000+ words, so any short response matching
-// these patterns is treated as a failure and retried — instead of being
-// sent to the customer as if it were their finished report.
+// A genuine report is required (system prompt) to run 2000+ words minimum.
+// Keyword-matching every possible refusal phrasing is a losing game — we've
+// already had to patch this twice: bug #23's original English-only miss,
+// then a NEW Malayalam phrasing ("ലഭിച്ചിട്ടില്ല" — "hasn't been received")
+// that slipped through the exact same way on 24/7/2026 (real incident:
+// Sudheer, 919744084652 — paid ₹99, model wrongly claimed his palm photo
+// was "just a payment receipt," that refusal was accepted as his report,
+// and he got stuck with no way back — refunded manually).
 //
-// The Malayalam branch was added after two real production incidents
-// (Ancy, 14/7; നിഷിത, 16/7) where the model refused in Malayalam — e.g.
-// claiming a valid palm photo "is a payment screenshot, not a palm image"
-// — and that refusal text slipped past the English-only check, got
-// accepted as a finished report, and flipped the session to report_sent.
-// The customer was then stuck: every real photo they resent afterward hit
-// the report_sent branch instead of a retry, with no way back in short of
-// a manual reset/refund.
+// Word count is now the PRIMARY check: it's a structural signal that
+// doesn't need to know the exact words a future refusal might use, unlike
+// keyword matching which we will always be one step behind on. The keyword
+// patterns remain as a SECONDARY, belt-and-suspenders check for the (very
+// unlikely) case of a padded/verbose refusal that somehow clears the
+// length bar.
+const MIN_REPORT_WORDS = 800; // well below the 2000-word real minimum, well above any refusal/apology message
+
 function isLikelyRefusal(text) {
-  if (!text) return false;
+  if (!text) return true;
   const trimmed = text.trim();
-
-  // Real reports are 2000+ words minimum (enforced in the system prompt),
-  // so anything under ~300 words is certainly not a real report — safe to
-  // check refusal patterns regardless of raw character length. A previous
-  // 400-CHARACTER cutoff was too low and let a verbose ~700-character
-  // Malayalam refusal (with detailed re-submission instructions) slip
-  // through uncaught — real incident: Vijay Philip, 919995974111, 18/7.
   const wordCount = trimmed.split(/\s+/).length;
-  if (wordCount > 300) return false;
 
+  // PRIMARY check — catches every refusal, current or future, regardless
+  // of how it's worded, since no refusal message will ever run 800+ words.
+  if (wordCount < MIN_REPORT_WORDS) return true;
+
+  // SECONDARY check — belt-and-suspenders only.
   const englishRefusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
   if (englishRefusalPatterns.test(trimmed)) return true;
 
   // Malayalam refusal shape: an apology word, combined with a negation,
-  // combined with a reference to the image — this is the pattern the model
-  // uses when it (sometimes wrongly) claims the palm photo is invalid or
-  // missing instead of writing the reading.
+  // combined with a reference to the image/receipt — this is the pattern
+  // the model uses when it (sometimes wrongly) claims the palm photo is
+  // invalid, missing, or a payment receipt instead of writing the reading.
   const malayalamApology = /ക്ഷമിക്കണം|ക്ഷമിക്കൂ/;
-  // NOTE: previously this was `അല്ല\b` — JS \b only recognizes ASCII
-  // [A-Za-z0-9_] as "word" characters, so \b essentially never fires
-  // correctly around Malayalam script. That silently made this branch
-  // dead code and let a real refusal (Akhil ks, 918157017051, 17/7-22/7)
-  // slip through as if it were a finished report. Anchor removed.
-  const malayalamNegation = /അല്ല|ലഭ്യമല്ല|ലഭ്യമായിട്ടില്ല|കഴിയില്ല|കഴിഞ്ഞില്ല|കഴിയാത്ത/;
-  const malayalamImageRef = /ചിത്രം|ഫോട്ടോ|കൈരേഖ|പാം|palm/i;
+  const malayalamNegation = /അല്ല|ലഭ്യമല്ല|ലഭ്യമായിട്ടില്ല|ലഭിച്ചിട്ടില്ല|ലഭിച്ചില്ല|കഴിയില്ല|കഴിഞ്ഞില്ല|കഴിയാത്ത|സാധ്യമല്ല/;
+  const malayalamImageRef = /ചിത്രം|ഫോട്ടോ|കൈരേഖ|പാം|palm|രസീത്|സ്ക്രീൻഷോട്ട്/i;
 
   if (malayalamApology.test(trimmed) && malayalamNegation.test(trimmed) && malayalamImageRef.test(trimmed)) {
     return true;
@@ -844,9 +852,11 @@ function isLikelyRefusal(text) {
 // the same short phrase hundreds of times instead of writing a real
 // reading. Real incident: Subin jose, 14/7 — report collapsed into endless
 // repetitions of "palm-ന്റെ records" and was sent to the customer in full
-// as their finished ₹99 reading. A normal 2000+ word report naturally
-// reuses short phrases a handful of times, but not dozens — this catches
-// the pathological case cheaply without needing another API call.
+// as their finished ₹99 report. Nothing previously checked for this.
+// **Fixed**: new `isLikelyDegenerateRepetition()` — checks 4-word sliding
+// windows across the generated text; if any phrase repeats 15+ times in
+// a report-length output, it's treated as a failed attempt and retried,
+// same as a refusal.
 function isLikelyDegenerateRepetition(text) {
   if (!text) return false;
   const words = text.trim().split(/\s+/);
@@ -1305,7 +1315,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
     await db.updateSession(phone, { awaitingReportInquiryCount: inquiryCount });
     const offerSupport = inquiryCount >= SUPPORT_EMAIL_INQUIRY_THRESHOLD;
     const withSupport = (msg) =>
-      offerSupport ? `${msg}\n\nകൂടുതൽ സഹായത്തിന് ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ഞങ്ങളെ ബന്ധപ്പെടാം.` : msg;
+      offerSupport ? `${msg}\n\n${SUPPORT_CONTACT_LINE}` : msg;
 
     if (!isReportStatusQuery(text)) {
       await sendText(phone, withSupport(REPORT_STILL_PENDING_MESSAGE));
@@ -1547,6 +1557,45 @@ async function handleImageMessage(phone, mediaId, session) {
     });
     await sendText(phone, PHOTO_REPLACED_MESSAGE);
     return;
+  }
+
+  if (session.stage === "report_sent") {
+    // Safety net for the same failure mode as bug #23/#24, but caught late:
+    // if the stored report itself still looks like a refusal or degenerate
+    // repetition — whether from before a phrasing fix was deployed, or a
+    // wording isLikelyRefusal() doesn't yet know about — treat an incoming
+    // photo as the customer trying to fix it, and auto-retry, instead of
+    // silently swallowing it with "ഫോട്ടോ ലഭിച്ചു, നന്ദി." and leaving them
+    // stuck with a paid-but-broken session. Real incident this fixes:
+    // Sudheer, 919744084652, 24/7 — sent 6 corrected photos after a bad
+    // refusal was accepted as his report, none of which did anything;
+    // refunded manually.
+    //
+    // A genuinely finished, valid report must NOT be disturbed by a stray
+    // photo (e.g. someone sending a thank-you selfie), so this only fires
+    // when the stored report_text itself fails the same checks used during
+    // generation.
+    if (isLikelyRefusal(session.reportText) || isLikelyDegenerateRepetition(session.reportText)) {
+      log(
+        "Photo received in report_sent for",
+        phone,
+        "but stored report looks like a refusal/garbage — treating as a correction and retrying instead of the generic fallback."
+      );
+      const retryDueAt = new Date(Date.now() + 2 * 60 * 1000);
+      await db.updateSession(phone, {
+        palmMediaId: mediaId,
+        stage: "awaiting_report",
+        reportStatus: "pending",
+        reportAttempts: 0,
+        reportDueAt: retryDueAt,
+        reportError: null,
+        awaitingReportInquiryCount: 0,
+      });
+      await sendText(phone, REPORT_CORRECTION_DETECTED_MESSAGE);
+      return;
+    }
+    // else: fall through to the generic ack below — a genuinely valid,
+    // already-sent report shouldn't be disturbed by a stray photo.
   }
 
   if (session.stage === "new" || session.stage === "collecting") {
@@ -1860,7 +1909,7 @@ app.get("/admin/failed-payments", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Paid but report generation gave up (${failed.length})</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat. Each of these already received a message telling them you'll follow up directly.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. ߎ</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. 🎉</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin failed-payments list failed (caught):", err.message);
@@ -1874,9 +1923,12 @@ app.get("/admin/failed-payments", async (req, res) => {
 // generation against the stored report_text. Any match means a refusal or
 // garbled output slipped through and was delivered to the customer (and
 // the DB marked 'sent') as if it were their real report — the exact
-// failure mode found in Akhil ks's chat (918157017051). These sessions are
-// invisible to /admin/failed-payments since their status is 'sent', not
-// 'failed', so this is the only way to find the rest of them.
+// failure mode found in Akhil ks's chat (918157017051) and Sudheer's chat
+// (919744084652). These sessions are invisible to /admin/failed-payments
+// since their status isn't 'failed', so this is the only way to find the
+// rest of them. NOTE: since isLikelyRefusal() is now length-first (see
+// MIN_REPORT_WORDS), this scan is also stricter than before and should
+// catch more historical cases than it used to.
 // Read-only. Safe to run repeatedly. Consider removing this route once the
 // backlog has been reviewed and cleared.
 app.get("/admin/scan-stuck-reports", async (req, res) => {
@@ -1896,7 +1948,7 @@ app.get("/admin/scan-stuck-reports", async (req, res) => {
         const time = new Date(s.updatedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
         const name = escapeHtml(s.name || "(no name)");
         const preview = escapeHtml((s.reportText || "").slice(0, 200));
-        const reason = isLikelyRefusal(s.reportText) ? "refusal pattern" : "degenerate repetition";
+        const reason = isLikelyRefusal(s.reportText) ? "refusal pattern / too short" : "degenerate repetition";
         return `<a href="/admin/chats/view?phone=${encodeURIComponent(s.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
           <div style="padding:12px 16px;border-bottom:1px solid #333;">
             <div style="display:flex;justify-content:space-between;">
@@ -1914,8 +1966,8 @@ app.get("/admin/scan-stuck-reports", async (req, res) => {
 <html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Stuck Reports Scan</title></head>
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Sessions marked "sent" that look like refusals (${suspects.length} of ${sentSessions.length} scanned)</div>
-  <div style="padding:8px 16px;color:#888;font-size:13px;">These customers paid and their session shows report_status='sent', but the stored report text matches a refusal or degenerate-output pattern — meaning they likely never got a real reading. Tap any row to open the full chat and confirm before refunding/regenerating.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. ߎ</div>'}
+  <div style="padding:8px 16px;color:#888;font-size:13px;">These customers paid and their session shows report_status='sent', but the stored report text matches a refusal or degenerate-output pattern (or is simply too short to be a real report) — meaning they likely never got a real reading. Tap any row to open the full chat and confirm before refunding/regenerating. As of the 24/7 fix, sending this customer a new photo while they're in report_sent will now auto-retry on its own — see REPORT_CORRECTION_DETECTED_MESSAGE.</div>
+  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. 🎉</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin scan-stuck-reports failed (caught):", err.message);
@@ -2034,7 +2086,7 @@ async function processWebhookBody(body) {
     db.logMessage(phone, "in", "[Contact card]", "contacts");
     await sendText(phone, "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
   } else if (message.type === "reaction") {
-    // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
+    // Emoji reactions to a previous message (👍, ❤️ etc.) — not something
     // that needs (or should get) a reply; replying here would be spammy.
     log("Reaction received from", phone, "-> acknowledging silently, no reply needed.");
     db.logMessage(phone, "in", "[Reaction]", "reaction");
