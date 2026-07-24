@@ -819,6 +819,18 @@ async function handleVoiceMessage(phone, mediaId, session) {
 // unlikely) case of a padded/verbose refusal that somehow clears the
 // length bar.
 const MIN_REPORT_WORDS = 800; // well below the 2000-word real minimum, well above any refusal/apology message
+// Upper bound of the "grey zone" for the secondary keyword check. A report
+// that genuinely follows the system prompt's 2000-word instruction will
+// almost always be well past this — so once content clears it, we skip the
+// keyword check entirely rather than risk a false positive. Real incident
+// this fixes: Aswathy, 918921390826, 24-25/7 — all 5 of her attempts came
+// back HTTP 200 with genuine, well-formed report content (confirmed from
+// logs), but every one was discarded because the unconditional secondary
+// check flagged common Malayalam words (അല്ല = "is not", കൈരേഖ = "palm
+// line" — both guaranteed to appear in any real reading) as if they were
+// refusal language. She was charged 5x in API cost for reports that were
+// silently thrown away, then told the report generation had failed.
+const REFUSAL_KEYWORD_CHECK_MAX_WORDS = 1500;
 
 function isLikelyRefusal(text) {
   if (!text) return true;
@@ -829,7 +841,14 @@ function isLikelyRefusal(text) {
   // of how it's worded, since no refusal message will ever run 800+ words.
   if (wordCount < MIN_REPORT_WORDS) return true;
 
-  // SECONDARY check — belt-and-suspenders only.
+  // SECONDARY check — belt-and-suspenders ONLY for the grey zone (800-1500
+  // words): long enough to clear the primary bar, but short enough that a
+  // padded/verbose refusal could plausibly still be responsible. A report
+  // comfortably past 1500 words is for all practical purposes guaranteed to
+  // be genuine content, and subjecting it to fragile keyword matching only
+  // risks false positives on ordinary, extremely common Malayalam words.
+  if (wordCount > REFUSAL_KEYWORD_CHECK_MAX_WORDS) return false;
+
   const englishRefusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
   if (englishRefusalPatterns.test(trimmed)) return true;
 
@@ -1045,6 +1064,16 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
 const MAX_REPORT_ATTEMPTS = 5;
 const REPORT_RETRY_INTERVAL_MS = 3 * 60 * 1000; // how far to push report_due_at forward on failure
 
+// Wall-clock safety net, independent of report_attempts/report_due_at
+// bookkeeping: if it's been this long since payment was confirmed and the
+// report still isn't delivered, force an immediate fresh attempt — either
+// because the customer just asked, or via the poller's own sweep even if
+// nobody asks. This exists specifically so a bug in the attempt-counter
+// logic itself (which happened once — see findOverdueAwaitingReports in
+// db.js) can never leave a paying customer stuck indefinitely with no
+// resolution message ever sent.
+const REPORT_FORCE_RETRY_AFTER_MS = 30 * 60 * 1000; // 30 minutes
+
 async function generateAndDeliverReport(session) {
   const phone = session.phone;
   const attemptNumber = (session.reportAttempts || 0) + 1;
@@ -1138,6 +1167,7 @@ async function confirmPaymentAndScheduleReport(phone, session, sourceLabel) {
   const dueAt = new Date(Date.now() + (10 + Math.random() * 5) * 60 * 1000);
   await db.updateSession(phone, {
     paymentReceived: true,
+    paymentConfirmedAt: new Date(),
     stage: "awaiting_report",
     reportStatus: "pending",
     reportDueAt: dueAt,
@@ -1310,29 +1340,51 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
   if (session.stage === "awaiting_report") {
     // Track how many times this customer has messaged while still waiting.
     // After several inquiries with no report yet, proactively offer the
-    // support email rather than waiting for them to ask for it.
+    // support email/WhatsApp helpline rather than waiting for them to ask.
     const inquiryCount = (session.awaitingReportInquiryCount || 0) + 1;
     await db.updateSession(phone, { awaitingReportInquiryCount: inquiryCount });
     const offerSupport = inquiryCount >= SUPPORT_EMAIL_INQUIRY_THRESHOLD;
     const withSupport = (msg) =>
       offerSupport ? `${msg}\n\n${SUPPORT_CONTACT_LINE}` : msg;
 
-    if (!isReportStatusQuery(text)) {
-      await sendText(phone, withSupport(REPORT_STILL_PENDING_MESSAGE));
-      return;
-    }
-
-    // Re-fetch fresh from DB — the poller may have updated this in the background.
+    // Always re-check fresh DB state on ANY message in this stage — no
+    // longer gated behind isReportStatusQuery() keyword matching. Real
+    // incident this fixes: Aswathy, 918921390826, 24-25/7 — every one of
+    // her messages ("My result where", "Time is long", etc.) failed to
+    // match the old keyword list, so the bot repeated a canned "still
+    // preparing" line for over an hour without ever checking whether the
+    // report had actually failed, succeeded, or was simply stuck.
     const fresh = await db.getOrCreateSession(phone);
 
-    if (fresh.reportStatus === "sent" && fresh.reportText) {
+    if (
+      fresh.reportStatus === "sent" &&
+      fresh.reportText &&
+      !isLikelyRefusal(fresh.reportText) &&
+      !isLikelyDegenerateRepetition(fresh.reportText)
+    ) {
       // Self-heal an edge case where stage didn't get updated in sync.
       await db.updateSession(phone, { stage: "report_sent", awaitingReportInquiryCount: 0 });
       await sendLongText(phone, fresh.reportText);
       return;
     }
 
-    if (fresh.reportStatus === "failed") {
+    // Genuine wall-clock overdue check, independent of report_attempts/
+    // report_due_at bookkeeping — see REPORT_FORCE_RETRY_AFTER_MS above.
+    const paymentAgeMs = fresh.paymentConfirmedAt
+      ? Date.now() - new Date(fresh.paymentConfirmedAt).getTime()
+      : 0;
+    const overdue = paymentAgeMs > REPORT_FORCE_RETRY_AFTER_MS;
+
+    if (fresh.reportStatus === "failed" || overdue) {
+      // Either formally exhausted, or simply taking too long regardless of
+      // internal attempt bookkeeping — force an immediate fresh attempt
+      // right now instead of waiting on the normal backoff/poller schedule.
+      log(
+        "awaiting_report force-retry for",
+        phone,
+        "-> reason:",
+        fresh.reportStatus === "failed" ? "status=failed" : `overdue by ${Math.round(paymentAgeMs / 60000)} min`
+      );
       await sendText(phone, REPORT_RETRYING_MESSAGE);
       const resetSession = await db.updateSession(phone, { reportAttempts: 0, reportStatus: "pending" });
       const result = await generateAndDeliverReport(resetSession);
@@ -1344,7 +1396,9 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
       return;
     }
 
-    // status === 'pending'
+    // Genuinely still within the normal wait window — no need to force a
+    // fresh (costly) generation attempt on every casual message, just
+    // reassure them it's in progress.
     await sendText(phone, withSupport(REPORT_STILL_PENDING_MESSAGE));
     return;
   }
@@ -1641,7 +1695,9 @@ async function pollDueReports() {
     if (dueSessions.length) {
       log(`Poller: found ${dueSessions.length} due report(s)`);
     }
+    const processedPhones = new Set();
     for (const session of dueSessions) {
+      processedPhones.add(session.phone);
       const result = await generateAndDeliverReport(session);
       if (!result.success) {
         if (result.attemptNumber === 1) {
@@ -1650,6 +1706,32 @@ async function pollDueReports() {
         if (result.exhausted) {
           await sendText(session.phone, REPORT_EXHAUSTED_MESSAGE);
         }
+      }
+    }
+
+    // Safety sweep, independent of report_attempts/report_due_at
+    // bookkeeping: force an attempt for any session that's been waiting
+    // past REPORT_FORCE_RETRY_AFTER_MS since payment, no matter what
+    // report_status/report_due_at currently claim. This exists specifically
+    // to catch the case where the normal attempt-counter logic itself is
+    // broken (e.g. an increment silently fails to persist and the session
+    // re-tries "attempt 1" forever without ever reaching report_status=
+    // 'failed'). Real incident this defends against: Aswathy, 918921390826,
+    // 24-25/7 — stuck over an hour with no exhausted message ever sent.
+    const overdueSessions = await db.findOverdueAwaitingReports(REPORT_FORCE_RETRY_AFTER_MS);
+    for (const session of overdueSessions) {
+      if (processedPhones.has(session.phone)) continue; // already handled above this tick
+      log(
+        "Poller safety sweep: forcing retry for",
+        session.phone,
+        "— overdue past the",
+        REPORT_FORCE_RETRY_AFTER_MS / 60000,
+        "minute wall-clock threshold regardless of internal attempt bookkeeping."
+      );
+      const resetSession = await db.updateSession(session.phone, { reportAttempts: 0, reportStatus: "pending" });
+      const result = await generateAndDeliverReport(resetSession);
+      if (!result.success && result.exhausted) {
+        await sendText(session.phone, REPORT_EXHAUSTED_MESSAGE);
       }
     }
   } catch (err) {
@@ -1909,7 +1991,7 @@ app.get("/admin/failed-payments", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Paid but report generation gave up (${failed.length})</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat. Each of these already received a message telling them you'll follow up directly.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. 🎉</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. ߎ</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin failed-payments list failed (caught):", err.message);
@@ -1967,7 +2049,7 @@ app.get("/admin/scan-stuck-reports", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Sessions marked "sent" that look like refusals (${suspects.length} of ${sentSessions.length} scanned)</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">These customers paid and their session shows report_status='sent', but the stored report text matches a refusal or degenerate-output pattern (or is simply too short to be a real report) — meaning they likely never got a real reading. Tap any row to open the full chat and confirm before refunding/regenerating. As of the 24/7 fix, sending this customer a new photo while they're in report_sent will now auto-retry on its own — see REPORT_CORRECTION_DETECTED_MESSAGE.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. 🎉</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. ߎ</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin scan-stuck-reports failed (caught):", err.message);
@@ -2086,7 +2168,7 @@ async function processWebhookBody(body) {
     db.logMessage(phone, "in", "[Contact card]", "contacts");
     await sendText(phone, "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
   } else if (message.type === "reaction") {
-    // Emoji reactions to a previous message (👍, ❤️ etc.) — not something
+    // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
     // that needs (or should get) a reply; replying here would be spammy.
     log("Reaction received from", phone, "-> acknowledging silently, no reply needed.");
     db.logMessage(phone, "in", "[Reaction]", "reaction");
