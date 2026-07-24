@@ -61,6 +61,11 @@ async function initDb() {
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_transaction_id BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_report_inquiry_count INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
+  // Stable "payment confirmed" timestamp — unlike report_due_at (which gets
+  // pushed forward by REPORT_RETRY_INTERVAL_MS on every failed attempt),
+  // this never changes once set, so it's what we use to measure genuine
+  // elapsed wait time for the 30-minute force-retry safety net.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS payment_confirmed_at TIMESTAMPTZ;`);
 
   // Permanent conversation log — every inbound and outbound message, so
   // chats can be reviewed regardless of what Meta/WhatsApp allows and
@@ -109,6 +114,7 @@ function rowToSession(row) {
     awaitingTransactionId: row.awaiting_transaction_id,
     awaitingReportInquiryCount: row.awaiting_report_inquiry_count,
     pendingSecondPerson: row.pending_second_person,
+    paymentConfirmedAt: row.payment_confirmed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -150,6 +156,7 @@ const FIELD_MAP = {
   awaitingTransactionId: "awaiting_transaction_id",
   awaitingReportInquiryCount: "awaiting_report_inquiry_count",
   pendingSecondPerson: "pending_second_person",
+  paymentConfirmedAt: "payment_confirmed_at",
 };
 
 // Updates only the given fields for a phone number's session, bumps
@@ -212,6 +219,29 @@ async function findSentReports() {
   return result.rows.map(rowToSession);
 }
 
+// Finds sessions stuck in awaiting_report where genuine wall-clock time
+// since payment (payment_confirmed_at) exceeds thresholdMs, regardless of
+// what report_status/report_attempts/report_due_at currently say. This is
+// a deliberate belt-and-suspenders check independent of the normal
+// attempt-counter bookkeeping — it exists specifically to catch the case
+// where that bookkeeping itself is broken (e.g. an attempt silently fails
+// to persist its incremented count and the session retries "attempt 1"
+// forever without ever reaching report_status='failed'). Real incident
+// this defends against: Aswathy, 918921390826, 24-25/7 — stuck over an
+// hour past payment with no exhausted message ever sent, because attempts
+// never appeared to progress past the first one.
+async function findOverdueAwaitingReports(thresholdMs) {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE stage = 'awaiting_report'
+       AND report_status != 'sent'
+       AND payment_confirmed_at IS NOT NULL
+       AND payment_confirmed_at <= now() - ($1 || ' milliseconds')::interval`,
+    [thresholdMs]
+  );
+  return result.rows.map(rowToSession);
+}
+
 async function findFailedPayments() {
   const result = await pool.query(
     `SELECT * FROM sessions
@@ -268,6 +298,7 @@ module.exports = {
   getOrCreateSession,
   updateSession,
   findDueReports,
+  findOverdueAwaitingReports,
   findFailedPayments,
   findSentReports,
   logMessage,
