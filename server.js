@@ -1991,7 +1991,7 @@ app.get("/admin/failed-payments", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Paid but report generation gave up (${failed.length})</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat. Each of these already received a message telling them you'll follow up directly.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. ߎ</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. 🎉</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin failed-payments list failed (caught):", err.message);
@@ -2049,7 +2049,7 @@ app.get("/admin/scan-stuck-reports", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Sessions marked "sent" that look like refusals (${suspects.length} of ${sentSessions.length} scanned)</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">These customers paid and their session shows report_status='sent', but the stored report text matches a refusal or degenerate-output pattern (or is simply too short to be a real report) — meaning they likely never got a real reading. Tap any row to open the full chat and confirm before refunding/regenerating. As of the 24/7 fix, sending this customer a new photo while they're in report_sent will now auto-retry on its own — see REPORT_CORRECTION_DETECTED_MESSAGE.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. ߎ</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. 🎉</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin scan-stuck-reports failed (caught):", err.message);
@@ -2168,7 +2168,7 @@ async function processWebhookBody(body) {
     db.logMessage(phone, "in", "[Contact card]", "contacts");
     await sendText(phone, "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
   } else if (message.type === "reaction") {
-    // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
+    // Emoji reactions to a previous message (👍, ❤️ etc.) — not something
     // that needs (or should get) a reply; replying here would be spammy.
     log("Reaction received from", phone, "-> acknowledging silently, no reply needed.");
     db.logMessage(phone, "in", "[Reaction]", "reaction");
