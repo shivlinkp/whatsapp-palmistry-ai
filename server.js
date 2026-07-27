@@ -1179,10 +1179,14 @@ async function progressCollectingStage(phone, session) {
 
 // Shared by all three ways a customer can confirm payment: screenshot image,
 // PDF receipt, or (if they can't send either) typing a transaction ID.
-// Real scheduling stays 10-15 min regardless of source — unaffected by the
+// Real scheduling now targets 5-8 minutes (well under 10) regardless of
+// source — deliberately faster than the 25-30 minute figure customers are
+// told (see paymentReceivedMessage / matchFaq / REPORT_CORRECTION_DETECTED_
+// MESSAGE, all unchanged), so delivery consistently arrives well ahead of
+// the promised window instead of right at the edge. Unaffected by the
 // per-message send delay, which is a separate concern.
 async function confirmPaymentAndScheduleReport(phone, session, sourceLabel) {
-  const dueAt = new Date(Date.now() + (10 + Math.random() * 5) * 60 * 1000);
+  const dueAt = new Date(Date.now() + (5 + Math.random() * 3) * 60 * 1000); // 5-8 minutes
   await db.updateSession(phone, {
     paymentReceived: true,
     paymentConfirmedAt: new Date(),
@@ -1622,6 +1626,25 @@ async function handleImageMessage(phone, mediaId, session) {
   log("Current session state for", phone, "->", JSON.stringify({ stage: session.stage }));
 
   if (session.stage === "awaiting_photo") {
+    if (session.palmMediaId) {
+      // A valid photo was already accepted here (QR already sent for it) —
+      // a second photo arriving in this same stage is almost always just
+      // another angle of the same palm, not a fresh submission attempt.
+      // Save it as the one to use for the report (most recent is usually
+      // the clearest) without re-validating or re-sending the QR again.
+      // If the FIRST photo had instead been rejected as not-a-palm,
+      // palmMediaId would already be null at that point (see
+      // processReceivedPalmPhoto's rejection branch), so this only fires
+      // for genuine extra angles, not resend-after-rejection attempts.
+      log(
+        "Additional palm photo received while awaiting_photo (QR already sent) for",
+        phone,
+        "— treating as another angle, not re-sending QR."
+      );
+      await db.updateSession(phone, { palmMediaId: mediaId });
+      await sendText(phone, "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.");
+      return;
+    }
     await processReceivedPalmPhoto(phone, mediaId, session);
     return;
   }
@@ -1633,6 +1656,31 @@ async function handleImageMessage(phone, mediaId, session) {
   }
 
   if (session.stage === "awaiting_report") {
+    // A photo sent very soon after payment is almost certainly just
+    // another angle of the same palm sent in the same burst (customers
+    // often send 2-3 angles for a richer reading) — NOT a "my report
+    // failed, here's a fixed photo" resend, which only makes sense once
+    // the customer has actually seen a failure or delay. Treating every
+    // such photo as a full correction was needlessly resetting the report
+    // schedule for customers who never had a problem in the first place.
+    const RECENT_PAYMENT_PHOTO_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
+    const paymentAgeMs = session.paymentConfirmedAt
+      ? Date.now() - new Date(session.paymentConfirmedAt).getTime()
+      : Infinity;
+
+    if (paymentAgeMs < RECENT_PAYMENT_PHOTO_WINDOW_MS) {
+      log(
+        "Additional palm photo received shortly after payment (",
+        Math.round(paymentAgeMs / 1000),
+        "s ago) for",
+        phone,
+        "— treating as another angle, not resetting report schedule."
+      );
+      await db.updateSession(phone, { palmMediaId: mediaId });
+      await sendText(phone, "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് ഉപയോഗിച്ച് റിപ്പോർട്ട് തയ്യാറാക്കും.");
+      return;
+    }
+
     // Previously: any photo sent here fell through to a generic "photo
     // received, thanks" with NO session update at all — so if the report
     // failed because the original photo wasn't a valid palm, a corrected
