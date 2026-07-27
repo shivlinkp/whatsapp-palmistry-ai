@@ -351,6 +351,45 @@ function isReportStatusQuery(text) {
   return /report|assessment|reading|എപ്പോൾ|kittum|kitum|ready|status|vannu|vanno/i.test(text);
 }
 
+// Matches short, low-content acknowledgment messages ("Ok", "K", "Okay",
+// "Alright", "ߑ" etc.) that genuinely don't need any reply — the customer
+// is just acknowledging the last message, not asking anything. Deliberately
+// conservative: only matches when the ENTIRE message (after trimming,
+// lowercasing, and stripping trailing punctuation) is one of these fillers,
+// so "Ok but when will it come" or "Okay, thank you so much" still get
+// treated as real messages needing a real reply.
+function isTrivialAcknowledgment(text) {
+  if (!text) return false;
+  const cleaned = text
+    .trim()
+    .toLowerCase()
+    .replace(/[.,!?~\s]+$/g, "")
+    .trim();
+  const trivialWords = new Set([
+    "ok",
+    "okay",
+    "okk",
+    "okie",
+    "k",
+    "kk",
+    "kay",
+    "fine",
+    "alright",
+    "aight",
+    "sari",
+    "seri",
+    "sheri", // Malayalam/Manglish "ok/fine"
+    "thik",
+    "thika",
+    "theek",
+    "ߑ",
+    "ߑ",
+    "✔️",
+    "✅",
+  ]);
+  return trivialWords.has(cleaned);
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI helpers
 // ---------------------------------------------------------------------------
@@ -1014,46 +1053,96 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
   const REPORT_MODEL_PRIMARY = "gpt-4.1";
   const REPORT_MODEL_FALLBACK = "gpt-4o";
 
-  let result = await callOpenAIForReport(messages, 7000, REPORT_MODEL_PRIMARY);
+  // Tries one model end-to-end and returns a structured outcome, including
+  // WHETHER the failure was "cheap" (API error / empty content — fails
+  // before or with minimal token spend) or "expensive" (a full completion
+  // was already generated, just flagged as a refusal or degenerate
+  // repetition). This distinction matters for deciding whether it's worth
+  // immediately trying the other model within the same attempt.
+  async function tryModel(model) {
+    const result = await callOpenAIForReport(messages, 7000, model);
 
-  // Only fall back if the PRIMARY model itself is unavailable on this
-  // account (invalid/unknown model error) — not for refusals or other
-  // content-based failures, which should surface normally either way.
-  const modelUnavailable =
-    !result.ok &&
-    result.data?.error &&
-    /model/i.test(result.data.error.code || "") &&
-    /not found|does not exist|invalid|unknown/i.test(result.data.error.message || result.data.error.code || "");
+    if (!result.ok) {
+      const detail = result.networkError
+        ? `network error: ${result.networkError}`
+        : `HTTP ${result.status} — ${result.data?.error?.code || result.data?.error?.type || "unknown"}: ${
+            result.data?.error?.message || JSON.stringify(result.data || {}).slice(0, 200)
+          }`;
+      return { report: null, failureReason: `${model} API failure — ${detail}`, model, cheapFailure: true };
+    }
 
-  if (modelUnavailable) {
-    log(
-      `Model "${REPORT_MODEL_PRIMARY}" appears unavailable on this account (error: ${JSON.stringify(
-        result.data.error
-      )}) — falling back to "${REPORT_MODEL_FALLBACK}"`
-    );
-    result = await callOpenAIForReport(messages, 7000, REPORT_MODEL_FALLBACK);
+    const content = result.content;
+    if (!content) {
+      const finishReason = result.data?.choices?.[0]?.finish_reason || "unknown";
+      return {
+        report: null,
+        failureReason: `${model} returned empty content (finish_reason: ${finishReason})`,
+        model,
+        cheapFailure: true,
+      };
+    }
+
+    if (isLikelyRefusal(content)) {
+      const wc = content.trim().split(/\s+/).length;
+      return {
+        report: null,
+        failureReason: `${model} output flagged as refusal/too short (${wc} words)`,
+        model,
+        cheapFailure: false, // a full completion was already paid for
+      };
+    }
+
+    if (isLikelyDegenerateRepetition(content)) {
+      return {
+        report: null,
+        failureReason: `${model} output flagged as degenerate repetition`,
+        model,
+        cheapFailure: false, // ditto — real tokens were spent generating this
+      };
+    }
+
+    return { report: content, failureReason: null, model: result.data?.model || model };
   }
 
-  let report = result.content;
+  // Cost-conscious fallback: only try the fallback model WITHIN THE SAME
+  // attempt for cheap failures (API error, empty response) — these fail
+  // fast with minimal/no token spend, so trying again on a different model
+  // is nearly free. For expensive failures (refusal/degenerate — a full
+  // completion was already generated and discarded), do NOT immediately
+  // burn a second full completion on the fallback model too; just let this
+  // attempt end as failed and let the NEXT scheduled attempt (poller,
+  // 3 min later) try again. Real incident this balances against: token
+  // usage spiked noticeably (27/7) from the sheer number of full 5-attempt
+  // exhaustion cycles across many customers that same day — doubling
+  // generation cost on every content-flagged failure would have made that
+  // meaningfully worse without a proportional gain in success rate.
+  let outcome = await tryModel(REPORT_MODEL_PRIMARY);
 
-  if (report && (isLikelyRefusal(report) || isLikelyDegenerateRepetition(report))) {
-    log(
-      "generateReport: model output looks like a refusal or degenerate repetition, not a report. Treating as failure. First 300 chars:",
-      report.slice(0, 300)
-    );
-    report = null;
+  if (!outcome.report && outcome.cheapFailure) {
+    log(`generateReport: primary model (${REPORT_MODEL_PRIMARY}) failed cheaply — ${outcome.failureReason} — trying fallback model within same attempt.`);
+    const fallbackOutcome = await tryModel(REPORT_MODEL_FALLBACK);
+    if (fallbackOutcome.report) {
+      outcome = fallbackOutcome;
+    } else {
+      outcome = {
+        report: null,
+        failureReason: `primary (${REPORT_MODEL_PRIMARY}): ${outcome.failureReason} | fallback (${REPORT_MODEL_FALLBACK}): ${fallbackOutcome.failureReason}`,
+      };
+    }
+  } else if (!outcome.report) {
+    log(`generateReport: primary model (${REPORT_MODEL_PRIMARY}) failed expensively (content already generated) — ${outcome.failureReason} — NOT double-generating this attempt; will retry on next scheduled attempt.`);
   }
+
+  const report = outcome.report;
+  const failureReason = outcome.failureReason;
 
   if (report) {
-    // response.model reflects the exact model OpenAI actually used (may be
-    // a specific dated snapshot, e.g. "gpt-4.1-2025-04-14") — this is more
-    // reliable than the model string we requested, and also tells us
-    // definitively whether the primary or fallback model produced this
-    // particular report.
-    console.log("REPORT GENERATED USING:", result.data?.model);
+    // Reflects the exact model that actually produced this report —
+    // definitive proof of whether the primary or fallback model succeeded.
+    console.log("REPORT GENERATED USING:", outcome.model);
   }
 
-  return report;
+  return { report, failureReason };
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,10 +1187,14 @@ async function generateAndDeliverReport(session) {
   await db.updateSession(phone, { lastAttemptAt: new Date() });
 
   let report = null;
+  let failureReason = null;
   try {
-    report = await generateReport(session);
+    const outcome = await generateReport(session);
+    report = outcome.report;
+    failureReason = outcome.failureReason;
   } catch (err) {
     log("generateAndDeliverReport crashed (caught):", err.message);
+    failureReason = `unexpected crash: ${err.message}`;
   }
 
   if (report) {
@@ -1122,10 +1215,14 @@ async function generateAndDeliverReport(session) {
     reportStatus: exhausted ? "failed" : "pending",
     reportAttempts: attemptNumber,
     reportDueAt: exhausted ? null : new Date(Date.now() + REPORT_RETRY_INTERVAL_MS),
-    reportError: `Attempt ${attemptNumber} failed to produce a valid report`,
+    // Real, specific failure reason (API error / empty content / refusal /
+    // degenerate repetition, per model tried) instead of a generic message
+    // — makes every future case diagnosable straight from
+    // /admin/failed-payments without needing to dig through raw logs.
+    reportError: failureReason || `Attempt ${attemptNumber} failed to produce a valid report (no reason captured)`,
   });
   log(
-    `Report generation FAILED for ${phone} on attempt ${attemptNumber}` +
+    `Report generation FAILED for ${phone} on attempt ${attemptNumber} — reason: ${failureReason}` +
       (exhausted ? " — max attempts exhausted, marked failed." : " — will retry via poller.")
   );
   return { success: false, attemptNumber, exhausted };
@@ -1259,7 +1356,7 @@ async function handleTextMessage(phone, text, session) {
     // etc.) — repeating the exact same "please send your details" prompt
     // ignores what they actually asked. Give a real, brief, reassuring
     // reply instead, then still end with the details request.
-    if (!faqAnswer && Object.keys(patch).length === 0) {
+    if (!faqAnswer && Object.keys(patch).length === 0 && !isTrivialAcknowledgment(text)) {
       const preReply = await openaiChat(
         [
           {
@@ -1332,6 +1429,13 @@ End by asking them to share their പേര് (name), ജനനത്തീയ�
       return;
     }
 
+    if (isTrivialAcknowledgment(text)) {
+      // A plain "Ok"/"K" doesn't need a full GPT reassurance call — just
+      // the free, static payment reminder.
+      await sendText(phone, "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.");
+      return;
+    }
+
     // Previously: any message that didn't match the small fixed FAQ list
     // (price/duration/what-you-get) got the exact same generic reminder,
     // even for genuinely different questions (trust concerns, "explain
@@ -1351,6 +1455,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
       { model: "gpt-5.5", temperature: 0.7, max_tokens: 800 }
     );
 
+
     if (preReply) {
       await sendText(phone, preReply);
     } else {
@@ -1360,6 +1465,16 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
   }
 
   if (session.stage === "awaiting_report") {
+    // A plain "Ok"/"K" here is just acknowledging the last message, not
+    // asking for status — skip entirely (no reply, no inquiry-count bump,
+    // no forced-retry check), same treatment as an emoji reaction. This
+    // also avoids accidentally burning a forced-retry generation attempt
+    // on a message that wasn't actually asking anything.
+    if (isTrivialAcknowledgment(text)) {
+      log("Trivial acknowledgment received in awaiting_report for", phone, "-> no reply needed.");
+      return;
+    }
+
     // Track how many times this customer has messaged while still waiting.
     // After several inquiries with no report yet, proactively offer the
     // support email/WhatsApp helpline rather than waiting for them to ask.
@@ -1447,6 +1562,15 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
   }
 
   if (session.stage === "report_sent") {
+    // A plain "Ok"/"K"/"ߑ" after the report or a reply doesn't need any
+    // response — skip entirely before spending anything on the
+    // wantsAnotherPersonReading() classifier call or the full follow-up
+    // GPT call below, same treatment as an emoji reaction.
+    if (isTrivialAcknowledgment(text) && !session.pendingSecondPerson) {
+      log("Trivial acknowledgment received in report_sent for", phone, "-> no reply needed.");
+      return;
+    }
+
     // Two-step flow for "reading for someone else in this chat":
     //   Step 1 — classifier says this message wants a new order. We ask for
     //   the next person's name/DOB/gender, but do NOT touch the current
