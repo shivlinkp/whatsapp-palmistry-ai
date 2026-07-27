@@ -1074,10 +1074,28 @@ const REPORT_RETRY_INTERVAL_MS = 3 * 60 * 1000; // how far to push report_due_at
 // resolution message ever sent.
 const REPORT_FORCE_RETRY_AFTER_MS = 30 * 60 * 1000; // 30 minutes
 
+// Minimum time between forced-retry generation attempts triggered by a
+// customer message, regardless of how many messages they send in that
+// window. Without this, a frustrated customer firing off several short
+// messages ("ߑ", "Hlo", "??") within seconds of each other each triggered
+// their own full (costly, ~7000-token) regeneration attempt — real
+// incident: Shameena, 919946345651, 26/7 — over a dozen forced attempts
+// within an hour, some just 5 seconds apart. This does not affect the
+// normal poller schedule (REPORT_RETRY_INTERVAL_MS) or the 30-minute
+// overdue sweep's own pacing — only how often a customer's own message can
+// force an out-of-schedule attempt.
+const REPORT_FORCE_RETRY_COOLDOWN_MS = 90 * 1000; // 90 seconds
+
 async function generateAndDeliverReport(session) {
   const phone = session.phone;
   const attemptNumber = (session.reportAttempts || 0) + 1;
   log(`generateAndDeliverReport: attempt ${attemptNumber}/${MAX_REPORT_ATTEMPTS} for`, phone);
+
+  // Stamp the moment this attempt started — used by the force-retry logic
+  // in handleTextMessage to throttle how often a customer message can
+  // trigger a brand new (costly) generation attempt. Set unconditionally,
+  // regardless of outcome, so even a failed attempt still resets the clock.
+  await db.updateSession(phone, { lastAttemptAt: new Date() });
 
   let report = null;
   try {
@@ -1376,6 +1394,27 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
     const overdue = paymentAgeMs > REPORT_FORCE_RETRY_AFTER_MS;
 
     if (fresh.reportStatus === "failed" || overdue) {
+      // Throttle: don't let a burst of customer messages ("ߑ", "Hlo", "??")
+      // each trigger their own full regeneration attempt seconds apart.
+      // See REPORT_FORCE_RETRY_COOLDOWN_MS above. This does NOT block the
+      // customer from getting a reply — they still get a status message —
+      // it only skips starting a brand new (costly) generation attempt if
+      // one was already kicked off very recently.
+      const sinceLastAttemptMs = fresh.lastAttemptAt
+        ? Date.now() - new Date(fresh.lastAttemptAt).getTime()
+        : Infinity;
+      if (sinceLastAttemptMs < REPORT_FORCE_RETRY_COOLDOWN_MS) {
+        log(
+          "awaiting_report force-retry SKIPPED for",
+          phone,
+          "-> a generation attempt already started",
+          Math.round(sinceLastAttemptMs / 1000),
+          "seconds ago (cooldown", REPORT_FORCE_RETRY_COOLDOWN_MS / 1000, "s) — replying with status only, not starting another."
+        );
+        await sendText(phone, withSupport(REPORT_STILL_PENDING_MESSAGE));
+        return;
+      }
+
       // Either formally exhausted, or simply taking too long regardless of
       // internal attempt bookkeeping — force an immediate fresh attempt
       // right now instead of waiting on the normal backoff/poller schedule.
@@ -1991,7 +2030,7 @@ app.get("/admin/failed-payments", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Paid but report generation gave up (${failed.length})</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat. Each of these already received a message telling them you'll follow up directly.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. 🎉</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. ߎ</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin failed-payments list failed (caught):", err.message);
@@ -2049,7 +2088,7 @@ app.get("/admin/scan-stuck-reports", async (req, res) => {
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
   <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Sessions marked "sent" that look like refusals (${suspects.length} of ${sentSessions.length} scanned)</div>
   <div style="padding:8px 16px;color:#888;font-size:13px;">These customers paid and their session shows report_status='sent', but the stored report text matches a refusal or degenerate-output pattern (or is simply too short to be a real report) — meaning they likely never got a real reading. Tap any row to open the full chat and confirm before refunding/regenerating. As of the 24/7 fix, sending this customer a new photo while they're in report_sent will now auto-retry on its own — see REPORT_CORRECTION_DETECTED_MESSAGE.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. 🎉</div>'}
+  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. ߎ</div>'}
 </body></html>`);
   } catch (err) {
     log("Admin scan-stuck-reports failed (caught):", err.message);
@@ -2168,7 +2207,7 @@ async function processWebhookBody(body) {
     db.logMessage(phone, "in", "[Contact card]", "contacts");
     await sendText(phone, "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
   } else if (message.type === "reaction") {
-    // Emoji reactions to a previous message (👍, ❤️ etc.) — not something
+    // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
     // that needs (or should get) a reply; replying here would be spammy.
     log("Reaction received from", phone, "-> acknowledging silently, no reply needed.");
     db.logMessage(phone, "in", "[Reaction]", "reaction");
