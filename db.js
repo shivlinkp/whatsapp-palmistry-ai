@@ -66,6 +66,17 @@ async function initDb() {
   // this never changes once set, so it's what we use to measure genuine
   // elapsed wait time for the 30-minute force-retry safety net.
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS payment_confirmed_at TIMESTAMPTZ;`);
+  // Tracks the moment the last actual generation attempt STARTED (poller's
+  // normal due-processing, poller's overdue sweep, or a manually forced
+  // retry from a customer message) — separate from updated_at, which gets
+  // bumped by unrelated writes like awaiting_report_inquiry_count. Used to
+  // throttle forced retries so a burst of customer messages ("ߑ", "Hlo",
+  // "??") can't each trigger their own full (costly) regeneration attempt
+  // seconds apart. Real incident: Shameena, 919946345651, 26/7 — over a
+  // dozen forced retries fired within an hour, several just 5 seconds
+  // apart, from consecutive short messages while she was frustrated and
+  // waiting.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;`);
 
   // Permanent conversation log — every inbound and outbound message, so
   // chats can be reviewed regardless of what Meta/WhatsApp allows and
@@ -115,6 +126,7 @@ function rowToSession(row) {
     awaitingReportInquiryCount: row.awaiting_report_inquiry_count,
     pendingSecondPerson: row.pending_second_person,
     paymentConfirmedAt: row.payment_confirmed_at,
+    lastAttemptAt: row.last_attempt_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -157,6 +169,7 @@ const FIELD_MAP = {
   awaitingReportInquiryCount: "awaiting_report_inquiry_count",
   pendingSecondPerson: "pending_second_person",
   paymentConfirmedAt: "payment_confirmed_at",
+  lastAttemptAt: "last_attempt_at",
 };
 
 // Updates only the given fields for a phone number's session, bumps
