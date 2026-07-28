@@ -1163,6 +1163,17 @@ const REPORT_RETRY_INTERVAL_MS = 3 * 60 * 1000; // how far to push report_due_at
 // resolution message ever sent.
 const REPORT_FORCE_RETRY_AFTER_MS = 30 * 60 * 1000; // 30 minutes
 
+// Absolute ceiling on auto-retrying a stuck session — past this point since
+// payment, the bot stops trying automatically (via the poller sweep AND via
+// customer messages) and just tells the customer to reach support. Without
+// this, an abandoned session got retried forever, every 30 minutes,
+// indefinitely — a real runaway retry loop that took gpt-4.1 request volume
+// from ~200/day to 7,333/day over three days (25-27/7). 3 hours is far more
+// than enough time for any genuine transient issue (rate limits, brief
+// outages) to resolve; a session still failing after that needs a human,
+// not another automatic attempt.
+const REPORT_FORCE_RETRY_HARD_CAP_MS = 3 * 60 * 60 * 1000; // 3 hours
+
 // Minimum time between forced-retry generation attempts triggered by a
 // customer message, regardless of how many messages they send in that
 // window. Without this, a frustrated customer firing off several short
@@ -1511,6 +1522,25 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
       ? Date.now() - new Date(fresh.paymentConfirmedAt).getTime()
       : 0;
     const overdue = paymentAgeMs > REPORT_FORCE_RETRY_AFTER_MS;
+    const pastHardCap = paymentAgeMs > REPORT_FORCE_RETRY_HARD_CAP_MS;
+
+    if (pastHardCap && (fresh.reportStatus === "failed" || overdue)) {
+      // Past the absolute ceiling — stop attempting automatically and point
+      // to support instead. See REPORT_FORCE_RETRY_HARD_CAP_MS above: this
+      // is what stops an abandoned-then-returned-to session from
+      // re-triggering another full 5-attempt cycle.
+      log(
+        "awaiting_report force-retry SKIPPED (past hard cap) for",
+        phone,
+        "-> payment age",
+        Math.round(paymentAgeMs / 60000),
+        "min exceeds",
+        REPORT_FORCE_RETRY_HARD_CAP_MS / 60000,
+        "min ceiling — pointing to support instead of retrying again."
+      );
+      await sendText(phone, REPORT_EXHAUSTED_MESSAGE);
+      return;
+    }
 
     if (fresh.reportStatus === "failed" || overdue) {
       // Throttle: don't let a burst of customer messages ("ߑ", "Hlo", "??")
@@ -1929,7 +1959,7 @@ async function pollDueReports() {
     // re-tries "attempt 1" forever without ever reaching report_status=
     // 'failed'). Real incident this defends against: Aswathy, 918921390826,
     // 24-25/7 — stuck over an hour with no exhausted message ever sent.
-    const overdueSessions = await db.findOverdueAwaitingReports(REPORT_FORCE_RETRY_AFTER_MS);
+    const overdueSessions = await db.findOverdueAwaitingReports(REPORT_FORCE_RETRY_AFTER_MS, REPORT_FORCE_RETRY_HARD_CAP_MS);
     for (const session of overdueSessions) {
       if (processedPhones.has(session.phone)) continue; // already handled above this tick
       log(
