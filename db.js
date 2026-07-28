@@ -243,14 +243,28 @@ async function findSentReports() {
 // this defends against: Aswathy, 918921390826, 24-25/7 — stuck over an
 // hour past payment with no exhausted message ever sent, because attempts
 // never appeared to progress past the first one.
-async function findOverdueAwaitingReports(thresholdMs) {
+//
+// hardCapMs is a SEPARATE, MUCH LARGER upper bound: sessions older than
+// this are EXCLUDED from the sweep entirely, even though they're still
+// "overdue" by the normal threshold. Without this, a customer who
+// abandons the chat after one failed cycle gets swept and retried FOREVER
+// — every 30 minutes, indefinitely, 5 real generation attempts each time,
+// with nobody ever there to receive the result. Real incident: gpt-4.1
+// request volume grew from ~200/day to 7,333/day over three days (25-27/7)
+// after this sweep was introduced — an uncapped runaway retry loop on
+// abandoned sessions, not real customer volume. Sessions past hardCapMs
+// are left as report_status='failed' permanently — a genuine, final
+// give-up state that requires manual follow-up (refund/support), which is
+// the correct outcome for someone who never came back anyway.
+async function findOverdueAwaitingReports(thresholdMs, hardCapMs) {
   const result = await pool.query(
     `SELECT * FROM sessions
      WHERE stage = 'awaiting_report'
        AND report_status != 'sent'
        AND payment_confirmed_at IS NOT NULL
-       AND payment_confirmed_at <= now() - ($1 || ' milliseconds')::interval`,
-    [thresholdMs]
+       AND payment_confirmed_at <= now() - ($1 || ' milliseconds')::interval
+       AND ($2::bigint IS NULL OR payment_confirmed_at > now() - ($2 || ' milliseconds')::interval)`,
+    [thresholdMs, hardCapMs || null]
   );
   return result.rows.map(rowToSession);
 }
