@@ -1172,7 +1172,23 @@ const REPORT_FORCE_RETRY_AFTER_MS = 30 * 60 * 1000; // 30 minutes
 // than enough time for any genuine transient issue (rate limits, brief
 // outages) to resolve; a session still failing after that needs a human,
 // not another automatic attempt.
-const REPORT_FORCE_RETRY_HARD_CAP_MS = 3 * 60 * 60 * 1000; // 3 hours
+const REPORT_FORCE_RETRY_HARD_CAP_MS = 3 * 60 * 60 * 1000; // 3 hours (applies to customer-triggered retries)
+
+// Separate, much tighter cap on the poller's OWN unprompted sweep — the
+// sweep should give an abandoned session exactly one extra automatic
+// chance beyond the normal 5-attempt cycle, not keep trying indefinitely
+// just because nobody told it to stop. A customer who actually comes back
+// later can still trigger a fresh retry themselves (bounded by
+// REPORT_FORCE_RETRY_HARD_CAP_MS above) — this cap only limits how long
+// the bot keeps trying on its own, unprompted.
+const SWEEP_AUTO_RETRY_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+// Minimum spacing between sweep-triggered attempts for the SAME session.
+// Critical fix: the poller runs every 60 seconds, and without this the
+// sweep re-attempted an overdue session on literally every tick — not
+// once per REPORT_FORCE_RETRY_AFTER_MS as intended. See
+// findOverdueAwaitingReports in db.js for the full incident writeup.
+const SWEEP_RETRY_PACING_MS = REPORT_FORCE_RETRY_AFTER_MS; // 30 minutes
 
 // Minimum time between forced-retry generation attempts triggered by a
 // customer message, regardless of how many messages they send in that
@@ -1959,7 +1975,11 @@ async function pollDueReports() {
     // re-tries "attempt 1" forever without ever reaching report_status=
     // 'failed'). Real incident this defends against: Aswathy, 918921390826,
     // 24-25/7 — stuck over an hour with no exhausted message ever sent.
-    const overdueSessions = await db.findOverdueAwaitingReports(REPORT_FORCE_RETRY_AFTER_MS, REPORT_FORCE_RETRY_HARD_CAP_MS);
+    const overdueSessions = await db.findOverdueAwaitingReports(
+      REPORT_FORCE_RETRY_AFTER_MS,
+      SWEEP_AUTO_RETRY_WINDOW_MS,
+      SWEEP_RETRY_PACING_MS
+    );
     for (const session of overdueSessions) {
       if (processedPhones.has(session.phone)) continue; // already handled above this tick
       log(
