@@ -247,24 +247,30 @@ async function findSentReports() {
 // hardCapMs is a SEPARATE, MUCH LARGER upper bound: sessions older than
 // this are EXCLUDED from the sweep entirely, even though they're still
 // "overdue" by the normal threshold. Without this, a customer who
-// abandons the chat after one failed cycle gets swept and retried FOREVER
-// — every 30 minutes, indefinitely, 5 real generation attempts each time,
-// with nobody ever there to receive the result. Real incident: gpt-4.1
-// request volume grew from ~200/day to 7,333/day over three days (25-27/7)
-// after this sweep was introduced — an uncapped runaway retry loop on
-// abandoned sessions, not real customer volume. Sessions past hardCapMs
-// are left as report_status='failed' permanently — a genuine, final
-// give-up state that requires manual follow-up (refund/support), which is
-// the correct outcome for someone who never came back anyway.
-async function findOverdueAwaitingReports(thresholdMs, hardCapMs) {
+// abandons the chat after one failed cycle gets swept and retried FOREVER.
+//
+// pacingMs is a CRITICAL third gate, added after discovering a severe bug:
+// the poller runs every 60 SECONDS, but this query previously had no idea
+// when a session was last actually attempted — only how old the payment
+// was. That meant once a session crossed the overdue threshold, it got
+// swept and fully re-attempted on EVERY 60-second poll tick, not once
+// per REPORT_FORCE_RETRY_AFTER_MS (30 min) as intended — up to ~150+
+// redundant full generation attempts over a 3-hour window for a single
+// abandoned session. pacingMs (using last_attempt_at, set at the start of
+// every real generation attempt) enforces genuine spacing between
+// sweep-triggered attempts. This — not just the missing hard cap — is
+// almost certainly the dominant cause behind gpt-4.1 request volume
+// growing from ~200/day to 7,333/day over 25-27/7.
+async function findOverdueAwaitingReports(thresholdMs, hardCapMs, pacingMs) {
   const result = await pool.query(
     `SELECT * FROM sessions
      WHERE stage = 'awaiting_report'
        AND report_status != 'sent'
        AND payment_confirmed_at IS NOT NULL
        AND payment_confirmed_at <= now() - ($1 || ' milliseconds')::interval
-       AND ($2::bigint IS NULL OR payment_confirmed_at > now() - ($2 || ' milliseconds')::interval)`,
-    [thresholdMs, hardCapMs || null]
+       AND ($2::bigint IS NULL OR payment_confirmed_at > now() - ($2 || ' milliseconds')::interval)
+       AND ($3::bigint IS NULL OR last_attempt_at IS NULL OR last_attempt_at <= now() - ($3 || ' milliseconds')::interval)`,
+    [thresholdMs, hardCapMs || null, pacingMs || null]
   );
   return result.rows.map(rowToSession);
 }
