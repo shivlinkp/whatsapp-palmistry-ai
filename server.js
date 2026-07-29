@@ -351,6 +351,21 @@ function isReportStatusQuery(text) {
   return /report|assessment|reading|എപ്പോൾ|kittum|kitum|ready|status|vannu|vanno/i.test(text);
 }
 
+// Matches messages that explicitly ask for a refund, in English or common
+// Malayalam/Manglish phrasing. Deliberately broad (substring match, not
+// whole-message) since refund requests come in many forms mid-sentence
+// ("please return the payment", "paisa thirichu tharu", etc.) — false
+// positives here just mean an extra flag on a session that's already
+// stuck, which is harmless, whereas missing a real one is the actual risk.
+// Real incident this addresses: Sangeetha, 919778743899, 29/7 — asked for
+// a refund twice, got a canned "we'll contact you" reply both times, with
+// no way to notice it was specifically a refund request until manually
+// reading the full chat transcript hours later.
+function isRefundRequest(text) {
+  if (!text) return false;
+  return /refund|return.*(payment|money|amount)|money\s*back|paisa.*(thirich|return)|തിരിച്ച്.*(തരൂ|തരാമോ|നൽകൂ)|റീഫണ്ട്/i.test(text);
+}
+
 // Matches short, low-content acknowledgment messages ("Ok", "K", "Okay",
 // "Alright", "ߑ" etc.) that genuinely don't need any reply — the customer
 // is just acknowledging the last message, not asking anything. Deliberately
@@ -1366,6 +1381,16 @@ async function handleTextMessage(phone, text, session) {
     JSON.stringify({ stage: session.stage, name: session.name, dob: session.dob, gender: session.gender })
   );
 
+  // Flag refund requests for visibility on /admin/refund-requests,
+  // regardless of stage — this doesn't change what reply the customer
+  // gets (that's decided normally, below), it just makes sure a refund
+  // ask is never invisible to a manual scan the way it was for Sangeetha,
+  // 919778743899, 29/7 (asked twice, no human response for hours).
+  if (isRefundRequest(text)) {
+    log("Refund request detected for", phone, "-> flagging on /admin/refund-requests. Message was:", text);
+    await db.updateSession(phone, { refundRequestedAt: new Date() });
+  }
+
   if (session.stage === "new") {
     session = await db.updateSession(phone, { stage: "collecting" });
     await sendText(phone, WELCOME_MESSAGE);
@@ -1552,6 +1577,31 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
       // to support instead. See REPORT_FORCE_RETRY_HARD_CAP_MS above: this
       // is what stops an abandoned-then-returned-to session from
       // re-triggering another full 5-attempt cycle.
+      //
+      // Throttled separately from the retry logic itself: without this,
+      // the exact same "we'll contact you directly" message got repeated
+      // verbatim to every single thing the customer sent, for hours — real
+      // incident: Sangeetha, 919778743899, 29/7, ~10 identical replies
+      // over 18+ hours, including to two explicit refund requests. Now
+      // this notice is sent at most once per HARD_CAP_NOTIFY_COOLDOWN_MS;
+      // anything in between gets silence rather than a hollow repeat of a
+      // promise nobody has acted on yet.
+      const sinceNotifiedMs = fresh.hardCapNotifiedAt
+        ? Date.now() - new Date(fresh.hardCapNotifiedAt).getTime()
+        : Infinity;
+      const HARD_CAP_NOTIFY_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+      if (sinceNotifiedMs < HARD_CAP_NOTIFY_COOLDOWN_MS) {
+        log(
+          "awaiting_report past-hard-cap message SKIPPED (already notified",
+          Math.round(sinceNotifiedMs / 60000),
+          "min ago) for",
+          phone,
+          "— staying silent instead of repeating the same notice again."
+        );
+        return;
+      }
+
       log(
         "awaiting_report force-retry SKIPPED (past hard cap) for",
         phone,
@@ -1562,6 +1612,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
         "min ceiling — pointing to support instead of retrying again."
       );
       await sendText(phone, REPORT_EXHAUSTED_MESSAGE);
+      await db.updateSession(phone, { hardCapNotifiedAt: new Date() });
       return;
     }
 
@@ -1880,6 +1931,32 @@ async function handleImageMessage(phone, mediaId, session) {
       }
       log("Additional palm photo received shortly after payment (", Math.round(paymentAgeMs / 1000), "s ago) for", phone, "— validated, treating as another angle, not resetting report schedule.");
       await sendText(phone, "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് ഉപയോഗിച്ച് റിപ്പോർട്ട് തയ്യാറാക്കും.");
+      return;
+    }
+
+    // CRITICAL: this path previously had NO cap at all — a customer could
+    // send corrected photos indefinitely, each one silently starting a
+    // brand new full 5-attempt generation cycle, completely bypassing
+    // REPORT_FORCE_RETRY_HARD_CAP_MS (which only guarded the text-message
+    // and poller-sweep retry paths). This was very likely a major source
+    // of renewed token usage on 29/7 — customers doing exactly what we
+    // told them to do (resend a corrected photo) kept getting full fresh
+    // retry cycles indefinitely, hours or even a full day after payment.
+    if (paymentAgeMs > REPORT_FORCE_RETRY_HARD_CAP_MS) {
+      // Still worth validating the photo — useful signal for manual
+      // follow-up (do they now have a genuine palm photo on file?) — but
+      // do NOT auto-start another generation cycle this long after payment.
+      const { accepted, reason } = await tryAcceptPalmPhoto(phone, mediaId);
+      log(
+        "Photo received well past hard cap (",
+        Math.round(paymentAgeMs / 60000),
+        "min since payment) for",
+        phone,
+        "-> validation:",
+        accepted ? "valid palm photo" : `rejected (${reason})`,
+        "— NOT auto-starting a new retry cycle. Needs manual /admin/force-report if you want to try again."
+      );
+      await sendText(phone, REPORT_EXHAUSTED_MESSAGE);
       return;
     }
 
@@ -2384,6 +2461,50 @@ app.get("/admin/failed-payments", async (req, res) => {
 </body></html>`);
   } catch (err) {
     log("Admin failed-payments list failed (caught):", err.message);
+    res.status(500).send("Failed to load: " + err.message);
+  }
+});
+
+// Admin: refund requests — GET /admin/refund-requests?key=resetmybot123
+// Lists every session where the customer explicitly asked for a refund
+// (detected by isRefundRequest() on any message, any stage), most-recent
+// first. Real incident this fixes: Sangeetha, 919778743899, 29/7 — asked
+// for a refund twice, got a canned "we'll contact you" reply both times,
+// and nobody noticed for hours because there was no way to see refund
+// asks separately from ordinary "where's my report" inquiries.
+app.get("/admin/refund-requests", async (req, res) => {
+  const { key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+
+  try {
+    const requests = await db.findRefundRequests();
+    const rows = requests
+      .map((s) => {
+        const time = new Date(s.refundRequestedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+        const name = escapeHtml(s.name || "(no name)");
+        return `<a href="/admin/chats/view?phone=${encodeURIComponent(s.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
+          <div style="padding:12px 16px;border-bottom:1px solid #333;">
+            <div style="display:flex;justify-content:space-between;">
+              <strong>${escapeHtml(s.phone)}</strong>
+              <span style="color:#888;font-size:12px;">refund asked: ${time}</span>
+            </div>
+            <div style="color:#aaa;font-size:14px;">${name} · payment_received: ${s.paymentReceived} · stage: ${escapeHtml(s.stage || "")}</div>
+          </div>
+        </a>`;
+      })
+      .join("");
+
+    res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Refund Requests</title></head>
+<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
+  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Customers who explicitly asked for a refund (${requests.length})</div>
+  <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat and confirm before processing. This list is separate from /admin/failed-payments since not every refund ask comes from a failed report.</div>
+  ${rows || '<div style="padding:16px;color:#888;">None right now. ߎ</div>'}
+</body></html>`);
+  } catch (err) {
+    log("Admin refund-requests list failed (caught):", err.message);
     res.status(500).send("Failed to load: " + err.message);
   }
 });
