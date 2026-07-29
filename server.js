@@ -1086,6 +1086,7 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
       const wc = content.trim().split(/\s+/).length;
       return {
         report: null,
+        rawContent: content,
         failureReason: `${model} output flagged as refusal/too short (${wc} words)`,
         model,
         cheapFailure: false, // a full completion was already paid for
@@ -1095,6 +1096,7 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
     if (isLikelyDegenerateRepetition(content)) {
       return {
         report: null,
+        rawContent: content,
         failureReason: `${model} output flagged as degenerate repetition`,
         model,
         cheapFailure: false, // ditto — real tokens were spent generating this
@@ -1126,6 +1128,10 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
     } else {
       outcome = {
         report: null,
+        // Keep whichever raw content exists (fallback's, since it ran
+        // last / is more likely to be the relevant one for a content-based
+        // failure) so diagnostic tools can still show something useful.
+        rawContent: fallbackOutcome.rawContent || outcome.rawContent,
         failureReason: `primary (${REPORT_MODEL_PRIMARY}): ${outcome.failureReason} | fallback (${REPORT_MODEL_FALLBACK}): ${fallbackOutcome.failureReason}`,
       };
     }
@@ -1135,6 +1141,7 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
 
   const report = outcome.report;
   const failureReason = outcome.failureReason;
+  const rawContent = outcome.rawContent || null;
 
   if (report) {
     // Reflects the exact model that actually produced this report —
@@ -1142,7 +1149,7 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
     console.log("REPORT GENERATED USING:", outcome.model);
   }
 
-  return { report, failureReason };
+  return { report, failureReason, rawContent };
 }
 
 // ---------------------------------------------------------------------------
@@ -2133,12 +2140,14 @@ app.get("/admin/preview-report", async (req, res) => {
       ? `✅ SUCCESS — this would have been accepted as a valid report (${outcome.report.trim().split(/\s+/).length} words).`
       : `❌ FAILED — reason: ${outcome.failureReason || "unknown"}`;
 
+    const displayText = outcome.report || outcome.rawContent || "(no content generated — likely a pure API error with no completion at all; see failure reason above)";
+
     res.status(200).send(`<!DOCTYPE html>
 <html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Preview: ${escapeHtml(phone)}</title></head>
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;padding:16px;white-space:pre-wrap;">
 <div style="font-size:16px;font-weight:bold;margin-bottom:12px;">${escapeHtml(statusLine)}</div>
 <div style="color:#888;font-size:12px;margin-bottom:16px;">Nothing was saved or sent to the customer — this is read-only.</div>
-<div style="border-top:1px solid #333;padding-top:12px;font-size:14px;line-height:1.6;">${escapeHtml(outcome.report || "(no content generated)")}</div>
+<div style="border-top:1px solid #333;padding-top:12px;font-size:14px;line-height:1.6;">${escapeHtml(displayText)}</div>
 </body></html>`);
   } catch (err) {
     log("Admin preview-report failed (caught):", err.message);
