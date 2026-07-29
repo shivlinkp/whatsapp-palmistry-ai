@@ -77,6 +77,17 @@ async function initDb() {
   // apart, from consecutive short messages while she was frustrated and
   // waiting.
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;`);
+  // Throttles the "we'll contact you directly" message once a session is
+  // past REPORT_FORCE_RETRY_HARD_CAP_MS — without this, that exact message
+  // got repeated verbatim to every single thing the customer sent, for
+  // hours, because nobody ever actually followed up. Real incident:
+  // Sangeetha, 919778743899, 29/7 — same message repeated ~10 times over
+  // 18+ hours, including to two explicit refund requests.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS hard_cap_notified_at TIMESTAMPTZ;`);
+  // Flags sessions where the customer explicitly asked for a refund, so
+  // they're visible on their own admin list instead of only being noticed
+  // by chance while reviewing an unrelated chat.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS refund_requested_at TIMESTAMPTZ;`);
 
   // Permanent conversation log — every inbound and outbound message, so
   // chats can be reviewed regardless of what Meta/WhatsApp allows and
@@ -127,6 +138,8 @@ function rowToSession(row) {
     pendingSecondPerson: row.pending_second_person,
     paymentConfirmedAt: row.payment_confirmed_at,
     lastAttemptAt: row.last_attempt_at,
+    hardCapNotifiedAt: row.hard_cap_notified_at,
+    refundRequestedAt: row.refund_requested_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -170,6 +183,8 @@ const FIELD_MAP = {
   pendingSecondPerson: "pending_second_person",
   paymentConfirmedAt: "payment_confirmed_at",
   lastAttemptAt: "last_attempt_at",
+  hardCapNotifiedAt: "hard_cap_notified_at",
+  refundRequestedAt: "refund_requested_at",
 };
 
 // Updates only the given fields for a phone number's session, bumps
@@ -275,6 +290,21 @@ async function findOverdueAwaitingReports(thresholdMs, hardCapMs, pacingMs) {
   return result.rows.map(rowToSession);
 }
 
+// Finds every session where the customer explicitly asked for a refund at
+// some point (refund_requested_at set), most-recent-first. Real incident
+// this fixes: Sangeetha, 919778743899, 29/7 — asked for a refund twice,
+// got a canned "we'll contact you" reply both times, and nobody noticed
+// for hours because there was no way to see refund requests separately
+// from ordinary "where's my report" inquiries.
+async function findRefundRequests() {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE refund_requested_at IS NOT NULL
+     ORDER BY refund_requested_at DESC`
+  );
+  return result.rows.map(rowToSession);
+}
+
 async function findFailedPayments() {
   const result = await pool.query(
     `SELECT * FROM sessions
@@ -333,6 +363,7 @@ module.exports = {
   findDueReports,
   findOverdueAwaitingReports,
   findFailedPayments,
+  findRefundRequests,
   findSentReports,
   logMessage,
   getMessagesForPhone,
