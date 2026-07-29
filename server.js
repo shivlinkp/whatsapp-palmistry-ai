@@ -1805,18 +1805,35 @@ async function handleImageMessage(phone, mediaId, session) {
   if (session.stage === "awaiting_photo") {
     if (session.palmMediaId) {
       // A valid photo was already accepted here (QR already sent for it) —
-      // a second photo arriving in this same stage is almost always just
-      // another angle of the same palm, not a fresh submission attempt.
-      // Save it as the one to use for the report (most recent is usually
-      // the clearest) without re-validating or re-sending the QR again.
-      // If the FIRST photo had instead been rejected as not-a-palm,
-      // palmMediaId would already be null at that point (see
-      // processReceivedPalmPhoto's rejection branch), so this only fires
-      // for genuine extra angles, not resend-after-rejection attempts.
+      // a second photo arriving in this same stage is USUALLY just another
+      // angle of the same palm — but validate before overwriting, in case
+      // it's actually something else entirely (a duplicate payment
+      // screenshot, an unrelated photo, etc.). Real incident this fixes:
+      // this exact class of bug — blindly overwriting palmMediaId with an
+      // unvalidated later photo — caused the report-generation model to
+      // correctly report it had been given a payment receipt instead of a
+      // palm photo. The model wasn't refusing; it was accurately
+      // describing bad input data.
+      const imageDataUrl = await getMediaBase64(mediaId);
+      const validation = await isPalmPhoto(imageDataUrl);
+      if (!validation.valid) {
+        log(
+          "Additional photo received while awaiting_photo for",
+          phone,
+          "failed palm validation (",
+          validation.reason,
+          ") — NOT overwriting the existing palm photo."
+        );
+        await sendText(
+          phone,
+          "ലഭിച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. നിങ്ങൾ നേരത്തെ അയച്ച കൈയുടെ ഫോട്ടോ ഉപയോഗിച്ച് തുടരും — ഇത് അവഗണിക്കാം, അല്ലെങ്കിൽ കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയക്കാം."
+        );
+        return;
+      }
       log(
         "Additional palm photo received while awaiting_photo (QR already sent) for",
         phone,
-        "— treating as another angle, not re-sending QR."
+        "— validated, treating as another angle, not re-sending QR."
       );
       await db.updateSession(phone, { palmMediaId: mediaId });
       await sendText(phone, "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.");
@@ -1833,25 +1850,40 @@ async function handleImageMessage(phone, mediaId, session) {
   }
 
   if (session.stage === "awaiting_report") {
-    // A photo sent very soon after payment is almost certainly just
-    // another angle of the same palm sent in the same burst (customers
-    // often send 2-3 angles for a richer reading) — NOT a "my report
-    // failed, here's a fixed photo" resend, which only makes sense once
-    // the customer has actually seen a failure or delay. Treating every
-    // such photo as a full correction was needlessly resetting the report
-    // schedule for customers who never had a problem in the first place.
+    // A photo sent very soon after payment is USUALLY just another angle
+    // of the same palm sent in the same burst — but validate before
+    // overwriting palmMediaId, for the same reason as above. This is the
+    // exact code path that caused Honey Samji's (917736266839, 29/7) real
+    // palm photo to be silently replaced by what the model then correctly
+    // identified as a payment receipt screenshot.
     const RECENT_PAYMENT_PHOTO_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
     const paymentAgeMs = session.paymentConfirmedAt
       ? Date.now() - new Date(session.paymentConfirmedAt).getTime()
       : Infinity;
 
     if (paymentAgeMs < RECENT_PAYMENT_PHOTO_WINDOW_MS) {
+      const imageDataUrl = await getMediaBase64(mediaId);
+      const validation = await isPalmPhoto(imageDataUrl);
+      if (!validation.valid) {
+        log(
+          "Additional photo received shortly after payment for",
+          phone,
+          "failed palm validation (",
+          validation.reason,
+          ") — NOT overwriting the existing palm photo, not touching report schedule."
+        );
+        await sendText(
+          phone,
+          "ലഭിച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. നിങ്ങൾ നേരത്തെ അയച്ച കൈയുടെ ഫോട്ടോ ഉപയോഗിച്ചാണ് റിപ്പോർട്ട് തയ്യാറാക്കുന്നത് — ഇത് അവഗണിക്കാം."
+        );
+        return;
+      }
       log(
         "Additional palm photo received shortly after payment (",
         Math.round(paymentAgeMs / 1000),
         "s ago) for",
         phone,
-        "— treating as another angle, not resetting report schedule."
+        "— validated, treating as another angle, not resetting report schedule."
       );
       await db.updateSession(phone, { palmMediaId: mediaId });
       await sendText(phone, "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് ഉപയോഗിച്ച് റിപ്പോർട്ട് തയ്യാറാക്കും.");
@@ -1862,9 +1894,25 @@ async function handleImageMessage(phone, mediaId, session) {
     // received, thanks" with NO session update at all — so if the report
     // failed because the original photo wasn't a valid palm, a corrected
     // photo sent afterward was silently ignored forever, and every retry
-    // kept re-using the original bad photo. Now: treat this as a genuine
-    // replacement and actually reschedule using the new photo.
-    log("New photo received while awaiting_report for", phone, "— treating as a corrected palm photo submission.");
+    // kept re-using the original bad photo. Now: validate, then treat this
+    // as a genuine replacement and actually reschedule using the new photo.
+    // Validation added for the same reason as above — an unvalidated
+    // "correction" could silently replace a good palm photo with garbage.
+    const correctionImageDataUrl = await getMediaBase64(mediaId);
+    const correctionValidation = await isPalmPhoto(correctionImageDataUrl);
+    if (!correctionValidation.valid) {
+      log(
+        "Corrected photo received while awaiting_report for",
+        phone,
+        "failed palm validation (",
+        correctionValidation.reason,
+        ") — NOT overwriting the existing palm photo, not resetting the retry cycle."
+      );
+      await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
+      return;
+    }
+
+    log("New photo received while awaiting_report for", phone, "— validated, treating as a corrected palm photo submission.");
     const retryDueAt = new Date(Date.now() + 2 * 60 * 1000);
     await db.updateSession(phone, {
       palmMediaId: mediaId,
