@@ -2059,6 +2059,93 @@ app.get("/admin/reset-session", async (req, res) => {
   }
 });
 
+// Admin: force an immediate generation attempt for one phone right now,
+// bypassing the normal poller schedule, the 90s cooldown, and the 30-min/
+// 3-hour overdue thresholds entirely — this IS the manual override, so
+// those pacing rules (which exist to stop the BOT retrying itself into a
+// runaway loop) don't apply to a deliberate one-off admin action. If it
+// succeeds, the report is saved and sent to the customer immediately. If
+// it fails, the real reason is shown right in the response — no need to
+// dig through chat/logs separately.
+// Usage: GET /admin/force-report?phone=917736266839&key=resetmybot123
+app.get("/admin/force-report", async (req, res) => {
+  const { phone, key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+  if (!phone) {
+    return res.status(400).send("Missing ?phone= (e.g. ?phone=917736266839&key=...)");
+  }
+
+  try {
+    const session = await db.getOrCreateSession(phone);
+    if (!session.palmMediaId) {
+      return res.status(400).send("No palm photo on file for this session — cannot generate a report.");
+    }
+
+    log("Admin force-report triggered for", phone);
+    const resetSession = await db.updateSession(phone, { reportAttempts: 0, reportStatus: "pending" });
+    const result = await generateAndDeliverReport(resetSession);
+
+    if (result.success) {
+      res.status(200).send(`✅ Report generated and sent to ${phone} (attempt ${result.attemptNumber}).`);
+    } else {
+      const fresh = await db.getOrCreateSession(phone);
+      res
+        .status(200)
+        .send(
+          `❌ Attempt failed.\n\nReason: ${fresh.reportError || "unknown"}\n\nExhausted: ${result.exhausted}\n\n` +
+            `You can reload this URL to try again — each reload is a fresh attempt, not subject to the normal cooldown.`
+        );
+    }
+  } catch (err) {
+    log("Admin force-report failed (caught):", err.message);
+    res.status(500).send("Force-report failed: " + err.message);
+  }
+});
+
+// Admin: SAFE diagnostic preview — runs the exact same generation pipeline
+// (same photo, same details, same prompt) as a real attempt, but does NOT
+// touch the session or send anything to the customer. Shows you the raw
+// model output (even if it's a refusal) directly in the browser, which is
+// exactly what was missing all week — every prior diagnosis needed manual
+// Railway log archaeology just to see what the model actually said.
+// Usage: GET /admin/preview-report?phone=917736266839&key=resetmybot123
+app.get("/admin/preview-report", async (req, res) => {
+  const { phone, key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+  if (!phone) {
+    return res.status(400).send("Missing ?phone= (e.g. ?phone=917736266839&key=...)");
+  }
+
+  try {
+    const session = await db.getOrCreateSession(phone);
+    if (!session.palmMediaId) {
+      return res.status(400).send("No palm photo on file for this session — cannot preview.");
+    }
+
+    log("Admin preview-report triggered for", phone, "(read-only — nothing will be saved or sent)");
+    const outcome = await generateReport(session);
+
+    const statusLine = outcome.report
+      ? `✅ SUCCESS — this would have been accepted as a valid report (${outcome.report.trim().split(/\s+/).length} words).`
+      : `❌ FAILED — reason: ${outcome.failureReason || "unknown"}`;
+
+    res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Preview: ${escapeHtml(phone)}</title></head>
+<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;padding:16px;white-space:pre-wrap;">
+<div style="font-size:16px;font-weight:bold;margin-bottom:12px;">${escapeHtml(statusLine)}</div>
+<div style="color:#888;font-size:12px;margin-bottom:16px;">Nothing was saved or sent to the customer — this is read-only.</div>
+<div style="border-top:1px solid #333;padding-top:12px;font-size:14px;line-height:1.6;">${escapeHtml(outcome.report || "(no content generated)")}</div>
+</body></html>`);
+  } catch (err) {
+    log("Admin preview-report failed (caught):", err.message);
+    res.status(500).send("Preview failed: " + err.message);
+  }
+});
+
 function escapeHtml(str) {
   return String(str || "")
     .replace(/&/g, "&amp;")
