@@ -1737,6 +1737,43 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
     } else {
       const wantsAnother = await wantsAnotherPersonReading(text);
       if (wantsAnother) {
+        // Check whether THIS message already contains extractable details
+        // before asking for them — otherwise a message like "Sabin mathew
+        // 25/02/1990 Male" (which itself satisfies wantsAnotherPersonReading
+        // as clearly starting a new order) gets asked to repeat the exact
+        // same information it just gave. Real incident: Jancy mol L,
+        // 917306344205, 8/7 — had to send her friend's details twice
+        // because the first submission triggered this same "please send
+        // details" prompt instead of being recognized as already complete.
+        const immediateDetails = await extractFields(text, {});
+        if (immediateDetails.name || immediateDetails.dob || immediateDetails.gender) {
+          log(
+            "Customer at",
+            phone,
+            "started a new-person order AND already included their details in the same message — skipping the redundant prompt, restarting collection flow directly (order #",
+            (session.orderCount || 1) + 1,
+            ")"
+          );
+          const reset = await db.updateSession(phone, {
+            stage: "collecting",
+            name: immediateDetails.name || null,
+            dob: immediateDetails.dob || null,
+            gender: immediateDetails.gender || null,
+            relation: immediateDetails.relation || null,
+            palmMediaId: null,
+            paymentReceived: false,
+            reportText: null,
+            reportStatus: "none",
+            reportDueAt: null,
+            reportAttempts: 0,
+            reportError: null,
+            orderCount: (session.orderCount || 1) + 1,
+            pendingSecondPerson: false,
+          });
+          await progressCollectingStage(phone, reset);
+          return;
+        }
+
         log(
           "Customer at",
           phone,
@@ -1767,6 +1804,8 @@ Customers write casually and in Manglish (Malayalam typed in English letters). R
 Always reply in Malayalam, even if the customer writes in English or explicitly asks for an English reply/summary — politely continue in Malayalam rather than switching languages, since the service and reading are Malayalam-only.
 
 Never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked directly. If children come up, speak only in general terms about family life or the number/timing of children in the future — never the sex of a specific unborn child.
+
+If the customer discloses something suggesting real personal distress or a genuine life crisis — an active divorce or separation, a death or serious illness in the family, mentions of self-harm, domestic conflict, addiction, or similar — shift out of the confident predictive style for that topic. Do not keep asserting definitive romantic/marriage/family outcomes ("വിവാഹം നടക്കും", specific dates, etc.) as if nothing has changed; acknowledge what they've shared in a brief, human way, keep any palm-based comments general and gentle rather than definitive, and avoid speculating about a specific new partner or relationship they mention in that context. This isn't about refusing to continue the reading — just about not compounding a real, difficult moment with confident predictions that could reinforce false hope or distress. Continue answering their other questions (career, health, family in general) normally.
 ${
   (session.orderCount || 1) > 1
     ? `\nIMPORTANT: this customer has ordered more than one reading in this chat (this is order #${
