@@ -866,24 +866,31 @@ async function handleVoiceMessage(phone, mediaId, session) {
 // was "just a payment receipt," that refusal was accepted as his report,
 // and he got stuck with no way back — refunded manually).
 //
-// Word count is now the PRIMARY check: it's a structural signal that
-// doesn't need to know the exact words a future refusal might use, unlike
-// keyword matching which we will always be one step behind on. The keyword
-// patterns remain as a SECONDARY, belt-and-suspenders check for the (very
-// unlikely) case of a padded/verbose refusal that somehow clears the
-// length bar.
-const MIN_REPORT_WORDS = 800; // well below the 2000-word real minimum, well above any refusal/apology message
-// Upper bound of the "grey zone" for the secondary keyword check. A report
-// that genuinely follows the system prompt's 2000-word instruction will
-// almost always be well past this — so once content clears it, we skip the
-// keyword check entirely rather than risk a false positive. Real incident
-// this fixes: Aswathy, 918921390826, 24-25/7 — all 5 of her attempts came
-// back HTTP 200 with genuine, well-formed report content (confirmed from
-// logs), but every one was discarded because the unconditional secondary
-// check flagged common Malayalam words (അല്ല = "is not", കൈരേഖ = "palm
-// line" — both guaranteed to appear in any real reading) as if they were
-// refusal language. She was charged 5x in API cost for reports that were
-// silently thrown away, then told the report generation had failed.
+// Word count is a SIGNAL, not a standalone verdict, at both ends of the
+// range — mirroring how the top end (REFUSAL_KEYWORD_CHECK_MAX_WORDS)
+// already works. It used to be a hard PRIMARY check on the low end too
+// (auto-reject anything under MIN_REPORT_WORDS, no keyword check at all),
+// which caused its own real incident: Sreekanth, 919847011965, 9-10/8 —
+// a genuine, on-topic 712-word reading was discarded purely for being
+// shorter than the 800-word floor, even though it contained no refusal
+// language whatsoever. gpt-4.1 does not reliably hit the system prompt's
+// 2000-word target on every attempt (temperature 0.8 plus normal per-palm
+// variation), so a hard length floor this high produces false positives
+// on real, paid-for reports. Fixed by lowering the only HARD floor to a
+// length no genuine report could plausibly fall under, and routing
+// everything else through the keyword check instead of skipping it.
+const MIN_REPORT_WORDS_HARD_FLOOR = 150; // no real report is ever this short; genuine refusal/apology messages are almost always well under this
+// Upper bound of the keyword-check range. A report that genuinely follows
+// the system prompt's 2000-word instruction will almost always be well
+// past this — so once content clears it, we skip the keyword check
+// entirely rather than risk a false positive. Real incident this fixes:
+// Aswathy, 918921390826, 24-25/7 — all 5 of her attempts came back HTTP
+// 200 with genuine, well-formed report content (confirmed from logs), but
+// every one was discarded because the unconditional secondary check
+// flagged common Malayalam words (അല്ല = "is not", കൈരേഖ = "palm line" —
+// both guaranteed to appear in any real reading) as if they were refusal
+// language. She was charged 5x in API cost for reports that were silently
+// thrown away, then told the report generation had failed.
 const REFUSAL_KEYWORD_CHECK_MAX_WORDS = 1500;
 
 function isLikelyRefusal(text) {
@@ -891,18 +898,20 @@ function isLikelyRefusal(text) {
   const trimmed = text.trim();
   const wordCount = trimmed.split(/\s+/).length;
 
-  // PRIMARY check — catches every refusal, current or future, regardless
-  // of how it's worded, since no refusal message will ever run 800+ words.
-  if (wordCount < MIN_REPORT_WORDS) return true;
+  // HARD floor — nothing this short could ever be a genuine report,
+  // regardless of content, so skip the keyword check and reject outright.
+  if (wordCount < MIN_REPORT_WORDS_HARD_FLOOR) return true;
 
-  // SECONDARY check — belt-and-suspenders ONLY for the grey zone (800-1500
-  // words): long enough to clear the primary bar, but short enough that a
-  // padded/verbose refusal could plausibly still be responsible. A report
-  // comfortably past 1500 words is for all practical purposes guaranteed to
-  // be genuine content, and subjecting it to fragile keyword matching only
-  // risks false positives on ordinary, extremely common Malayalam words.
+  // Comfortably past the keyword-check range: for all practical purposes
+  // guaranteed to be genuine content. Subjecting it to fragile keyword
+  // matching only risks false positives on ordinary, extremely common
+  // Malayalam words.
   if (wordCount > REFUSAL_KEYWORD_CHECK_MAX_WORDS) return false;
 
+  // Everything from MIN_REPORT_WORDS_HARD_FLOOR up to
+  // REFUSAL_KEYWORD_CHECK_MAX_WORDS — including short-but-genuine reports
+  // like Sreekanth's 712-word one — is decided by the keyword check below,
+  // not auto-rejected for length alone.
   const englishRefusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
   if (englishRefusalPatterns.test(trimmed)) return true;
 
@@ -2775,3 +2784,4 @@ async function start() {
 }
 
 start();
+
