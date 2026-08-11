@@ -214,10 +214,29 @@ async function sendLongText(to, text) {
 }
 
 // ---------------------------------------------------------------------------
-// Message content constants (Malayalam)
+// Message content constants — bilingual (Malayalam + English)
 // ---------------------------------------------------------------------------
 
-const WELCOME_MESSAGE = `Hi
+const SUPPORT_EMAIL = "contact@boldwordsmedia.com";
+// New WhatsApp helpline for issues (added 24/7/2026) — a customer stuck in
+// any error state now has a human escalation path, not just an email
+// address they may not check. Shown alongside the email everywhere the
+// email already appears, plus in the two new stuck-session recovery
+// messages below.
+const SUPPORT_WHATSAPP = "6360780748";
+const SUPPORT_EMAIL_INQUIRY_THRESHOLD = 3; // offer support email after this many messages while awaiting_report
+
+// All customer-facing copy lives here, one entry per supported language.
+// Every session has a `language` field ('ml' default, or 'en') that is
+// updated adaptively per incoming message (see detectLanguage() below) —
+// t(language, key, ...args) is how every send site looks up the right
+// string. Falls back to 'ml' for any unknown/missing language so behavior
+// for existing sessions is completely unchanged unless English is actually
+// detected.
+const T = {
+  ml: {
+    supportContactLine: `കൂടുതൽ സഹായത്തിന് ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ബന്ധപ്പെടാം, അല്ലെങ്കിൽ ${SUPPORT_WHATSAPP} എന്ന നമ്പറിൽ ഞങ്ങളുടെ WhatsApp helpline-ൽ മെസേജ് ചെയ്യാം.`,
+    welcome: `Hi
 
 ₹99 കൈരേഖാ വിശകലനത്തിൽ നിങ്ങൾക്ക് ലഭിക്കുന്നത്:
 
@@ -235,15 +254,13 @@ const WELCOME_MESSAGE = `Hi
 • ജനനത്തീയതി
 • Gender (ലിംഗം)
 
-ഫീസ്: ₹99 മാത്രം.`;
-
-const ASK_ALL_DETAILS_MESSAGE = `ദയവായി താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
+ഫീസ്: ₹99 മാത്രം.`,
+    askAllDetails: `ദയവായി താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
 
 • പേര്
 • ജനനത്തീയതി
-• Gender (ലിംഗം)`;
-
-const ASK_SECOND_PERSON_DETAILS_MESSAGE = `തീർച്ചയായും, ഇതേ ചാറ്റിൽ തന്നെ അടുത്ത വ്യക്തിയുടെ കൈരേഖാ വിശകലനം ആരംഭിക്കാം.
+• Gender (ലിംഗം)`,
+    askSecondPersonDetails: `തീർച്ചയായും, ഇതേ ചാറ്റിൽ തന്നെ അടുത്ത വ്യക്തിയുടെ കൈരേഖാ വിശകലനം ആരംഭിക്കാം.
 
 ദയവായി ആ വ്യക്തിയുടെ താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
 
@@ -253,11 +270,10 @@ const ASK_SECOND_PERSON_DETAILS_MESSAGE = `തീർച്ചയായും, �
 
 (ഇഷ്ടമെങ്കിൽ, ഈ വ്യക്തി നിങ്ങളുമായി എങ്ങനെ ബന്ധപ്പെട്ടിരിക്കുന്നു എന്നും പറയാം — നിർബന്ധമില്ല.)
 
-ഫീസ്: ₹99 മാത്രം.`;
-
-function handRequestMessage(name, gender) {
-  const hand = gender === "female" ? "ഇടത്" : "വലത്";
-  return `നന്ദി ${name}.
+ഫീസ്: ₹99 മാത്രം.`,
+    handRequest: (name, gender) => {
+      const hand = gender === "female" ? "ഇടത്" : "വലത്";
+      return `നന്ദി ${name}.
 
 ഇപ്പോൾ ദയവായി നിങ്ങളുടെ ${hand} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?
 
@@ -265,55 +281,286 @@ function handRequestMessage(name, gender) {
 - കൈ മുഴുവനും വ്യക്തമായി കാണണം
 - നല്ല വെളിച്ചത്തിൽ എടുക്കണം
 - കൈരേഖകൾ blur ആകരുത്`;
-}
-
-const PHOTO_RECEIVED_PAYMENT_MESSAGE = `ഫോട്ടോ ലഭിച്ചു. നന്ദി.
+    },
+    photoReceivedPayment: `ഫോട്ടോ ലഭിച്ചു. നന്ദി.
 
 താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്യുക.
 
-Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`;
-
-const SUPPORT_EMAIL = "contact@boldwordsmedia.com";
-// New WhatsApp helpline for issues (added 24/7/2026) — a customer stuck in
-// any error state now has a human escalation path, not just an email
-// address they may not check. Shown alongside the email everywhere the
-// email already appears, plus in the two new stuck-session recovery
-// messages below.
-const SUPPORT_WHATSAPP = "6360780748";
-const SUPPORT_CONTACT_LINE = `കൂടുതൽ സഹായത്തിന് ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ബന്ധപ്പെടാം, അല്ലെങ്കിൽ ${SUPPORT_WHATSAPP} എന്ന നമ്പറിൽ ഞങ്ങളുടെ WhatsApp helpline-ൽ മെസേജ് ചെയ്യാം.`;
-const SUPPORT_EMAIL_INQUIRY_THRESHOLD = 3; // offer support email after this many messages while awaiting_report
-
-const QR_FAILURE_MESSAGE =
-  `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${SUPPORT_CONTACT_LINE}`;
-
-function paymentReceivedMessage(name, isRepeatOrder) {
-  const timingLine = isRepeatOrder
-    ? "Report ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും."
-    : "Report ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
-  return `Payment screenshot ലഭിച്ചു. നന്ദി ${name}.
+Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`,
+    qrFailure(language) {
+      return `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${T.ml.supportContactLine}`;
+    },
+    paymentReceived: (name, isRepeatOrder) => {
+      const timingLine = isRepeatOrder
+        ? "Report ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും."
+        : "Report ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
+      return `Payment screenshot ലഭിച്ചു. നന്ദി ${name}.
 
 നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
 
 ${timingLine}`;
+    },
+    reportPreparing:
+      "നിങ്ങളുടെ റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ അല്പം സമയമെടുക്കുന്നു. ദയവായി അല്പസമയം കൂടി കാത്തിരിക്കൂ, ഞങ്ങൾ ഉടൻ അയയ്ക്കും.",
+    get reportExhausted() {
+      return `ക്ഷമിക്കണം, റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ കൂടുതൽ സമയമെടുക്കുന്നു. ഞങ്ങൾ ഉടൻ തന്നെ നേരിട്ട് നിങ്ങളെ ബന്ധപ്പെടും. ആവശ്യമെങ്കിൽ ${T.ml.supportContactLine}`;
+    },
+    reportStillPending: "നിങ്ങളുടെ റിപ്പോർട്ട് ഇപ്പോഴും തയ്യാറാക്കുകയാണ്. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.",
+    reportRetrying: "ഒരു നിമിഷം, റിപ്പോർട്ട് വീണ്ടും തയ്യാറാക്കാൻ ശ്രമിക്കുന്നു...",
+    get reportCorrectionDetected() {
+      return `ക്ഷമിക്കണം, മുൻപ് ലഭിച്ച റിപ്പോർട്ട് ശരിയായി തയ്യാറാക്കപ്പെട്ടിരുന്നില്ല എന്ന് ഞങ്ങൾ കണ്ടെത്തി. നിങ്ങളുടെ ₹99 payment നഷ്ടപ്പെട്ടിട്ടില്ല — അയച്ച ഫോട്ടോ ഉപയോഗിച്ച് ഇപ്പോൾ വീണ്ടും ശരിയായ റിപ്പോർട്ട് തയ്യാറാക്കുന്നു, ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ലഭിക്കും. ബുദ്ധിമുട്ടിന് ക്ഷമ ചോദിക്കുന്നു. ${T.ml.supportContactLine}`;
+    },
+    notAPalm: (gender) =>
+      `ക്ഷമിക്കണം, അയച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. ദയവായി നിങ്ങളുടെ ${
+        gender === "female" ? "ഇടത്" : "വലത്"
+      } കൈയുടെ താളത്തിൽ നിന്ന്, നല്ല വെളിച്ചത്തിൽ എടുത്ത വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയച്ചുതരാമോ?`,
+    photoReplaced: "പുതിയ ഫോട്ടോ ലഭിച്ചു, നന്ദി. ഇത് ഉപയോഗിച്ച് നിങ്ങളുടെ കൈരേഖാ വിശകലനം വീണ്ടും തയ്യാറാക്കുന്നു. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.",
+    voiceTranscriptionFailed: "ക്ഷമിക്കണം, നിങ്ങളുടെ ശബ്ദ സന്ദേശം മനസ്സിലാക്കാൻ കഴിഞ്ഞില്ല. ദയവായി വീണ്ടും ശബ്ദ സന്ദേശം അയക്കാമോ?",
+    resetConfirm: "സെഷൻ റീസെറ്റ് ചെയ്തു. വീണ്ടും തുടങ്ങാൻ 'Hi' എന്ന് അയക്കൂ.",
+    missingFieldsPrompt: (missingList) => `നന്ദി! ദയവായി ${missingList} കൂടി അയച്ചുതരാമോ?`,
+    thanksName: (name) => `നന്ദി ${name}.`,
+    genericPhotoAck: "ഫോട്ടോ ലഭിച്ചു, നന്ദി.",
+    photoStashedAskDetails: "ASK_ALL_DETAILS_PLACEHOLDER",
+    followUpFailed: "ക്ഷമിക്കണം, ഒരു നിമിഷം ശ്രമിക്കാമോ? ചെറിയൊരു തടസ്സം ഉണ്ടായി.",
+    videoNotPhoto: "വീഡിയോ അല്ല, ദയവായി കൈയുടെ ഒരു ഫോട്ടോ (still image) അയച്ചുതരാമോ?",
+    stickerAck: "നന്ദി! തുടരാൻ ദയവായി ഒരു text സന്ദേശമോ ഫോട്ടോയോ അയച്ചുതരാമോ?",
+    locationAck: "നന്ദി! ലൊക്കേഷൻ ഇവിടെ ആവശ്യമില്ല. തുടരാൻ ദയവായി പേര്/ഫോട്ടോ പോലുള്ള വിവരങ്ങൾ text ആയോ photo ആയോ അയച്ചുതരാമോ?",
+    contactAck: "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?",
+    unrecognizedFallback: "ദയവായി text ആയോ photo ആയോ അയക്കൂ.",
+    fieldName: "പേര്",
+    fieldDob: "ജനനത്തീയതി",
+    fieldGender: "Gender (ലിംഗം)",
+    faqPaymentNumber:
+      "ഇത് ഒരു കമ്പനി അക്കൗണ്ട് ആണ്; വ്യക്തിഗത payment നമ്പർ ഇല്ല. മുകളിൽ നൽകിയിരിക്കുന്ന QR Code സ്കാൻ ചെയ്ത്, ഏത് UPI ആപ്പ് ഉപയോഗിച്ചും (Google Pay, PhonePe, Paytm etc.) ₹99 payment ചെയ്യാം. Payment കഴിഞ്ഞാൽ screenshot ഇവിടെ അയച്ചാൽ മതി.",
+    faqHowMuch: "ഫീസ് ₹99 മാത്രം.",
+    faqHowLong: "Payment screenshot അയച്ചതിന് ശേഷം ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ report ലഭിക്കും.",
+    faqWhatGet: "നിങ്ങളുടെ സ്വഭാവം, ബന്ധങ്ങൾ, വിവാഹം, കരിയർ, സാമ്പത്തികം, ഭാവി എന്നിവയെക്കുറിച്ചുള്ള വിശദമായ കൈരേഖാ വിശകലനം ലഭിക്കും.",
+    paymentReminderShort: "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.",
+    askForHandPhotoAgain: (gender) =>
+      `ദയവായി നിങ്ങളുടെ ${gender === "female" ? "ഇടത്" : "വലത്"} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?`,
+    askTransactionId: "സ്ക്രീൻഷോട്ട് അയക്കാൻ കഴിയുന്നില്ലെങ്കിൽ കുഴപ്പമില്ല. Payment ചെയ്ത transaction ID ഇവിടെ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ മതി.",
+    extraPhotoRejectedAwaitingPhoto:
+      "ലഭിച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. നിങ്ങൾ നേരത്തെ അയച്ച കൈയുടെ ഫോട്ടോ ഉപയോഗിച്ച് തുടരും — ഇത് അവഗണിക്കാം, അല്ലെങ്കിൽ കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയക്കാം.",
+    extraPhotoAcceptedAwaitingPhoto: "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.",
+    extraPhotoRejectedAfterPayment:
+      "ലഭിച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. നിങ്ങൾ നേരത്തെ അയച്ച കൈയുടെ ഫോട്ടോ ഉപയോഗിച്ചാണ് റിപ്പോർട്ട് തയ്യാറാക്കുന്നത് — ഇത് അവഗണിക്കാം.",
+    extraPhotoAcceptedAfterPayment: "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് ഉപയോഗിച്ച് റിപ്പോർട്ട് തയ്യാറാക്കും.",
+    languageName: "Malayalam",
+    addressGuidance: "Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ, or similar.",
+  },
+  en: {
+    supportContactLine: `For further help you can reach us at ${SUPPORT_EMAIL}, or message our WhatsApp helpline at ${SUPPORT_WHATSAPP}.`,
+    welcome: `Hi
+
+With the ₹99 palm reading, you'll get insights into:
+
+- Your nature and personality
+- Love and relationships
+- Marriage prospects and family life
+- Job, career, and business prospects
+- Financial growth and money indications
+- Major upcoming opportunities and challenges
+- Special signs found in your palm
+
+Could you please send me the following details together?
+
+• Name
+• Date of birth
+• Gender
+
+Fee: just ₹99.`,
+    askAllDetails: `Could you please send me the following details together?
+
+• Name
+• Date of birth
+• Gender`,
+    askSecondPersonDetails: `Sure, let's start the next person's palm reading right here in this same chat.
+
+Could you please send that person's following details together?
+
+• Name
+• Date of birth
+• Gender
+
+(If you'd like, you can also mention how this person is related to you — not required.)
+
+Fee: just ₹99.`,
+    handRequest: (name, gender) => {
+      const hand = gender === "female" ? "left" : "right";
+      return `Thank you, ${name}.
+
+Now could you please send a clear photo of your ${hand} hand?
+
+When taking the photo:
+- Make sure the whole hand is clearly visible
+- Take it in good lighting
+- Make sure the palm lines aren't blurry`;
+    },
+    photoReceivedPayment: `Got the photo. Thank you.
+
+Please pay ₹99 using the QR code above.
+
+Once you've paid, just send the payment screenshot here.`,
+    qrFailure(language) {
+      return `There was a small issue sending the QR code. Please try again in a little while. If the issue continues, ${T.en.supportContactLine}`;
+    },
+    paymentReceived: (name, isRepeatOrder) => {
+      const timingLine = isRepeatOrder
+        ? "Your report will be ready here in about 30 minutes."
+        : "Your report will be ready here in about 25-30 minutes.";
+      return `Got your payment screenshot. Thank you, ${name}.
+
+We're preparing your palm reading.
+
+${timingLine}`;
+    },
+    reportPreparing: "Your report is taking a little extra time to prepare. Please wait just a bit longer — we'll send it soon.",
+    get reportExhausted() {
+      return `Sorry, your report is taking longer than expected. We'll reach out to you directly very soon. If needed, ${T.en.supportContactLine}`;
+    },
+    reportStillPending: "Your report is still being prepared. It'll be ready here shortly.",
+    reportRetrying: "One moment, trying to prepare your report again...",
+    get reportCorrectionDetected() {
+      return `Sorry, we found that your earlier report wasn't generated correctly. Your ₹99 payment hasn't been lost — we're now preparing a proper report using the photo you sent, which should be ready in about 25-30 minutes. Apologies for the inconvenience. ${T.en.supportContactLine}`;
+    },
+    notAPalm: (gender) =>
+      `Sorry, we can't clearly see a palm in the photo you sent. Could you please send a clear photo of your ${
+        gender === "female" ? "left" : "right"
+      } hand, taken in good lighting?`,
+    photoReplaced: "Got the new photo, thank you. We're preparing your palm reading again using this one. It'll be ready here shortly.",
+    voiceTranscriptionFailed: "Sorry, we couldn't understand your voice message. Could you please send it again?",
+    resetConfirm: "Session reset. Send 'Hi' to start again.",
+    missingFieldsPrompt: (missingList) => `Thanks! Could you please also send ${missingList}?`,
+    thanksName: (name) => `Thank you, ${name}.`,
+    genericPhotoAck: "Got the photo, thank you.",
+    photoStashedAskDetails: "ASK_ALL_DETAILS_PLACEHOLDER",
+    followUpFailed: "Sorry, could you try again in a moment? There was a small hiccup.",
+    videoNotPhoto: "That's a video, not a photo — could you please send a still photo of your hand instead?",
+    stickerAck: "Thanks! To continue, could you please send a text message or a photo?",
+    locationAck: "Thanks! We don't need a location here. To continue, could you please send details like your name/photo as text or a photo?",
+    contactAck: "Thanks! We don't need a contact card here. Could you please continue with text or a photo?",
+    unrecognizedFallback: "Please send text or a photo.",
+    fieldName: "Name",
+    fieldDob: "Date of birth",
+    fieldGender: "Gender",
+    faqPaymentNumber:
+      "This is a company account — there's no personal payment number. Please scan the QR code above and pay ₹99 using any UPI app (Google Pay, PhonePe, Paytm, etc). Once paid, just send the screenshot here.",
+    faqHowMuch: "The fee is just ₹99.",
+    faqHowLong: "You'll get your report about 25-30 minutes after sending the payment screenshot.",
+    faqWhatGet: "You'll get a detailed palm reading covering your personality, relationships, marriage, career, finances, and future.",
+    paymentReminderShort: "Once you've paid, just send the screenshot here.",
+    askForHandPhotoAgain: (gender) =>
+      `Could you please send a clear photo of your ${gender === "female" ? "left" : "right"} hand?`,
+    askTransactionId: "No problem if you can't send a screenshot. Just type and send the transaction ID for the payment here.",
+    extraPhotoRejectedAwaitingPhoto:
+      "We can't clearly see a palm in that photo. We'll continue using the hand photo you sent earlier — you can ignore this, or send a clear photo of your hand again.",
+    extraPhotoAcceptedAwaitingPhoto: "Got the extra photo, thank you! It's saved.",
+    extraPhotoRejectedAfterPayment:
+      "We can't clearly see a palm in that photo. Your report is being prepared using the hand photo you sent earlier — you can ignore this.",
+    extraPhotoAcceptedAfterPayment: "Got the extra photo, thank you! Your report will be prepared using this.",
+    languageName: "English",
+    addressGuidance: "Keep the tone warm but respectful and professional — avoid overly casual address terms like 'bro', 'dude', 'buddy', 'sis', or excessive slang.",
+  },
+};
+// Fix up the photoStashedAskDetails placeholder now that askAllDetails exists
+// on the same object (can't self-reference during literal construction).
+T.ml.photoStashedAskDetails = "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + T.ml.askAllDetails;
+T.en.photoStashedAskDetails = "Got the photo, thank you! It's saved.\n\n" + T.en.askAllDetails;
+
+// Looks up a translated string/function for the given language, always
+// falling back to Malayalam if the language is unknown or the key is
+// missing — this keeps every existing (pre-English) code path behaving
+// identically by default.
+function t(language, key, ...args) {
+  const lang = T[language] ? language : "ml";
+  const entry = T[lang][key];
+  const value = typeof entry === "function" ? entry(...args) : entry;
+  return value ?? (typeof T.ml[key] === "function" ? T.ml[key](...args) : T.ml[key]);
 }
 
-const REPORT_PREPARING_MESSAGE =
-  "നിങ്ങളുടെ റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ അല്പം സമയമെടുക്കുന്നു. ദയവായി അല്പസമയം കൂടി കാത്തിരിക്കൂ, ഞങ്ങൾ ഉടൻ അയയ്ക്കും.";
+// ---------------------------------------------------------------------------
+// Language detection — adaptive per message. Malayalam script is detected
+// instantly and for free via Unicode range (covers the vast majority of
+// existing traffic with zero added latency/cost). Anything without
+// Malayalam script could be genuine English OR Manglish (Malayalam typed in
+// Roman letters, which the bot has always handled as Malayalam) — those two
+// look identical to a regex, so a cheap classifier call distinguishes them.
+// Defaults to 'ml' on any ambiguity or failure, preserving existing
+// behavior for anyone not clearly writing in English.
+// ---------------------------------------------------------------------------
 
-const REPORT_EXHAUSTED_MESSAGE =
-  `ക്ഷമിക്കണം, റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ കൂടുതൽ സമയമെടുക്കുന്നു. ഞങ്ങൾ ഉടൻ തന്നെ നേരിട്ട് നിങ്ങളെ ബന്ധപ്പെടും. ആവശ്യമെങ്കിൽ ${SUPPORT_CONTACT_LINE}`;
+const MALAYALAM_SCRIPT_RE = /[\u0D00-\u0D7F]/;
 
-const REPORT_STILL_PENDING_MESSAGE =
-  "നിങ്ങളുടെ റിപ്പോർട്ട് ഇപ്പോഴും തയ്യാറാക്കുകയാണ്. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
+async function detectLanguage(text, currentLanguage) {
+  if (!text || !text.trim()) return currentLanguage || "ml";
+  if (MALAYALAM_SCRIPT_RE.test(text)) return "ml";
 
-const REPORT_RETRYING_MESSAGE = "ഒരു നിമിഷം, റിപ്പോർട്ട് വീണ്ടും തയ്യാറാക്കാൻ ശ്രമിക്കുന്നു...";
+  if (!OPENAI_API_KEY) return currentLanguage || "ml";
 
-// Sent when we auto-detect that a previously "sent" report was actually a
-// refusal/garbage output (see isLikelyRefusal / isLikelyDegenerateRepetition
-// checks reused below) and a corrected photo has just re-triggered a retry.
-// Distinct from PHOTO_REPLACED_MESSAGE so the customer understands this was
-// on our end, not something wrong with their photo.
-const REPORT_CORRECTION_DETECTED_MESSAGE = `ക്ഷമിക്കണം, മുൻപ് ലഭിച്ച റിപ്പോർട്ട് ശരിയായി തയ്യാറാക്കപ്പെട്ടിരുന്നില്ല എന്ന് ഞങ്ങൾ കണ്ടെത്തി. നിങ്ങളുടെ ₹99 payment നഷ്ടപ്പെട്ടിട്ടില്ല — അയച്ച ഫോട്ടോ ഉപയോഗിച്ച് ഇപ്പോൾ വീണ്ടും ശരിയായ റിപ്പോർട്ട് തയ്യാറാക്കുന്നു, ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ലഭിക്കും. ബുദ്ധിമുട്ടിന് ക്ഷമ ചോദിക്കുന്നു. ${SUPPORT_CONTACT_LINE}`;
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: `A WhatsApp customer wrote the message below, in Roman/Latin script (no Malayalam script characters). Determine whether it is genuine English, OR Manglish (Malayalam words spelled out phonetically in English letters, e.g. "eppo kittum", "entha vila", "pattilla", "vanno" — these are Malayalam, not English, even though written in English letters).
+
+Reply with ONLY one word: ENGLISH or MANGLISH. If genuinely unsure or the message is just a name/number/emoji with no clear language signal, reply MANGLISH (safer default — this bot's customers are overwhelmingly Malayalam speakers).
+
+Message: """${text}"""`,
+          },
+        ],
+        max_completion_tokens: 5,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      log("detectLanguage check FAILED:", JSON.stringify(data));
+      return currentLanguage || "ml";
+    }
+    const answer = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
+    log("detectLanguage classification for non-Malayalam-script text ->", answer);
+    return answer.startsWith("ENGLISH") ? "en" : "ml";
+  } catch (err) {
+    log("detectLanguage crashed (caught):", err.message);
+    return currentLanguage || "ml";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// First-contact language selection — deterministic, no GPT call. Sent once,
+// on a brand-new session's very first message, before anything else. Kept
+// intentionally short and equally readable in both scripts so it works for
+// customers who can't read Malayalam at all, not just as a courtesy to
+// English speakers.
+// ---------------------------------------------------------------------------
+
+const LANGUAGE_PICKER_MESSAGE = `Hi! Please choose your language / ദയവായി ഭാഷ തിരഞ്ഞെടുക്കുക:
+
+1️⃣ English
+2️⃣ മലയാളം (Malayalam)`;
+
+// Matches a reply to LANGUAGE_PICKER_MESSAGE. Deliberately simple and
+// deterministic (digit, keyword, or script match) rather than a GPT call —
+// this is the one decision that must never be ambiguous, since it's what
+// the adaptive per-message detection above was too unreliable for. Returns
+// 'en'/'ml' on a clear match, or null if the reply doesn't look like a
+// language choice at all (caller re-sends the picker rather than guessing).
+function matchLanguageChoice(text) {
+  if (!text) return null;
+  const trimmed = text.trim();
+  if (MALAYALAM_SCRIPT_RE.test(trimmed)) return "ml"; // typed in Malayalam script is itself a clear choice
+  const lower = trimmed.toLowerCase();
+  if (/^1\b/.test(lower) || /\benglish\b/.test(lower) || /\beng\b/.test(lower)) return "en";
+  if (/^2\b/.test(lower) || /\bmalayalam\b/.test(lower) || /\bmalayalee\b/.test(lower) || /\bmal\b/.test(lower)) return "ml";
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // FAQ handling (keyword based, no GPT call — keeps pre-payment flow cheap/fast)
@@ -329,19 +576,22 @@ function cannotSendScreenshotIntent(text) {
   return mentionsScreenshot && inability;
 }
 
-function matchFaq(text) {
-  const t = text.toLowerCase();
+// FAQ intent patterns are language-agnostic (they already match English AND
+// Manglish keywords, since customers of either language type these same
+// keywords) — only the reply text depends on `language`.
+const FAQ_PATTERNS = {
+  asksForNumber: /(phone number|mobile number|upi number|payment number|account number|your number|number tharo|number parayo|number koodukumo|number tharuo)/i,
+  howMuch: /(how much|price|cost|fee|rate|entha vila|entra vila|₹)/i,
+  howLong: /(how long|when.*report|time.*report|eppo kittum|how many min)/i,
+  whatGet: /(what.*get|enthanu kittu|entha kittunnath|what do i|what will i)/i,
+};
 
-  const whatGet = /(what.*get|enthanu kittu|entha kittunnath|what do i|what will i)/i;
-  const howMuch = /(how much|price|cost|fee|rate|entha vila|entra vila|₹)/i;
-  const howLong = /(how long|when.*report|time.*report|eppo kittum|how many min)/i;
-  const asksForNumber = /(phone number|mobile number|upi number|payment number|account number|your number|number tharo|number parayo|number koodukumo|number tharuo)/i;
-
-  if (asksForNumber.test(t))
-    return "ഇത് ഒരു കമ്പനി അക്കൗണ്ട് ആണ്; വ്യക്തിഗത payment നമ്പർ ഇല്ല. മുകളിൽ നൽകിയിരിക്കുന്ന QR Code സ്കാൻ ചെയ്ത്, ഏത് UPI ആപ്പ് ഉപയോഗിച്ചും (Google Pay, PhonePe, Paytm etc.) ₹99 payment ചെയ്യാം. Payment കഴിഞ്ഞാൽ screenshot ഇവിടെ അയച്ചാൽ മതി.";
-  if (howMuch.test(t)) return "ഫീസ് ₹99 മാത്രം.";
-  if (howLong.test(t)) return "Payment screenshot അയച്ചതിന് ശേഷം ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ report ലഭിക്കും.";
-  if (whatGet.test(t)) return "നിങ്ങളുടെ സ്വഭാവം, ബന്ധങ്ങൾ, വിവാഹം, കരിയർ, സാമ്പത്തികം, ഭാവി എന്നിവയെക്കുറിച്ചുള്ള വിശദമായ കൈരേഖാ വിശകലനം ലഭിക്കും.";
+function matchFaq(text, language) {
+  const lower = text.toLowerCase();
+  if (FAQ_PATTERNS.asksForNumber.test(lower)) return t(language, "faqPaymentNumber");
+  if (FAQ_PATTERNS.howMuch.test(lower)) return t(language, "faqHowMuch");
+  if (FAQ_PATTERNS.howLong.test(lower)) return t(language, "faqHowLong");
+  if (FAQ_PATTERNS.whatGet.test(lower)) return t(language, "faqWhatGet");
   return null;
 }
 
@@ -830,25 +1080,24 @@ async function transcribeVoiceMessage(buffer, mimeType) {
   }
 }
 
-const VOICE_TRANSCRIPTION_FAILED_MESSAGE =
-  "ക്ഷമിക്കണം, നിങ്ങളുടെ ശബ്ദ സന്ദേശം മനസ്സിലാക്കാൻ കഴിഞ്ഞില്ല. ദയവായി വീണ്ടും ശബ്ദ സന്ദേശം അയക്കാമോ?";
-
 // Handles an incoming voice message end-to-end: download -> transcribe ->
 // hand off to the EXACT SAME handleTextMessage() used for typed text, so
 // every downstream stage (detail collection, FAQs, follow-up Q&A, etc.)
 // behaves identically regardless of whether the customer typed or spoke.
+// Language can't be detected from a failed/undownloadable transcript, so
+// failure messages here use the session's current (last-known) language.
 async function handleVoiceMessage(phone, mediaId, session) {
   log("Voice message received from", phone, "-> mediaId:", mediaId);
 
   const audio = await getAudioBuffer(mediaId);
   if (!audio) {
-    await sendText(phone, VOICE_TRANSCRIPTION_FAILED_MESSAGE);
+    await sendText(phone, t(session.language, "voiceTranscriptionFailed"));
     return;
   }
 
   const transcript = await transcribeVoiceMessage(audio.buffer, audio.mimeType);
   if (!transcript) {
-    await sendText(phone, VOICE_TRANSCRIPTION_FAILED_MESSAGE);
+    await sendText(phone, t(session.language, "voiceTranscriptionFailed"));
     return;
   }
 
@@ -912,6 +1161,7 @@ function isLikelyRefusal(text) {
   // REFUSAL_KEYWORD_CHECK_MAX_WORDS — including short-but-genuine reports
   // like Sreekanth's 712-word one — is decided by the keyword check below,
   // not auto-rejected for length alone.
+
   const englishRefusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
   if (englishRefusalPatterns.test(trimmed)) return true;
 
@@ -1025,7 +1275,9 @@ async function generateReport(session) {
     ? `\n\n(Context for you only, not to be stated as a fact in the reading: the customer described this person as their ${relation}. You may let this inform tone/warmth naturally if relevant, but do not fabricate anything about the relationship that wasn't stated.)`
     : "";
 
-  const systemPrompt = `You are an experienced traditional Malayalam palmist (കൈരേഖാ വിശാരദൻ) with many years of practice, writing a formal, authoritative personal palm reading entirely in Malayalam script, minimum 2000 words.
+  const isEnglish = session.language === "en";
+
+  const systemPromptMl = `You are an experienced traditional Malayalam palmist (കൈരേഖാ വിശാരദൻ) with many years of practice, writing a formal, authoritative personal palm reading entirely in Malayalam script, minimum 2000 words.
 
 ADDRESSING THE CUSTOMER:
 - Never use casual/familiar terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ, or similar.
@@ -1056,7 +1308,48 @@ Do not include any disclaimers. Do not say you are unable to see or analyze an i
 
 IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked or even if it would seem to follow naturally from a comment about children/family. If children are relevant to the reading, speak only in general terms about family life, parenthood, or the number/timing of children in the future — never about the sex of a specific unborn child.`;
 
-  const instructionText = imageAvailable
+  const systemPromptEn = `You are an experienced traditional palmist with many years of practice, writing a formal, authoritative personal palm reading entirely in English, minimum 2000 words.
+
+ADDRESSING THE CUSTOMER:
+- Never use casual/familiar terms like "bro", "dude", "buddy", "sis", or similar.
+- You may address the customer by name once, near the beginning (e.g. "Shivlin,\n\nLooking closely at the principal lines on your palm...") — after that, avoid repeatedly addressing them directly. Write as a respected, experienced traditional palmist speaking with quiet authority, not as a casual younger conversational voice.
+
+TONE AND CONFIDENCE:
+- Avoid hedging phrases: "I feel", "maybe", "perhaps", "possibly", "it seems".
+- Prefer grounded, authoritative interpretive phrases such as: "These lines indicate...", "What is clearly visible is...", "The structure of these lines makes clear...", "This palm reveals...", "On closer examination, what stands out is...".
+- The confidence should come from the interpretation of the palm itself — describe tendencies and possibilities firmly, without making absolute guarantees about specific outcomes.
+
+VARIETY AND DIRECTNESS:
+- Do not repeatedly start sentences with "In your life...", "On your hand...", or "Your lines...". Vary sentence openings and structure naturally throughout.
+- Do not explain what a palm line means in general (no palmistry-theory or textbook-style explanations). Go straight to interpreting THIS customer's palm. For example, instead of "The heart line represents love and emotions," write something like "The clarity and depth of your heart line points to a personality that values sincerity and stability in relationships." Customers are paying for interpretation, not a palmistry lesson.
+
+GROUNDING IN THE ACTUAL PALM:
+- Where a palm image is available, naturally weave in specific visible observations — only ones actually visible in the image — such as the depth of the life line, the direction of the head line, the structure of the heart line, the clarity of the fate line, the mount of Venus, the mount of Jupiter, the mount of the Sun, the structure of the thumb, the proportion of the fingers. Do not invent features that are not visible.
+
+LANGUAGE:
+- Write consistently in English throughout.
+
+CONTENT (weave naturally into a flowing narrative, never as labeled headings or a checklist):
+personality and character, love and relationships, marriage and family life, job/career/business, financial matters, health, opportunities abroad, home/property, spiritual growth, future possibilities and challenges over the next 2-5 years, special signs in the palm. Expand meaningfully on future possibilities across these areas rather than listing them briefly.
+
+CONCLUSION:
+End with a strong, premium, confident, and inspiring closing passage that ties together the overall reading and future outlook — not a generic sign-off.
+
+Do not include any disclaimers. Do not say you are unable to see or analyze an image. Never use the words: fun, entertainment, AI, OpenAI, bot, automation, model, system. Minimum 2000 words.
+
+IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked or even if it would seem to follow naturally from a comment about children/family. If children are relevant to the reading, speak only in general terms about family life, parenthood, or the number/timing of children in the future — never about the sex of a specific unborn child.`;
+
+  const systemPrompt = isEnglish ? systemPromptEn : systemPromptMl;
+
+  const instructionText = isEnglish
+    ? imageAvailable
+      ? `Customer details:\nName: ${name}\nDate of birth: ${dob}\nGender: ${
+          gender === "female" ? "Female" : "Male"
+        }\n\nThe customer's palm image is attached. Use it together with the details above to write the full reading, referencing specific palm lines and signs naturally.${relationLine}`
+      : `Customer details:\nName: ${name}\nDate of birth: ${dob}\nGender: ${
+          gender === "female" ? "Female" : "Male"
+        }\n\nWrite the full palmistry reading based on these details. Describe palm lines and signs naturally as part of the reading, without mentioning that no image was provided.${relationLine}`
+    : imageAvailable
     ? `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
         gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
       }\n\nThe customer's palm image is attached. Use it together with the details above to write the full reading, referencing specific palm lines and signs naturally.${relationLine}`
@@ -1301,9 +1594,9 @@ function applyExtractedPatch(session, extracted) {
 
 async function progressCollectingStage(phone, session) {
   const missingFields = [];
-  if (!session.name) missingFields.push("പേര്");
-  if (!session.dob) missingFields.push("ജനനത്തീയതി");
-  if (!session.gender) missingFields.push("Gender (ലിംഗം)");
+  if (!session.name) missingFields.push(t(session.language, "fieldName"));
+  if (!session.dob) missingFields.push(t(session.language, "fieldDob"));
+  if (!session.gender) missingFields.push(t(session.language, "fieldGender"));
 
   if (missingFields.length > 0) {
     // Only ask for what's actually still missing — previously this always
@@ -1311,8 +1604,8 @@ async function progressCollectingStage(phone, session) {
     // fields (e.g. name and gender) had already been provided.
     const message =
       missingFields.length === 3
-        ? ASK_ALL_DETAILS_MESSAGE
-        : `നന്ദി! ദയവായി ${missingFields.join(", ")} കൂടി അയച്ചുതരാമോ?`;
+        ? t(session.language, "askAllDetails")
+        : t(session.language, "missingFieldsPrompt", missingFields.join(", "));
     await sendText(phone, message);
     return session;
   }
@@ -1322,13 +1615,13 @@ async function progressCollectingStage(phone, session) {
     // stashed — don't ask for it again, just process it now.
     log("progressCollectingStage: details complete AND a photo was already stashed for", phone, "— processing it now instead of re-asking.");
     const updated = await db.updateSession(phone, { stage: "awaiting_photo" });
-    await sendText(phone, `നന്ദി ${updated.name}.`);
+    await sendText(phone, t(updated.language, "thanksName", updated.name));
     await processReceivedPalmPhoto(phone, session.palmMediaId, updated);
     return updated;
   }
 
   const updated = await db.updateSession(phone, { stage: "awaiting_photo" });
-  await sendText(phone, handRequestMessage(updated.name, updated.gender));
+  await sendText(phone, t(updated.language, "handRequest", updated.name, updated.gender));
   return updated;
 }
 
@@ -1353,7 +1646,7 @@ async function confirmPaymentAndScheduleReport(phone, session, sourceLabel) {
     awaitingTransactionId: false,
   });
   log(`Payment confirmed via ${sourceLabel} for`, phone, "— report scheduled (via DB, no setTimeout), due at", dueAt.toISOString());
-  await sendText(phone, paymentReceivedMessage(session.name || "", (session.orderCount || 1) > 1));
+  await sendText(phone, t(session.language, "paymentReceived", session.name || "", (session.orderCount || 1) > 1));
 }
 
 // Hidden testing command — wipes a phone number's session back to a fresh
@@ -1379,15 +1672,60 @@ async function handleTextMessage(phone, text, session) {
       pendingSecondPerson: false,
     });
     log("Session RESET for", phone, "via hidden test command");
-    await sendText(phone, "സെഷൻ റീസെറ്റ് ചെയ്തു. വീണ്ടും തുടങ്ങാൻ 'Hi' എന്ന് അയക്കൂ.");
+    await sendText(phone, t(session.language, "resetConfirm"));
     return;
+  }
+
+  // First-ever contact: ask for language explicitly instead of guessing.
+  // A bare "Hi" carries no reliable language signal — it's the standard
+  // greeting used by Malayalam and English speakers alike (the bot's own
+  // instructions tell everyone to send "Hi" to start) — so running it
+  // through the adaptive detectLanguage() classifier risked flipping a
+  // Malayalam-speaking customer straight into English on their very first
+  // message. This is fully deterministic (digit/keyword/script match via
+  // matchLanguageChoice below), not a GPT call, so there's no ambiguity.
+  if (session.stage === "new") {
+    session = await db.updateSession(phone, { stage: "awaiting_language" });
+    await sendText(phone, LANGUAGE_PICKER_MESSAGE);
+    return;
+  }
+
+  if (session.stage === "awaiting_language") {
+    const chosen = matchLanguageChoice(text);
+    if (!chosen) {
+      log("awaiting_language: unrecognized reply from", phone, "-> re-sending picker instead of guessing. Text was:", text);
+      await sendText(phone, LANGUAGE_PICKER_MESSAGE);
+      return;
+    }
+    session = await db.updateSession(phone, { language: chosen, stage: "collecting" });
+    await sendText(phone, t(session.language, "welcome"));
+
+    // In case the customer packed their actual details into the same
+    // message as their language choice (e.g. "1, John, 12/03/1990, Male"),
+    // don't discard that — extract and apply it immediately.
+    const extracted = await extractFields(text, session);
+    const patch = applyExtractedPatch(session, extracted);
+    if (Object.keys(patch).length) session = await db.updateSession(phone, patch);
+    await progressCollectingStage(phone, session);
+    return;
+  }
+
+  // Adaptive per-message language detection — for every stage AFTER the
+  // initial explicit choice above, whatever language this message is in
+  // becomes session.language for the rest of this turn (and stays that way
+  // for future turns until the customer writes in the other language
+  // again). See detectLanguage() for the detection strategy.
+  const detectedLanguage = await detectLanguage(text, session.language);
+  if (detectedLanguage !== session.language) {
+    log("Language for", phone, "changed:", session.language, "->", detectedLanguage);
+    session = await db.updateSession(phone, { language: detectedLanguage });
   }
 
   log(
     "Current session state for",
     phone,
     "->",
-    JSON.stringify({ stage: session.stage, name: session.name, dob: session.dob, gender: session.gender })
+    JSON.stringify({ stage: session.stage, name: session.name, dob: session.dob, gender: session.gender, language: session.language })
   );
 
   // Flag refund requests for visibility on /admin/refund-requests,
@@ -1400,19 +1738,8 @@ async function handleTextMessage(phone, text, session) {
     await db.updateSession(phone, { refundRequestedAt: new Date() });
   }
 
-  if (session.stage === "new") {
-    session = await db.updateSession(phone, { stage: "collecting" });
-    await sendText(phone, WELCOME_MESSAGE);
-
-    const extracted = await extractFields(text, session);
-    const patch = applyExtractedPatch(session, extracted);
-    if (Object.keys(patch).length) session = await db.updateSession(phone, patch);
-    await progressCollectingStage(phone, session);
-    return;
-  }
-
   if (session.stage === "collecting") {
-    const faqAnswer = matchFaq(text);
+    const faqAnswer = matchFaq(text, session.language);
     if (faqAnswer) await sendText(phone, faqAnswer);
 
     const extracted = await extractFields(text, session);
@@ -1425,13 +1752,14 @@ async function handleTextMessage(phone, text, session) {
     // ignores what they actually asked. Give a real, brief, reassuring
     // reply instead, then still end with the details request.
     if (!faqAnswer && Object.keys(patch).length === 0 && !isTrivialAcknowledgment(text)) {
+      const langName = t(session.language, "languageName");
       const preReply = await openaiChat(
         [
           {
             role: "system",
-            content: `You are the same experienced traditional Malayalam palmist. The customer has not yet given their name, date of birth, and gender to start their ₹99 palm reading, and just sent a message that isn't providing those details — it may be a trust concern ("is this genuine", "will it actually work"), a question, or hesitation. Answer briefly in Malayalam (2-3 sentences). Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ.
+            content: `You are the same experienced traditional palmist. The customer has not yet given their name, date of birth, and gender to start their ₹99 palm reading, and just sent a message that isn't providing those details — it may be a trust concern ("is this genuine", "will it actually work"), a question, or hesitation. Answer briefly in ${langName} (2-3 sentences). ${t(session.language, "addressGuidance")}
 If it's a trust concern specifically, be concrete and honest, not vague: say directly that the reading is done from their own actual palm photo (not a generic template answer), and that the ₹99 fee makes it low-risk to simply try. Do NOT just describe what palmistry generally covers (personality, career, family, etc.) as if that were an answer to a trust question — that doesn't actually address "is this real/legit" and reads as empty filler before the payment ask.
-End by asking them to share their പേര് (name), ജനനത്തീയതി (date of birth), and ലിംഗം (gender) together to continue.`,
+End by asking them to share their name, date of birth, and gender together to continue. Reply entirely in ${langName}.`,
           },
           { role: "user", content: text },
         ],
@@ -1450,7 +1778,7 @@ End by asking them to share their പേര് (name), ജനനത്തീയ�
   }
 
   if (session.stage === "awaiting_photo") {
-    const faqAnswer = matchFaq(text);
+    const faqAnswer = matchFaq(text, session.language);
     if (faqAnswer) await sendText(phone, faqAnswer);
 
     if (session.palmMediaId) {
@@ -1458,17 +1786,14 @@ End by asking them to share their പേര് (name), ജനനത്തീയ�
       const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
       if (qrSent) {
         await db.updateSession(phone, { stage: "awaiting_payment" });
-        await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
+        await sendText(phone, t(session.language, "photoReceivedPayment"));
       } else {
-        await sendText(phone, QR_FAILURE_MESSAGE);
+        await sendText(phone, t(session.language, "qrFailure"));
       }
       return;
     }
 
-    await sendText(
-      phone,
-      `ദയവായി നിങ്ങളുടെ ${session.gender === "female" ? "ഇടത്" : "വലത്"} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?`
-    );
+    await sendText(phone, t(session.language, "askForHandPhotoAgain", session.gender));
     return;
   }
 
@@ -1484,14 +1809,11 @@ End by asking them to share their പേര് (name), ജനനത്തീയ�
 
     if (cannotSendScreenshotIntent(text)) {
       await db.updateSession(phone, { awaitingTransactionId: true });
-      await sendText(
-        phone,
-        "സ്ക്രീൻഷോട്ട് അയക്കാൻ കഴിയുന്നില്ലെങ്കിൽ കുഴപ്പമില്ല. Payment ചെയ്ത transaction ID ഇവിടെ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ മതി."
-      );
+      await sendText(phone, t(session.language, "askTransactionId"));
       return;
     }
 
-    const faqAnswer = matchFaq(text);
+    const faqAnswer = matchFaq(text, session.language);
     if (faqAnswer) {
       await sendText(phone, faqAnswer);
       return;
@@ -1500,7 +1822,7 @@ End by asking them to share their പേര് (name), ജനനത്തീയ�
     if (isTrivialAcknowledgment(text)) {
       // A plain "Ok"/"K" doesn't need a full GPT reassurance call — just
       // the free, static payment reminder.
-      await sendText(phone, "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.");
+      await sendText(phone, t(session.language, "paymentReminderShort"));
       return;
     }
 
@@ -1510,13 +1832,14 @@ End by asking them to share their പേര് (name), ജനനത്തീയ�
     // first", etc.) — repetitive and unhelpful right before asking someone
     // to pay. Now: give a real, brief, reassuring answer, still ending
     // with the payment reminder.
+    const langName = t(session.language, "languageName");
     const preReply = await openaiChat(
       [
         {
           role: "system",
-          content: `You are the same experienced traditional Malayalam palmist, speaking with a customer who is about to pay ₹99 for their palm reading but has a question or hesitation before paying. Answer briefly in Malayalam (2-4 sentences) — this could be a trust concern ("how do I know this is legit"), a request to explain the process again, or anything else. Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ.
+          content: `You are the same experienced traditional palmist, speaking with a customer who is about to pay ₹99 for their palm reading but has a question or hesitation before paying. Answer briefly in ${langName} (2-4 sentences) — this could be a trust concern ("how do I know this is legit"), a request to explain the process again, or anything else. ${t(session.language, "addressGuidance")}
 If it's a trust concern specifically, be concrete and honest, not vague: say directly that the reading is done from their own actual palm photo they already sent (not a generic template answer), and that the ₹99 fee makes it low-risk to simply try. Do NOT just describe what palmistry generally covers (personality, career, family, etc.) as if that were an answer to a trust question — that doesn't actually address "is this real/legit" and reads as empty filler before the payment ask.
-After your answer, end with a gentle reminder that once they complete the ₹99 payment using the QR code above, they should send the payment screenshot here to receive their reading.`,
+After your answer, end with a gentle reminder that once they complete the ₹99 payment using the QR code above, they should send the payment screenshot here to receive their reading. Reply entirely in ${langName}.`,
         },
         { role: "user", content: text },
       ],
@@ -1527,7 +1850,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
     if (preReply) {
       await sendText(phone, preReply);
     } else {
-      await sendText(phone, "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.");
+      await sendText(phone, t(session.language, "paymentReminderShort"));
     }
     return;
   }
@@ -1550,7 +1873,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
     await db.updateSession(phone, { awaitingReportInquiryCount: inquiryCount });
     const offerSupport = inquiryCount >= SUPPORT_EMAIL_INQUIRY_THRESHOLD;
     const withSupport = (msg) =>
-      offerSupport ? `${msg}\n\n${SUPPORT_CONTACT_LINE}` : msg;
+      offerSupport ? `${msg}\n\n${t(session.language, "supportContactLine")}` : msg;
 
     // Always re-check fresh DB state on ANY message in this stage — no
     // longer gated behind isReportStatusQuery() keyword matching. Real
@@ -1620,7 +1943,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
         REPORT_FORCE_RETRY_HARD_CAP_MS / 60000,
         "min ceiling — pointing to support instead of retrying again."
       );
-      await sendText(phone, REPORT_EXHAUSTED_MESSAGE);
+      await sendText(phone, t(session.language, "reportExhausted"));
       await db.updateSession(phone, { hardCapNotifiedAt: new Date() });
       return;
     }
@@ -1643,7 +1966,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
           Math.round(sinceLastAttemptMs / 1000),
           "seconds ago (cooldown", REPORT_FORCE_RETRY_COOLDOWN_MS / 1000, "s) — replying with status only, not starting another."
         );
-        await sendText(phone, withSupport(REPORT_STILL_PENDING_MESSAGE));
+        await sendText(phone, withSupport(t(session.language, "reportStillPending")));
         return;
       }
 
@@ -1656,11 +1979,14 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
         "-> reason:",
         fresh.reportStatus === "failed" ? "status=failed" : `overdue by ${Math.round(paymentAgeMs / 60000)} min`
       );
-      await sendText(phone, REPORT_RETRYING_MESSAGE);
+      await sendText(phone, t(session.language, "reportRetrying"));
       const resetSession = await db.updateSession(phone, { reportAttempts: 0, reportStatus: "pending" });
       const result = await generateAndDeliverReport(resetSession);
       if (!result.success) {
-        await sendText(phone, withSupport(result.exhausted ? REPORT_EXHAUSTED_MESSAGE : REPORT_STILL_PENDING_MESSAGE));
+        await sendText(
+          phone,
+          withSupport(t(session.language, result.exhausted ? "reportExhausted" : "reportStillPending"))
+        );
       } else {
         await db.updateSession(phone, { awaitingReportInquiryCount: 0 });
       }
@@ -1670,7 +1996,7 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
     // Genuinely still within the normal wait window — no need to force a
     // fresh (costly) generation attempt on every casual message, just
     // reassure them it's in progress.
-    await sendText(phone, withSupport(REPORT_STILL_PENDING_MESSAGE));
+    await sendText(phone, withSupport(t(session.language, "reportStillPending")));
     return;
   }
 
@@ -1789,32 +2115,47 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
           "indicated they want a reading for another person — asking for that person's details before touching anything."
         );
         await db.updateSession(phone, { pendingSecondPerson: true });
-        await sendText(phone, ASK_SECOND_PERSON_DETAILS_MESSAGE);
+        await sendText(phone, t(session.language, "askSecondPersonDetails"));
         return;
       }
     }
 
     const todayStr = new Date().toISOString().slice(0, 10); // e.g. "2026-07-03"
     const currentYear = new Date().getFullYear();
+    const isEnglish = session.language === "en";
+    const langName = t(session.language, "languageName");
+
+    const hedgingLine = isEnglish
+      ? "Speak with the same quiet, authoritative confidence as the original reading (avoid hedging words like 'I feel', 'maybe', 'perhaps', 'possibly'). Use natural, correct English word choices throughout."
+      : "Speak with the same quiet, authoritative confidence as the original reading (avoid hedging words like എനിക്ക് തോന്നുന്നു, ഒരുപക്ഷേ, ആയിരിക്കാം, ചിലപ്പോൾ). Use correct, natural Malayalam word choices throughout.";
+    const timeframeLine = isEnglish
+      ? `If asked generally "when," prefer a relative timeframe (the next few months, next year, within the next 1-2 years) over naming a specific year unless you are confident it is genuinely in the future.`
+      : `If asked generally "when," prefer a relative timeframe (അടുത്ത കുറച്ച് മാസങ്ങൾ, അടുത്ത വർഷം, അടുത്ത 1-2 വർഷത്തിനുള്ളിൽ) over naming a specific year unless you are confident it is genuinely in the future.`;
+    const languageLockLine = isEnglish
+      ? "Always reply in English, matching the customer's current language — even if the earlier reading below happens to be in Malayalam, read and interpret it, but write your reply in English."
+      : "Always reply in Malayalam, even if the customer writes in English or explicitly asks for an English reply/summary — politely continue in Malayalam rather than switching languages. (If the earlier reading below happens to be in English because the customer's language was English at the time it was generated, still answer in Malayalam now, since that is their current language.)";
+    const distressLine = isEnglish
+      ? `If the customer discloses something suggesting real personal distress or a genuine life crisis — an active divorce or separation, a death or serious illness in the family, mentions of self-harm, domestic conflict, addiction, or similar — shift out of the confident predictive style for that topic. Do not keep asserting definitive romantic/marriage/family outcomes ("marriage will happen", specific dates, etc.) as if nothing has changed; acknowledge what they've shared in a brief, human way, keep any palm-based comments general and gentle rather than definitive, and avoid speculating about a specific new partner or relationship they mention in that context. This isn't about refusing to continue the reading — just about not compounding a real, difficult moment with confident predictions that could reinforce false hope or distress. Continue answering their other questions (career, health, family in general) normally.`
+      : `If the customer discloses something suggesting real personal distress or a genuine life crisis — an active divorce or separation, a death or serious illness in the family, mentions of self-harm, domestic conflict, addiction, or similar — shift out of the confident predictive style for that topic. Do not keep asserting definitive romantic/marriage/family outcomes ("വിവാഹം നടക്കും", specific dates, etc.) as if nothing has changed; acknowledge what they've shared in a brief, human way, keep any palm-based comments general and gentle rather than definitive, and avoid speculating about a specific new partner or relationship they mention in that context. This isn't about refusing to continue the reading — just about not compounding a real, difficult moment with confident predictions that could reinforce false hope or distress. Continue answering their other questions (career, health, family in general) normally.`;
 
     const followUpMessages = [
       {
         role: "system",
-        content: `You are the same experienced traditional Malayalam palmist continuing a conversation with a customer, after having given them a palm reading earlier. Respond naturally and briefly in Malayalam.
-Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ, or similar — do not address the customer directly by any such term. Speak with the same quiet, authoritative confidence as the original reading (avoid hedging words like എനിക്ക് തോന്നുന്നു, ഒരുപക്ഷേ, ആയിരിക്കാം, ചിലപ്പോൾ). Use correct, natural Malayalam word choices throughout.
+        content: `You are the same experienced traditional palmist continuing a conversation with a customer, after having given them a palm reading earlier. Respond naturally and briefly in ${langName}.
+${t(session.language, "addressGuidance")} ${hedgingLine}
 
-Today's actual date is ${todayStr} (year ${currentYear}). If the customer asks about future timing (which year, when, how soon, etc.), any year or timeframe you mention MUST be ${currentYear} or later — never state a year that has already passed as if it were a future prediction. If asked generally "when," prefer a relative timeframe (അടുത്ത കുറച്ച് മാസങ്ങൾ, അടുത്ത വർഷം, അടുത്ത 1-2 വർഷത്തിനുള്ളിൽ) over naming a specific year unless you are confident it is genuinely in the future.
+Today's actual date is ${todayStr} (year ${currentYear}). If the customer asks about future timing (which year, when, how soon, etc.), any year or timeframe you mention MUST be ${currentYear} or later — never state a year that has already passed as if it were a future prediction. ${timeframeLine}
 
-Customers write casually and in Manglish (Malayalam typed in English letters). Read past literal wording to their actual intent before answering:
+Customers write casually, and Malayalam-speaking customers sometimes type in Manglish (Malayalam typed in English letters). Read past literal wording to their actual intent before answering:
 - If they're asking a question about THEIR OWN earlier reading, answer using the reading context below.
 - If they're asking about price for an additional or repeat reading, the fee is ₹99 per person, same as before.
 - If it's a greeting, thanks, or general conversation unrelated to the reading, respond warmly and briefly in the same authoritative but personal voice, without forcing it back to palm topics.
 
-Always reply in Malayalam, even if the customer writes in English or explicitly asks for an English reply/summary — politely continue in Malayalam rather than switching languages, since the service and reading are Malayalam-only.
+${languageLockLine}
 
 Never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked directly. If children come up, speak only in general terms about family life or the number/timing of children in the future — never the sex of a specific unborn child.
 
-If the customer discloses something suggesting real personal distress or a genuine life crisis — an active divorce or separation, a death or serious illness in the family, mentions of self-harm, domestic conflict, addiction, or similar — shift out of the confident predictive style for that topic. Do not keep asserting definitive romantic/marriage/family outcomes ("വിവാഹം നടക്കും", specific dates, etc.) as if nothing has changed; acknowledge what they've shared in a brief, human way, keep any palm-based comments general and gentle rather than definitive, and avoid speculating about a specific new partner or relationship they mention in that context. This isn't about refusing to continue the reading — just about not compounding a real, difficult moment with confident predictions that could reinforce false hope or distress. Continue answering their other questions (career, health, family in general) normally.
+${distressLine}
 ${
   (session.orderCount || 1) > 1
     ? `\nIMPORTANT: this customer has ordered more than one reading in this chat (this is order #${
@@ -1854,19 +2195,11 @@ Earlier reading:\n${session.reportText || ""}`,
     if (followUp) {
       await sendText(phone, followUp);
     } else {
-      await sendText(phone, "ക്ഷമിക്കണം, ഒരു നിമിഷം ശ്രമിക്കാമോ? ചെറിയൊരു തടസ്സം ഉണ്ടായി.");
+      await sendText(phone, t(session.language, "followUpFailed"));
     }
     return;
   }
 }
-
-const NOT_A_PALM_MESSAGE_TEMPLATE = (gender) =>
-  `ക്ഷമിക്കണം, അയച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. ദയവായി നിങ്ങളുടെ ${
-    gender === "female" ? "ഇടത്" : "വലത്"
-  } കൈയുടെ താളത്തിൽ നിന്ന്, നല്ല വെളിച്ചത്തിൽ എടുത്ത വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയച്ചുതരാമോ?`;
-
-const PHOTO_REPLACED_MESSAGE =
-  "പുതിയ ഫോട്ടോ ലഭിച്ചു, നന്ദി. ഇത് ഉപയോഗിച്ച് നിങ്ങളുടെ കൈരേഖാ വിശകലനം വീണ്ടും തയ്യാറാക്കുന്നു. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
 
 // Validates a palm photo and either sends the QR (moving to
 // awaiting_payment) or asks for a proper resend (staying in awaiting_photo).
@@ -1881,7 +2214,7 @@ async function processReceivedPalmPhoto(phone, mediaId, session) {
 
   if (!validation.valid) {
     await db.updateSession(phone, { stage: "awaiting_photo", palmMediaId: null });
-    await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
+    await sendText(phone, t(session.language, "notAPalm", session.gender));
     return;
   }
 
@@ -1890,12 +2223,12 @@ async function processReceivedPalmPhoto(phone, mediaId, session) {
   const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
   if (!qrSent) {
     log("QR image failed to send to", phone, "— NOT sending payment message. Staying in awaiting_photo for retry.");
-    await sendText(phone, QR_FAILURE_MESSAGE);
+    await sendText(phone, t(session.language, "qrFailure"));
     return;
   }
 
   await db.updateSession(phone, { stage: "awaiting_payment" });
-  await sendText(phone, PHOTO_RECEIVED_PAYMENT_MESSAGE);
+  await sendText(phone, t(session.language, "photoReceivedPayment"));
 }
 
 // Single, mandatory-validation gateway for ANY code path that wants to set
@@ -1936,14 +2269,11 @@ async function handleImageMessage(phone, mediaId, session) {
       const { accepted, reason } = await tryAcceptPalmPhoto(phone, mediaId);
       if (!accepted) {
         log("Additional photo received while awaiting_photo for", phone, "failed validation (", reason, ") — existing photo kept.");
-        await sendText(
-          phone,
-          "ലഭിച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. നിങ്ങൾ നേരത്തെ അയച്ച കൈയുടെ ഫോട്ടോ ഉപയോഗിച്ച് തുടരും — ഇത് അവഗണിക്കാം, അല്ലെങ്കിൽ കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയക്കാം."
-        );
+        await sendText(phone, t(session.language, "extraPhotoRejectedAwaitingPhoto"));
         return;
       }
       log("Additional palm photo received while awaiting_photo (QR already sent) for", phone, "— validated, treating as another angle, not re-sending QR.");
-      await sendText(phone, "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.");
+      await sendText(phone, t(session.language, "extraPhotoAcceptedAwaitingPhoto"));
       return;
     }
     await processReceivedPalmPhoto(phone, mediaId, session);
@@ -1971,14 +2301,11 @@ async function handleImageMessage(phone, mediaId, session) {
       const { accepted, reason } = await tryAcceptPalmPhoto(phone, mediaId);
       if (!accepted) {
         log("Additional photo received shortly after payment for", phone, "failed validation (", reason, ") — existing photo kept, report schedule untouched.");
-        await sendText(
-          phone,
-          "ലഭിച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. നിങ്ങൾ നേരത്തെ അയച്ച കൈയുടെ ഫോട്ടോ ഉപയോഗിച്ചാണ് റിപ്പോർട്ട് തയ്യാറാക്കുന്നത് — ഇത് അവഗണിക്കാം."
-        );
+        await sendText(phone, t(session.language, "extraPhotoRejectedAfterPayment"));
         return;
       }
       log("Additional palm photo received shortly after payment (", Math.round(paymentAgeMs / 1000), "s ago) for", phone, "— validated, treating as another angle, not resetting report schedule.");
-      await sendText(phone, "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് ഉപയോഗിച്ച് റിപ്പോർട്ട് തയ്യാറാക്കും.");
+      await sendText(phone, t(session.language, "extraPhotoAcceptedAfterPayment"));
       return;
     }
 
@@ -2004,7 +2331,7 @@ async function handleImageMessage(phone, mediaId, session) {
         accepted ? "valid palm photo" : `rejected (${reason})`,
         "— NOT auto-starting a new retry cycle. Needs manual /admin/force-report if you want to try again."
       );
-      await sendText(phone, REPORT_EXHAUSTED_MESSAGE);
+      await sendText(phone, t(session.language, "reportExhausted"));
       return;
     }
 
@@ -2018,7 +2345,7 @@ async function handleImageMessage(phone, mediaId, session) {
     const { accepted, reason } = await tryAcceptPalmPhoto(phone, mediaId);
     if (!accepted) {
       log("Corrected photo received while awaiting_report for", phone, "failed validation (", reason, ") — existing photo kept, retry cycle not reset.");
-      await sendText(phone, NOT_A_PALM_MESSAGE_TEMPLATE(session.gender));
+      await sendText(phone, t(session.language, "notAPalm", session.gender));
       return;
     }
 
@@ -2030,7 +2357,7 @@ async function handleImageMessage(phone, mediaId, session) {
       reportDueAt: retryDueAt,
       reportError: null,
     });
-    await sendText(phone, PHOTO_REPLACED_MESSAGE);
+    await sendText(phone, t(session.language, "photoReplaced"));
     return;
   }
 
@@ -2066,37 +2393,37 @@ async function handleImageMessage(phone, mediaId, session) {
         reportError: null,
         awaitingReportInquiryCount: 0,
       });
-      await sendText(phone, REPORT_CORRECTION_DETECTED_MESSAGE);
+      await sendText(phone, t(session.language, "reportCorrectionDetected"));
       return;
     }
     // else: fall through to the generic ack below — a genuinely valid,
     // already-sent report shouldn't be disturbed by a stray photo.
   }
 
-  if (session.stage === "new" || session.stage === "collecting") {
+  if (session.stage === "new" || session.stage === "awaiting_language") {
+    // A photo carries no language signal, and the picker itself needs to be
+    // readable regardless of what language the customer eventually picks —
+    // so stash the photo and ask for language first, exactly as if their
+    // first message had been text instead of a photo.
+    log("Photo received before language was chosen (stage", session.stage, ") for", phone, "— stashing mediaId, asking for language first.");
+    await db.updateSession(phone, { stage: "awaiting_language", palmMediaId: mediaId });
+    await sendText(phone, LANGUAGE_PICKER_MESSAGE);
+    return;
+  }
+
+  if (session.stage === "collecting") {
     // Previously: a photo sent before name/DOB/gender were known was
     // completely discarded — not saved anywhere — and the customer would
     // later be asked for "a photo" again during awaiting_photo as if it
     // had never been sent. Now: stash it, and acknowledge that it's saved.
     log("Photo received early (stage", session.stage, ") for", phone, "— stashing mediaId for later, not discarding.");
 
-    if (session.stage === "new") {
-      // This is genuinely the customer's first-ever contact — send the
-      // "Hi" welcome/service intro FIRST, before anything else, exactly
-      // as if their first message had been text instead of a photo.
-      await sendText(phone, WELCOME_MESSAGE);
-      await db.updateSession(phone, { stage: "collecting" });
-    }
-
     await db.updateSession(phone, { palmMediaId: mediaId });
-    await sendText(
-      phone,
-      "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + ASK_ALL_DETAILS_MESSAGE
-    );
+    await sendText(phone, t(session.language, "photoStashedAskDetails"));
     return;
   }
 
-  await sendText(phone, "ഫോട്ടോ ലഭിച്ചു, നന്ദി.");
+  await sendText(phone, t(session.language, "genericPhotoAck"));
 }
 
 
@@ -2122,10 +2449,10 @@ async function pollDueReports() {
       const result = await generateAndDeliverReport(session);
       if (!result.success) {
         if (result.attemptNumber === 1) {
-          await sendText(session.phone, REPORT_PREPARING_MESSAGE);
+          await sendText(session.phone, t(session.language, "reportPreparing"));
         }
         if (result.exhausted) {
-          await sendText(session.phone, REPORT_EXHAUSTED_MESSAGE);
+          await sendText(session.phone, t(session.language, "reportExhausted"));
         }
       }
     }
@@ -2156,7 +2483,7 @@ async function pollDueReports() {
       const resetSession = await db.updateSession(session.phone, { reportAttempts: 0, reportStatus: "pending" });
       const result = await generateAndDeliverReport(resetSession);
       if (!result.success && result.exhausted) {
-        await sendText(session.phone, REPORT_EXHAUSTED_MESSAGE);
+        await sendText(session.phone, t(session.language, "reportExhausted"));
       }
     }
   } catch (err) {
@@ -2714,17 +3041,17 @@ async function processWebhookBody(body) {
     await sendText(
       phone,
       message.type === "video"
-        ? "വീഡിയോ അല്ല, ദയവായി കൈയുടെ ഒരു ഫോട്ടോ (still image) അയച്ചുതരാമോ?"
-        : "നന്ദി! തുടരാൻ ദയവായി ഒരു text സന്ദേശമോ ഫോട്ടോയോ അയച്ചുതരാമോ?"
+        ? t(session.language, "videoNotPhoto")
+        : t(session.language, "stickerAck")
     );
   } else if (message.type === "location") {
     log("Location message received from", phone, "-> not relevant to this flow, acknowledging and redirecting.");
     db.logMessage(phone, "in", "[Location]", "location");
-    await sendText(phone, "നന്ദി! ലൊക്കേഷൻ ഇവിടെ ആവശ്യമില്ല. തുടരാൻ ദയവായി പേര്/ഫോട്ടോ പോലുള്ള വിവരങ്ങൾ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
+    await sendText(phone, t(session.language, "locationAck"));
   } else if (message.type === "contacts") {
     log("Contact card received from", phone, "-> not relevant to this flow, acknowledging and redirecting.");
     db.logMessage(phone, "in", "[Contact card]", "contacts");
-    await sendText(phone, "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?");
+    await sendText(phone, t(session.language, "contactAck"));
   } else if (message.type === "reaction") {
     // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
     // that needs (or should get) a reply; replying here would be spammy.
@@ -2733,7 +3060,7 @@ async function processWebhookBody(body) {
   } else {
     log("Unrecognized message type from", phone, "->", message.type, "- full payload:", JSON.stringify(message));
     db.logMessage(phone, "in", `[Unrecognized message type: ${message.type}]`, message.type || "unknown");
-    await sendText(phone, "ദയവായി text ആയോ photo ആയോ അയക്കൂ.");
+    await sendText(phone, t(session.language, "unrecognizedFallback"));
   }
 }
 
@@ -2784,4 +3111,3 @@ async function start() {
 }
 
 start();
-
