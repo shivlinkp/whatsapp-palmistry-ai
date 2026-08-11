@@ -61,6 +61,13 @@ async function initDb() {
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_transaction_id BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_report_inquiry_count INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
+  // Customer's current reply language, detected per-message (see
+  // detectLanguage() in server.js) and updated adaptively — whatever
+  // language their most recent message was in is what they get replied to
+  // in next, including for the eventual report generation itself. Defaults
+  // to 'ml' so every existing session (and any session where detection is
+  // ever skipped/fails) keeps today's Malayalam-only behavior unchanged.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'ml';`);
   // Stable "payment confirmed" timestamp — unlike report_due_at (which gets
   // pushed forward by REPORT_RETRY_INTERVAL_MS on every failed attempt),
   // this never changes once set, so it's what we use to measure genuine
@@ -140,6 +147,7 @@ function rowToSession(row) {
     lastAttemptAt: row.last_attempt_at,
     hardCapNotifiedAt: row.hard_cap_notified_at,
     refundRequestedAt: row.refund_requested_at,
+    language: row.language,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -185,6 +193,7 @@ const FIELD_MAP = {
   lastAttemptAt: "last_attempt_at",
   hardCapNotifiedAt: "hard_cap_notified_at",
   refundRequestedAt: "refund_requested_at",
+  language: "language",
 };
 
 // Updates only the given fields for a phone number's session, bumps
