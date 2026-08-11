@@ -1715,10 +1715,25 @@ async function handleTextMessage(phone, text, session) {
   // becomes session.language for the rest of this turn (and stays that way
   // for future turns until the customer writes in the other language
   // again). See detectLanguage() for the detection strategy.
-  const detectedLanguage = await detectLanguage(text, session.language);
-  if (detectedLanguage !== session.language) {
-    log("Language for", phone, "changed:", session.language, "->", detectedLanguage);
-    session = await db.updateSession(phone, { language: detectedLanguage });
+  //
+  // SKIPPED during "collecting": those messages are short, expected-format
+  // answers to a specific field prompt (name / DOB / gender) — not genuine
+  // conversation — and carry no real language signal. "Female" is the
+  // standard reply to "Gender (ലിംഗം)" even for an entirely Malayalam-
+  // speaking customer; running it through the classifier just flips the
+  // session mid-flow on a false signal, the exact same failure mode the
+  // first-contact picker was built to avoid. Real incident this fixes:
+  // Faseela P, 918590262657, 11/8 — explicitly chose Malayalam via the
+  // picker, then got two English replies (the "thanksName" and "notAPalm"
+  // messages right after her palm photo) purely because she'd typed
+  // "Female" as her gender answer, before flipping back to Malayalam on
+  // her very next message ("Enth").
+  if (session.stage !== "collecting") {
+    const detectedLanguage = await detectLanguage(text, session.language);
+    if (detectedLanguage !== session.language) {
+      log("Language for", phone, "changed:", session.language, "->", detectedLanguage);
+      session = await db.updateSession(phone, { language: detectedLanguage });
+    }
   }
 
   log(
