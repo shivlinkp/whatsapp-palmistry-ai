@@ -227,12 +227,13 @@ const SUPPORT_WHATSAPP = "6360780748";
 const SUPPORT_EMAIL_INQUIRY_THRESHOLD = 3; // offer support email after this many messages while awaiting_report
 
 // All customer-facing copy lives here, one entry per supported language.
-// Every session has a `language` field ('ml' default, or 'en') that is
-// updated adaptively per incoming message (see detectLanguage() below) —
-// t(language, key, ...args) is how every send site looks up the right
-// string. Falls back to 'ml' for any unknown/missing language so behavior
-// for existing sessions is completely unchanged unless English is actually
-// detected.
+// Every session has a `language` field ('ml' default, or 'en') that is set
+// exactly once, deterministically, by the first-contact language picker
+// (see the "awaiting_language" stage in handleTextMessage) and never
+// changes automatically after that — t(language, key, ...args) is how
+// every send site looks up the right string. Falls back to 'ml' for any
+// unknown/missing language so behavior for existing sessions is completely
+// unchanged unless English is actually chosen.
 const T = {
   ml: {
     supportContactLine: `കൂടുതൽ സഹായത്തിന് ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ബന്ധപ്പെടാം, അല്ലെങ്കിൽ ${SUPPORT_WHATSAPP} എന്ന നമ്പറിൽ ഞങ്ങളുടെ WhatsApp helpline-ൽ മെസേജ് ചെയ്യാം.`,
@@ -479,14 +480,16 @@ function t(language, key, ...args) {
 }
 
 // ---------------------------------------------------------------------------
-// Language detection — adaptive per message. Malayalam script is detected
-// instantly and for free via Unicode range (covers the vast majority of
-// existing traffic with zero added latency/cost). Anything without
-// Malayalam script could be genuine English OR Manglish (Malayalam typed in
-// Roman letters, which the bot has always handled as Malayalam) — those two
-// look identical to a regex, so a cheap classifier call distinguishes them.
-// Defaults to 'ml' on any ambiguity or failure, preserving existing
-// behavior for anyone not clearly writing in English.
+// GPT-based language classifier (English vs. Manglish, for Roman-script
+// text with no Malayalam script characters). NOT currently called anywhere
+// — the adaptive per-message re-detection that used to call this was
+// removed (see the comment in handleTextMessage where it used to run) after
+// two confirmed production incidents where short, common, cross-language
+// words ("Ok", "Hlo", "Female") got misread as a deliberate language
+// switch. Kept here, unused, in case a future EXPLICIT "switch language"
+// feature wants a classifier for free-form phrasing (e.g. "reply in
+// English please") — matchLanguageChoice() below remains the only thing
+// actually deciding session.language today, and it's fully deterministic.
 // ---------------------------------------------------------------------------
 
 const MALAYALAM_SCRIPT_RE = /[\u0D00-\u0D7F]/;
@@ -1710,31 +1713,32 @@ async function handleTextMessage(phone, text, session) {
     return;
   }
 
-  // Adaptive per-message language detection — for every stage AFTER the
-  // initial explicit choice above, whatever language this message is in
-  // becomes session.language for the rest of this turn (and stays that way
-  // for future turns until the customer writes in the other language
-  // again). See detectLanguage() for the detection strategy.
-  //
-  // SKIPPED during "collecting": those messages are short, expected-format
-  // answers to a specific field prompt (name / DOB / gender) — not genuine
-  // conversation — and carry no real language signal. "Female" is the
-  // standard reply to "Gender (ലിംഗം)" even for an entirely Malayalam-
-  // speaking customer; running it through the classifier just flips the
-  // session mid-flow on a false signal, the exact same failure mode the
-  // first-contact picker was built to avoid. Real incident this fixes:
-  // Faseela P, 918590262657, 11/8 — explicitly chose Malayalam via the
-  // picker, then got two English replies (the "thanksName" and "notAPalm"
-  // messages right after her palm photo) purely because she'd typed
-  // "Female" as her gender answer, before flipping back to Malayalam on
-  // her very next message ("Enth").
-  if (session.stage !== "collecting") {
-    const detectedLanguage = await detectLanguage(text, session.language);
-    if (detectedLanguage !== session.language) {
-      log("Language for", phone, "changed:", session.language, "->", detectedLanguage);
-      session = await db.updateSession(phone, { language: detectedLanguage });
-    }
-  }
+  // Language is NOT re-detected here. It's set exactly once, deterministically,
+  // by the "awaiting_language" picker above, and never changes automatically
+  // for the rest of the session after that. This replaces an earlier
+  // "adaptive" version that re-ran detectLanguage() on every message and
+  // proved unreliable in production in two distinct, confirmed ways:
+  // - Faseela P, 918590262657, 11/8 — explicitly chose Malayalam, then got
+  //   two English replies purely because she'd typed "Female" (a literal
+  //   English word) as her gender answer, before flipping back on her next
+  //   message.
+  // - Shamnaz, 917306176496, 12/8 — explicitly chose Malayalam (implicitly,
+  //   by writing in Malayalam script), stayed correctly in Malayalam through
+  //   the whole name/DOB/gender/photo/payment flow, then flipped to English
+  //   on a plain "Ok", flipped back to Malayalam on a "Hlo", flipped to
+  //   English again on another "Ok" — and that last flip was still in
+  //   effect when the poller generated her report, so her actual paid
+  //   ₹99 reading was delivered entirely in English despite never once
+  //   having written a genuine English sentence in the whole conversation.
+  // Short, common, cross-language acknowledgment words ("Ok", "Hlo", "K",
+  // gender-field answers like "Female"/"Male") are exactly the class of
+  // message a language classifier will confidently score one way or the
+  // other, but which carry no real signal about which language the
+  // customer actually wants — the same fundamental problem the picker was
+  // built to solve for the very first "Hi", just recurring on every later
+  // short reply too. If a customer ever wants to actually switch language
+  // mid-conversation, that needs to be an explicit, deliberate action, not
+  // something inferred from ordinary short replies.
 
   log(
     "Current session state for",
