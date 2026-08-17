@@ -1647,6 +1647,7 @@ async function confirmPaymentAndScheduleReport(phone, session, sourceLabel) {
     reportAttempts: 0,
     reportError: null,
     awaitingTransactionId: false,
+    awaitingPaymentInquiryCount: 0,
   });
   log(`Payment confirmed via ${sourceLabel} for`, phone, "— report scheduled (via DB, no setTimeout), due at", dueAt.toISOString());
   await sendText(phone, t(session.language, "paymentReceived", session.name || "", (session.orderCount || 1) > 1));
@@ -1817,6 +1818,17 @@ End by asking them to share their name, date of birth, and gender together to co
   }
 
   if (session.stage === "awaiting_payment") {
+    // Same pattern as awaiting_report's inquiry counter — previously this
+    // stage NEVER offered support contact no matter how many times or how
+    // confusedly a customer asked. Real incident: Sreeja pv, 918606427024,
+    // 13/8 — sent 4 messages (including confused voice notes) stuck
+    // verifying payment, never once pointed to a human.
+    const paymentInquiryCount = (session.awaitingPaymentInquiryCount || 0) + 1;
+    await db.updateSession(phone, { awaitingPaymentInquiryCount: paymentInquiryCount });
+    const offerPaymentSupport = paymentInquiryCount >= SUPPORT_EMAIL_INQUIRY_THRESHOLD;
+    const withPaymentSupport = (msg) =>
+      offerPaymentSupport ? `${msg}\n\n${t(session.language, "supportContactLine")}` : msg;
+
     if (session.awaitingTransactionId) {
       // We already asked for a transaction ID after they said they couldn't
       // send a screenshot — accept whatever they send now, unverified, and
@@ -1828,20 +1840,21 @@ End by asking them to share their name, date of birth, and gender together to co
 
     if (cannotSendScreenshotIntent(text)) {
       await db.updateSession(phone, { awaitingTransactionId: true });
-      await sendText(phone, t(session.language, "askTransactionId"));
+      await sendText(phone, withPaymentSupport(t(session.language, "askTransactionId")));
       return;
     }
 
     const faqAnswer = matchFaq(text, session.language);
     if (faqAnswer) {
-      await sendText(phone, faqAnswer);
+      await sendText(phone, withPaymentSupport(faqAnswer));
       return;
     }
 
     if (isTrivialAcknowledgment(text)) {
       // A plain "Ok"/"K" doesn't need a full GPT reassurance call — just
-      // the free, static payment reminder.
-      await sendText(phone, t(session.language, "paymentReminderShort"));
+      // the free, static payment reminder (still with support contact once
+      // the inquiry threshold is reached).
+      await sendText(phone, withPaymentSupport(t(session.language, "paymentReminderShort")));
       return;
     }
 
@@ -1867,9 +1880,9 @@ After your answer, end with a gentle reminder that once they complete the ₹99 
 
 
     if (preReply) {
-      await sendText(phone, preReply);
+      await sendText(phone, withPaymentSupport(preReply));
     } else {
-      await sendText(phone, t(session.language, "paymentReminderShort"));
+      await sendText(phone, withPaymentSupport(t(session.language, "paymentReminderShort")));
     }
     return;
   }
