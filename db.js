@@ -67,6 +67,19 @@ async function initDb() {
   // (including confused voice notes) stuck verifying payment, never once
   // pointed to a human.
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_payment_inquiry_count INTEGER NOT NULL DEFAULT 0;`);
+  // Counts failed attempts to match a language choice in the
+  // awaiting_language picker. Without a fallback, a customer who never
+  // sends an exact "1"/"2"/"English"/"Malayalam"-style reply gets the
+  // identical picker message re-sent forever, with zero acknowledgment,
+  // no matter how many times or how differently they try — losing the
+  // sale before they've even seen pricing. Real incident: 918637429436 —
+  // tried 5 separate times across 8 days (general questions, "Tamil", a
+  // voice message), got the exact same picker every time, never got
+  // through. After a couple of failed attempts we now default to
+  // Malayalam (this bot's customers are overwhelmingly Malayalam
+  // speakers, same reasoning used elsewhere in this codebase) and let
+  // them proceed rather than trap them indefinitely.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS language_attempts INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
   // Customer's current reply language, detected per-message (see
   // detectLanguage() in server.js) and updated adaptively — whatever
@@ -150,6 +163,7 @@ function rowToSession(row) {
     awaitingTransactionId: row.awaiting_transaction_id,
     awaitingReportInquiryCount: row.awaiting_report_inquiry_count,
     awaitingPaymentInquiryCount: row.awaiting_payment_inquiry_count,
+    languageAttempts: row.language_attempts,
     pendingSecondPerson: row.pending_second_person,
     paymentConfirmedAt: row.payment_confirmed_at,
     lastAttemptAt: row.last_attempt_at,
@@ -197,6 +211,7 @@ const FIELD_MAP = {
   awaitingTransactionId: "awaiting_transaction_id",
   awaitingReportInquiryCount: "awaiting_report_inquiry_count",
   awaitingPaymentInquiryCount: "awaiting_payment_inquiry_count",
+  languageAttempts: "language_attempts",
   pendingSecondPerson: "pending_second_person",
   paymentConfirmedAt: "payment_confirmed_at",
   lastAttemptAt: "last_attempt_at",
