@@ -1697,11 +1697,41 @@ async function handleTextMessage(phone, text, session) {
   if (session.stage === "awaiting_language") {
     const chosen = matchLanguageChoice(text);
     if (!chosen) {
+      const attempts = (session.languageAttempts || 0) + 1;
+      const LANGUAGE_PICKER_FALLBACK_THRESHOLD = 2;
+
+      if (attempts >= LANGUAGE_PICKER_FALLBACK_THRESHOLD) {
+        // Don't trap them forever — default to Malayalam (this bot's
+        // customers are overwhelmingly Malayalam speakers, same reasoning
+        // used elsewhere in this codebase for ambiguous-language defaults)
+        // and let them through, rather than re-showing the identical
+        // picker with zero acknowledgment no matter how many times or how
+        // differently they try. Real incident: 918637429436 — 5 separate
+        // attempts across 8 days, never once got past this screen.
+        log(
+          "awaiting_language: unrecognized reply from",
+          phone,
+          "after",
+          attempts,
+          "attempts -> defaulting to Malayalam and proceeding instead of trapping them. Text was:",
+          text
+        );
+        session = await db.updateSession(phone, { language: "ml", stage: "collecting", languageAttempts: 0 });
+        await sendText(phone, t(session.language, "welcome"));
+
+        const extracted = await extractFields(text, session);
+        const patch = applyExtractedPatch(session, extracted);
+        if (Object.keys(patch).length) session = await db.updateSession(phone, patch);
+        await progressCollectingStage(phone, session);
+        return;
+      }
+
       log("awaiting_language: unrecognized reply from", phone, "-> re-sending picker instead of guessing. Text was:", text);
+      await db.updateSession(phone, { languageAttempts: attempts });
       await sendText(phone, LANGUAGE_PICKER_MESSAGE);
       return;
     }
-    session = await db.updateSession(phone, { language: chosen, stage: "collecting" });
+    session = await db.updateSession(phone, { language: chosen, stage: "collecting", languageAttempts: 0 });
     await sendText(phone, t(session.language, "welcome"));
 
     // In case the customer packed their actual details into the same
