@@ -80,6 +80,16 @@ async function initDb() {
   // speakers, same reasoning used elsewhere in this codebase) and let
   // them proceed rather than trap them indefinitely.
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS language_attempts INTEGER NOT NULL DEFAULT 0;`);
+  // Tracks whether a one-time re-engagement nudge has been sent to a
+  // customer who stalled early in the funnel (awaiting_language or
+  // collecting) and went quiet. Real finding: on 28/8, 25% of active chats
+  // never picked a language and 24% never finished giving name/DOB/gender
+  // — nearly half the day's conversations — with zero follow-up from the
+  // bot once they went quiet. One customer (918637429436) was confirmed to
+  // never return on their own across multiple separate days. NULL means
+  // no nudge sent yet; once sent, this is set permanently so it only ever
+  // happens once per session (never spammy, never repeated).
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS funnel_nudge_sent_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
   // Customer's current reply language, detected per-message (see
   // detectLanguage() in server.js) and updated adaptively — whatever
@@ -164,6 +174,7 @@ function rowToSession(row) {
     awaitingReportInquiryCount: row.awaiting_report_inquiry_count,
     awaitingPaymentInquiryCount: row.awaiting_payment_inquiry_count,
     languageAttempts: row.language_attempts,
+    funnelNudgeSentAt: row.funnel_nudge_sent_at,
     pendingSecondPerson: row.pending_second_person,
     paymentConfirmedAt: row.payment_confirmed_at,
     lastAttemptAt: row.last_attempt_at,
@@ -212,6 +223,7 @@ const FIELD_MAP = {
   awaitingReportInquiryCount: "awaiting_report_inquiry_count",
   awaitingPaymentInquiryCount: "awaiting_payment_inquiry_count",
   languageAttempts: "language_attempts",
+  funnelNudgeSentAt: "funnel_nudge_sent_at",
   pendingSecondPerson: "pending_second_person",
   paymentConfirmedAt: "payment_confirmed_at",
   lastAttemptAt: "last_attempt_at",
@@ -309,6 +321,27 @@ async function findSentReports() {
 // sweep-triggered attempts. This — not just the missing hard cap — is
 // almost certainly the dominant cause behind gpt-4.1 request volume
 // growing from ~200/day to 7,333/day over 25-27/7.
+// Finds pre-payment sessions that have gone quiet for at least thresholdMs
+// and never received a re-engagement nudge. Scoped to the two earliest
+// funnel stages (awaiting_language, collecting) — these are the stages
+// with the highest drop-off and, unlike awaiting_report/awaiting_payment,
+// had NO follow-up mechanism at all before this. Only ever fires once per
+// session (funnel_nudge_sent_at IS NULL), so this can never become spam —
+// a customer who's genuinely not interested gets nudged once, not
+// repeatedly. Real finding this addresses: on 28/8, 49% of active chats
+// stalled in these two stages combined, with confirmed evidence
+// (918637429436) that customers do not return on their own.
+async function findAbandonedFunnelSessions(thresholdMs) {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE stage IN ('awaiting_language', 'collecting')
+       AND updated_at <= now() - ($1 || ' milliseconds')::interval
+       AND funnel_nudge_sent_at IS NULL`,
+    [thresholdMs]
+  );
+  return result.rows.map(rowToSession);
+}
+
 async function findOverdueAwaitingReports(thresholdMs, hardCapMs, pacingMs) {
   const result = await pool.query(
     `SELECT * FROM sessions
@@ -395,6 +428,7 @@ module.exports = {
   updateSession,
   findDueReports,
   findOverdueAwaitingReports,
+  findAbandonedFunnelSessions,
   findFailedPayments,
   findRefundRequests,
   findSentReports,
