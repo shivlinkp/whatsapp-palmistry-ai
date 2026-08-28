@@ -337,6 +337,8 @@ ${timingLine}`;
     faqHowLong: "Payment screenshot അയച്ചതിന് ശേഷം ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ report ലഭിക്കും.",
     faqWhatGet: "നിങ്ങളുടെ സ്വഭാവം, ബന്ധങ്ങൾ, വിവാഹം, കരിയർ, സാമ്പത്തികം, ഭാവി എന്നിവയെക്കുറിച്ചുള്ള വിശദമായ കൈരേഖാ വിശകലനം ലഭിക്കും.",
     paymentReminderShort: "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.",
+    funnelNudge:
+      "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഇപ്പോഴും തയ്യാറാണ് — തുടരാൻ താൽപര്യമുണ്ടെങ്കിൽ പേര്, ജനനത്തീയതി, Gender എന്നിവ ഒരുമിച്ച് അയച്ചുതരാം. ചോദ്യങ്ങൾ ഉണ്ടെങ്കിൽ ഇവിടെ ചോദിക്കാം.",
     askForHandPhotoAgain: (gender) =>
       `ദയവായി നിങ്ങളുടെ ${gender === "female" ? "ഇടത്" : "വലത്"} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?`,
     askTransactionId: "സ്ക്രീൻഷോട്ട് അയക്കാൻ കഴിയുന്നില്ലെങ്കിൽ കുഴപ്പമില്ല. Payment ചെയ്ത transaction ID ഇവിടെ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ മതി.",
@@ -450,6 +452,8 @@ ${timingLine}`;
     faqHowLong: "You'll get your report about 25-30 minutes after sending the payment screenshot.",
     faqWhatGet: "You'll get a detailed palm reading covering your personality, relationships, marriage, career, finances, and future.",
     paymentReminderShort: "Once you've paid, just send the screenshot here.",
+    funnelNudge:
+      "Hi! ߑ Your ₹99 palm reading is still ready whenever you'd like to continue — just send your name, date of birth, and gender together. Happy to answer any questions here too.",
     askForHandPhotoAgain: (gender) =>
       `Could you please send a clear photo of your ${gender === "female" ? "left" : "right"} hand?`,
     askTransactionId: "No problem if you can't send a screenshot. Just type and send the transaction ID for the payment here.",
@@ -548,6 +552,14 @@ const LANGUAGE_PICKER_MESSAGE = `Hi! Please choose your language / ദയവാ�
 
 1️⃣ English
 2️⃣ മലയാളം (Malayalam)`;
+
+// Bilingual re-engagement nudge for a customer who stalled BEFORE ever
+// picking a language — session.language is still null at this point, so
+// the normal t()-based lookup can't be used. Sent once, ever, per session
+// (see funnel_nudge_sent_at in db.js).
+const LANGUAGE_STAGE_FUNNEL_NUDGE = `Hi! ߑ Just checking in — your ₹99 palm reading is still available whenever you'd like to continue.
+
+Reply 1️⃣ for English or 2️⃣ for മലയാളം to get started / ദയവായി ഭാഷ തിരഞ്ഞെടുക്കുക.`;
 
 // Matches a reply to LANGUAGE_PICKER_MESSAGE. Deliberately simple and
 // deterministic (digit, keyword, or script match) rather than a GPT call —
@@ -1516,6 +1528,12 @@ const SWEEP_AUTO_RETRY_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 // once per REPORT_FORCE_RETRY_AFTER_MS as intended. See
 // findOverdueAwaitingReports in db.js for the full incident writeup.
 const SWEEP_RETRY_PACING_MS = REPORT_FORCE_RETRY_AFTER_MS; // 30 minutes
+
+// How long a customer must be quiet in awaiting_language/collecting before
+// getting the one-time re-engagement nudge. 3 hours is long enough that
+// it's clearly not just normal typing/thinking pause, short enough that
+// the ₹99 pricing and context are still fresh when they get the nudge.
+const FUNNEL_NUDGE_AFTER_MS = 3 * 60 * 60 * 1000; // 3 hours
 
 // Minimum time between forced-retry generation attempts triggered by a
 // customer message, regardless of how many messages they send in that
@@ -2549,6 +2567,29 @@ async function pollDueReports() {
       if (!result.success && result.exhausted) {
         await sendText(session.phone, t(session.language, "reportExhausted"));
       }
+    }
+
+    // One-time re-engagement nudge for customers who stalled in the two
+    // earliest, highest-drop-off funnel stages (awaiting_language,
+    // collecting) and went quiet — these stages previously had NO
+    // follow-up at all. Real finding: 28/8, 49% of active chats stalled
+    // here combined, with confirmed evidence (918637429436) that
+    // customers do not return on their own. Fires at most once ever per
+    // session (see funnel_nudge_sent_at / findAbandonedFunnelSessions).
+    const abandonedSessions = await db.findAbandonedFunnelSessions(FUNNEL_NUDGE_AFTER_MS);
+    for (const session of abandonedSessions) {
+      const nudgeText =
+        session.stage === "awaiting_language"
+          ? LANGUAGE_STAGE_FUNNEL_NUDGE
+          : t(session.language, "funnelNudge");
+      log(
+        "Funnel nudge: sending one-time re-engagement message to",
+        session.phone,
+        "-> stalled in stage:",
+        session.stage
+      );
+      await sendText(session.phone, nudgeText);
+      await db.updateSession(session.phone, { funnelNudgeSentAt: new Date() });
     }
   } catch (err) {
     log("Poller crashed (caught):", err.message);
