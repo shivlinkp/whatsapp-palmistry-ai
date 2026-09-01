@@ -90,6 +90,18 @@ async function initDb() {
   // no nudge sent yet; once sent, this is set permanently so it only ever
   // happens once per session (never spammy, never repeated).
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS funnel_nudge_sent_at TIMESTAMPTZ;`);
+  // Counts real (non-trivial-ack) follow-up messages answered for free
+  // after a report was delivered. Without a limit, customers could ask
+  // unlimited personal questions indefinitely, each one a real paid GPT
+  // call, at zero additional revenue. Real incident: Ajitha KA,
+  // 919961850471 — 1,282 messages over a full week on a single ₹99
+  // payment, hundreds of deeply personal follow-up questions all answered
+  // for free. Resets to 0 whenever a fresh payment is confirmed (either
+  // the original report or a follow-up re-payment).
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS follow_up_message_count INTEGER NOT NULL DEFAULT 0;`);
+  // True once the free follow-up limit is reached and the bot is waiting
+  // for a new ₹99 payment screenshot before answering more questions.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_follow_up_payment BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
   // Customer's current reply language, detected per-message (see
   // detectLanguage() in server.js) and updated adaptively — whatever
@@ -175,6 +187,8 @@ function rowToSession(row) {
     awaitingPaymentInquiryCount: row.awaiting_payment_inquiry_count,
     languageAttempts: row.language_attempts,
     funnelNudgeSentAt: row.funnel_nudge_sent_at,
+    followUpMessageCount: row.follow_up_message_count,
+    awaitingFollowUpPayment: row.awaiting_follow_up_payment,
     pendingSecondPerson: row.pending_second_person,
     paymentConfirmedAt: row.payment_confirmed_at,
     lastAttemptAt: row.last_attempt_at,
@@ -224,6 +238,8 @@ const FIELD_MAP = {
   awaitingPaymentInquiryCount: "awaiting_payment_inquiry_count",
   languageAttempts: "language_attempts",
   funnelNudgeSentAt: "funnel_nudge_sent_at",
+  followUpMessageCount: "follow_up_message_count",
+  awaitingFollowUpPayment: "awaiting_follow_up_payment",
   pendingSecondPerson: "pending_second_person",
   paymentConfirmedAt: "payment_confirmed_at",
   lastAttemptAt: "last_attempt_at",
