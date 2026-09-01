@@ -288,6 +288,10 @@ const T = {
 താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്യുക.
 
 Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`,
+    followUpLimitReached: `നന്ദി, ഇത്രയധികം ചോദ്യങ്ങൾ ചോദിച്ചതിന്! 🙏
+
+ഈ റീഡിംഗിനുള്ള ചോദ്യങ്ങളുടെ പരിധി എത്തിയിരിക്കുന്നു. കൂടുതൽ ചോദ്യങ്ങൾ ചോദിക്കാൻ ആഗ്രഹിക്കുന്നുവെങ്കിൽ, ദയവായി താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്ത് screenshot അയച്ചുതരാമോ? അതിനുശേഷം തുടരാം.`,
+    followUpPaymentConfirmed: `Payment ലഭിച്ചു, നന്ദി! 🙏 ദയവായി നിങ്ങളുടെ ചോദ്യങ്ങൾ തുടരാം.`,
     qrFailure(language) {
       return `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${T.ml.supportContactLine}`;
     },
@@ -338,7 +342,7 @@ ${timingLine}`;
     faqWhatGet: "നിങ്ങളുടെ സ്വഭാവം, ബന്ധങ്ങൾ, വിവാഹം, കരിയർ, സാമ്പത്തികം, ഭാവി എന്നിവയെക്കുറിച്ചുള്ള വിശദമായ കൈരേഖാ വിശകലനം ലഭിക്കും.",
     paymentReminderShort: "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.",
     funnelNudge:
-      "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഇപ്പോഴും തയ്യാറാണ് — തുടരാൻ താൽപര്യമുണ്ടെങ്കിൽ പേര്, ജനനത്തീയതി, Gender എന്നിവ ഒരുമിച്ച് അയച്ചുതരാം. ചോദ്യങ്ങൾ ഉണ്ടെങ്കിൽ ഇവിടെ ചോദിക്കാം.",
+      "Hi! 👋 നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഇപ്പോഴും തയ്യാറാണ് — തുടരാൻ താൽപര്യമുണ്ടെങ്കിൽ പേര്, ജനനത്തീയതി, Gender എന്നിവ ഒരുമിച്ച് അയച്ചുതരാം. ചോദ്യങ്ങൾ ഉണ്ടെങ്കിൽ ഇവിടെ ചോദിക്കാം.",
     askForHandPhotoAgain: (gender) =>
       `ദയവായി നിങ്ങളുടെ ${gender === "female" ? "ഇടത്" : "വലത്"} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?`,
     askTransactionId: "സ്ക്രീൻഷോട്ട് അയക്കാൻ കഴിയുന്നില്ലെങ്കിൽ കുഴപ്പമില്ല. Payment ചെയ്ത transaction ID ഇവിടെ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ മതി.",
@@ -404,6 +408,10 @@ When taking the photo:
 Please pay ₹99 using the QR code above.
 
 Once you've paid, just send the payment screenshot here.`,
+    followUpLimitReached: `Thank you for all your questions! 🙏
+
+You've reached the question limit for this reading. If you'd like to continue asking questions, please pay ₹99 using the QR code below and send the screenshot — we'll continue right after.`,
+    followUpPaymentConfirmed: `Payment received, thank you! 🙏 Please go ahead and continue with your questions.`,
     qrFailure(language) {
       return `There was a small issue sending the QR code. Please try again in a little while. If the issue continues, ${T.en.supportContactLine}`;
     },
@@ -453,7 +461,7 @@ ${timingLine}`;
     faqWhatGet: "You'll get a detailed palm reading covering your personality, relationships, marriage, career, finances, and future.",
     paymentReminderShort: "Once you've paid, just send the screenshot here.",
     funnelNudge:
-      "Hi! ߑ Your ₹99 palm reading is still ready whenever you'd like to continue — just send your name, date of birth, and gender together. Happy to answer any questions here too.",
+      "Hi! 👋 Your ₹99 palm reading is still ready whenever you'd like to continue — just send your name, date of birth, and gender together. Happy to answer any questions here too.",
     askForHandPhotoAgain: (gender) =>
       `Could you please send a clear photo of your ${gender === "female" ? "left" : "right"} hand?`,
     askTransactionId: "No problem if you can't send a screenshot. Just type and send the transaction ID for the payment here.",
@@ -557,7 +565,7 @@ const LANGUAGE_PICKER_MESSAGE = `Hi! Please choose your language / ദയവാ�
 // picking a language — session.language is still null at this point, so
 // the normal t()-based lookup can't be used. Sent once, ever, per session
 // (see funnel_nudge_sent_at in db.js).
-const LANGUAGE_STAGE_FUNNEL_NUDGE = `Hi! ߑ Just checking in — your ₹99 palm reading is still available whenever you'd like to continue.
+const LANGUAGE_STAGE_FUNNEL_NUDGE = `Hi! 👋 Just checking in — your ₹99 palm reading is still available whenever you'd like to continue.
 
 Reply 1️⃣ for English or 2️⃣ for മലയാളം to get started / ദയവായി ഭാഷ തിരഞ്ഞെടുക്കുക.`;
 
@@ -1535,6 +1543,14 @@ const SWEEP_RETRY_PACING_MS = REPORT_FORCE_RETRY_AFTER_MS; // 30 minutes
 // the ₹99 pricing and context are still fresh when they get the nudge.
 const FUNNEL_NUDGE_AFTER_MS = 3 * 60 * 60 * 1000; // 3 hours
 
+// How many real (non-trivial-ack) follow-up questions a customer can ask
+// for free after their report is delivered, before being asked to pay
+// ₹99 again to continue. Generous enough that normal engagement (a
+// handful to a couple dozen genuine questions) is never affected — this
+// only stops the genuine outlier case. See report_sent handler for the
+// gate itself.
+const FOLLOW_UP_FREE_LIMIT = 30;
+
 // Minimum time between forced-retry generation attempts triggered by a
 // customer message, regardless of how many messages they send in that
 // window. Without this, a frustrated customer firing off several short
@@ -2202,6 +2218,41 @@ Otherwise, after your answer, end with a gentle reminder that once they complete
       }
     }
 
+    // Free-follow-up limit: after a report is delivered, customers can ask
+    // reasonable follow-up questions for free — but without a ceiling this
+    // is unbounded. Real incident: Ajitha KA, 919961850471 — 1,282
+    // messages over a full week on a single ₹99 payment, hundreds of real
+    // GPT calls answering deeply personal questions for zero additional
+    // revenue. FOLLOW_UP_FREE_LIMIT is generous (30 real questions) so
+    // normal engagement is unaffected — this only kicks in for genuine
+    // outliers. Trivial acks and the second-person-order flow above don't
+    // count toward this and are handled before reaching here.
+    if (session.awaitingFollowUpPayment) {
+      log("Customer at", phone, "is gated on follow-up payment — reminding instead of answering. Message was:", text);
+      await sendText(phone, t(session.language, "followUpLimitReached"));
+      return;
+    }
+
+    const followUpCount = (session.followUpMessageCount || 0) + 1;
+    if (followUpCount > FOLLOW_UP_FREE_LIMIT) {
+      log(
+        "Customer at",
+        phone,
+        "reached the free follow-up limit (",
+        FOLLOW_UP_FREE_LIMIT,
+        ") — gating further Q&A behind a new ₹99 payment instead of calling GPT."
+      );
+      await db.updateSession(phone, { awaitingFollowUpPayment: true, followUpMessageCount: followUpCount });
+      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+      if (qrSent) {
+        await sendText(phone, t(session.language, "followUpLimitReached"));
+      } else {
+        await sendText(phone, t(session.language, "qrFailure"));
+      }
+      return;
+    }
+    await db.updateSession(phone, { followUpMessageCount: followUpCount });
+
     const todayStr = new Date().toISOString().slice(0, 10); // e.g. "2026-07-03"
     const currentYear = new Date().getFullYear();
     const isEnglish = session.language === "en";
@@ -2444,6 +2495,17 @@ async function handleImageMessage(phone, mediaId, session) {
   }
 
   if (session.stage === "report_sent") {
+    // A photo arriving while gated on the free-follow-up limit is treated
+    // as the payment screenshot for continuing — accept it unconditionally
+    // (same trust model as the original payment flow: no verification,
+    // just proceed) and reset the counter so Q&A resumes normally.
+    if (session.awaitingFollowUpPayment) {
+      log("Follow-up payment screenshot received from", phone, "-> resetting follow-up limit and resuming Q&A.");
+      await db.updateSession(phone, { awaitingFollowUpPayment: false, followUpMessageCount: 0 });
+      await sendText(phone, t(session.language, "followUpPaymentConfirmed"));
+      return;
+    }
+
     // Safety net for the same failure mode as bug #23/#24, but caught late:
     // if the stored report itself still looks like a refusal or degenerate
     // repetition — whether from before a phrasing fix was deployed, or a
