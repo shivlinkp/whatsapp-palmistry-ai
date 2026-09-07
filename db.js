@@ -102,6 +102,14 @@ async function initDb() {
   // True once the free follow-up limit is reached and the bot is waiting
   // for a new ₹99 payment screenshot before answering more questions.
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_follow_up_payment BOOLEAN NOT NULL DEFAULT false;`);
+  // Counts consecutive times a customer in "collecting" has been shown the
+  // "please send name/DOB/gender" prompt without successfully providing
+  // it — used to switch from a generic re-ask to a concrete example after
+  // repeated confusion, rather than repeating the same abstract
+  // instruction indefinitely. Real incident: several 7/9 chats where a
+  // genuinely confused (non-troll) customer kept getting near-identical
+  // "please send your details" prompts with no example format shown.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS collecting_clarify_attempts INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
   // Customer's current reply language, detected per-message (see
   // detectLanguage() in server.js) and updated adaptively — whatever
@@ -189,6 +197,7 @@ function rowToSession(row) {
     funnelNudgeSentAt: row.funnel_nudge_sent_at,
     followUpMessageCount: row.follow_up_message_count,
     awaitingFollowUpPayment: row.awaiting_follow_up_payment,
+    collectingClarifyAttempts: row.collecting_clarify_attempts,
     pendingSecondPerson: row.pending_second_person,
     paymentConfirmedAt: row.payment_confirmed_at,
     lastAttemptAt: row.last_attempt_at,
@@ -240,6 +249,7 @@ const FIELD_MAP = {
   funnelNudgeSentAt: "funnel_nudge_sent_at",
   followUpMessageCount: "follow_up_message_count",
   awaitingFollowUpPayment: "awaiting_follow_up_payment",
+  collectingClarifyAttempts: "collecting_clarify_attempts",
   pendingSecondPerson: "pending_second_person",
   paymentConfirmedAt: "payment_confirmed_at",
   lastAttemptAt: "last_attempt_at",
