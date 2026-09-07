@@ -261,6 +261,7 @@ const T = {
 • പേര്
 • ജനനത്തീയതി
 • Gender (ലിംഗം)`,
+    detailsExample: `\n\nഉദാഹരണം: Anjali, 15-08-1995, Female`,
     askSecondPersonDetails: `തീർച്ചയായും, ഇതേ ചാറ്റിൽ തന്നെ അടുത്ത വ്യക്തിയുടെ കൈരേഖാ വിശകലനം ആരംഭിക്കാം.
 
 ദയവായി ആ വ്യക്തിയുടെ താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
@@ -381,6 +382,7 @@ Fee: just ₹99.`,
 • Name
 • Date of birth
 • Gender`,
+    detailsExample: `\n\nExample: Anjali, 15-08-1995, Female`,
     askSecondPersonDetails: `Sure, let's start the next person's palm reading right here in this same chat.
 
 Could you please send that person's following details together?
@@ -675,7 +677,16 @@ function isTrivialAcknowledgment(text) {
     "✔️",
     "✅",
   ]);
-  return trivialWords.has(cleaned);
+  if (trivialWords.has(cleaned)) return true;
+
+  // Catches messages made up ENTIRELY of emoji (any count/combination),
+  // e.g. "😃😃😃😃😃" — previously each burst of these triggered its own
+  // full GPT reply since they didn't match the fixed single-emoji set
+  // above. Real incident: a rapid-fire emoji spam burst (many messages
+  // within seconds of each other) each got a distinct, real GPT-5.5 call
+  // in the collecting stage, pure wasted spend on non-questions.
+  const emojiOnlyRegex = /^[\p{Extended_Pictographic}\u200d\ufe0f\s]+$/u;
+  return text.trim().length > 0 && emojiOnlyRegex.test(text.trim());
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,6 +1640,8 @@ function applyExtractedPatch(session, extracted) {
   return patch;
 }
 
+const COLLECTING_EXAMPLE_THRESHOLD = 3; // show a concrete example after this many unresolved prompts
+
 async function progressCollectingStage(phone, session) {
   const missingFields = [];
   if (!session.name) missingFields.push(t(session.language, "fieldName"));
@@ -1636,15 +1649,32 @@ async function progressCollectingStage(phone, session) {
   if (!session.gender) missingFields.push(t(session.language, "fieldGender"));
 
   if (missingFields.length > 0) {
+    // Track how many times in a row this customer has been shown this
+    // prompt without successfully providing their details — after a few
+    // unresolved attempts, switch from an abstract instruction to a
+    // concrete example, which converts much better for genuinely confused
+    // (non-troll) customers than repeating the same generic ask.
+    const attempts = (session.collectingClarifyAttempts || 0) + 1;
+    await db.updateSession(phone, { collectingClarifyAttempts: attempts });
+
     // Only ask for what's actually still missing — previously this always
     // sent the full "please send name/DOB/gender" message even when some
     // fields (e.g. name and gender) had already been provided.
-    const message =
+    let message =
       missingFields.length === 3
         ? t(session.language, "askAllDetails")
         : t(session.language, "missingFieldsPrompt", missingFields.join(", "));
+    if (attempts >= COLLECTING_EXAMPLE_THRESHOLD) {
+      message += t(session.language, "detailsExample");
+    }
     await sendText(phone, message);
     return session;
+  }
+
+  // All fields present — reset the counter so it doesn't carry over to a
+  // future second-person order in the same chat.
+  if (session.collectingClarifyAttempts) {
+    await db.updateSession(phone, { collectingClarifyAttempts: 0 });
   }
 
   if (session.palmMediaId) {
