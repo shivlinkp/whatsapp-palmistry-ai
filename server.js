@@ -289,10 +289,10 @@ const T = {
 താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്യുക.
 
 Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`,
-    followUpLimitReached: `നന്ദി, ഇത്രയധികം ചോദ്യങ്ങൾ ചോദിച്ചതിന്! 🙏
+    followUpLimitReached: `നന്ദി, ഇത്രയധികം ചോദ്യങ്ങൾ ചോദിച്ചതിന്! ߙ
 
 ഈ റീഡിംഗിനുള്ള ചോദ്യങ്ങളുടെ പരിധി എത്തിയിരിക്കുന്നു. കൂടുതൽ ചോദ്യങ്ങൾ ചോദിക്കാൻ ആഗ്രഹിക്കുന്നുവെങ്കിൽ, ദയവായി താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്ത് screenshot അയച്ചുതരാമോ? അതിനുശേഷം തുടരാം.`,
-    followUpPaymentConfirmed: `Payment ലഭിച്ചു, നന്ദി! 🙏 ദയവായി നിങ്ങളുടെ ചോദ്യങ്ങൾ തുടരാം.`,
+    followUpPaymentConfirmed: `Payment ലഭിച്ചു, നന്ദി! ߙ ദയവായി നിങ്ങളുടെ ചോദ്യങ്ങൾ തുടരാം.`,
     qrFailure(language) {
       return `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${T.ml.supportContactLine}`;
     },
@@ -343,7 +343,7 @@ ${timingLine}`;
     faqWhatGet: "നിങ്ങളുടെ സ്വഭാവം, ബന്ധങ്ങൾ, വിവാഹം, കരിയർ, സാമ്പത്തികം, ഭാവി എന്നിവയെക്കുറിച്ചുള്ള വിശദമായ കൈരേഖാ വിശകലനം ലഭിക്കും.",
     paymentReminderShort: "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.",
     funnelNudge:
-      "Hi! 👋 നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഇപ്പോഴും തയ്യാറാണ് — തുടരാൻ താൽപര്യമുണ്ടെങ്കിൽ പേര്, ജനനത്തീയതി, Gender എന്നിവ ഒരുമിച്ച് അയച്ചുതരാം. ചോദ്യങ്ങൾ ഉണ്ടെങ്കിൽ ഇവിടെ ചോദിക്കാം.",
+      "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഇപ്പോഴും തയ്യാറാണ് — തുടരാൻ താൽപര്യമുണ്ടെങ്കിൽ പേര്, ജനനത്തീയതി, Gender എന്നിവ ഒരുമിച്ച് അയച്ചുതരാം. ചോദ്യങ്ങൾ ഉണ്ടെങ്കിൽ ഇവിടെ ചോദിക്കാം.",
     askForHandPhotoAgain: (gender) =>
       `ദയവായി നിങ്ങളുടെ ${gender === "female" ? "ഇടത്" : "വലത്"} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?`,
     askTransactionId: "സ്ക്രീൻഷോട്ട് അയക്കാൻ കഴിയുന്നില്ലെങ്കിൽ കുഴപ്പമില്ല. Payment ചെയ്ത transaction ID ഇവിടെ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ മതി.",
@@ -410,10 +410,10 @@ When taking the photo:
 Please pay ₹99 using the QR code above.
 
 Once you've paid, just send the payment screenshot here.`,
-    followUpLimitReached: `Thank you for all your questions! 🙏
+    followUpLimitReached: `Thank you for all your questions! ߙ
 
 You've reached the question limit for this reading. If you'd like to continue asking questions, please pay ₹99 using the QR code below and send the screenshot — we'll continue right after.`,
-    followUpPaymentConfirmed: `Payment received, thank you! 🙏 Please go ahead and continue with your questions.`,
+    followUpPaymentConfirmed: `Payment received, thank you! ߙ Please go ahead and continue with your questions.`,
     qrFailure(language) {
       return `There was a small issue sending the QR code. Please try again in a little while. If the issue continues, ${T.en.supportContactLine}`;
     },
@@ -463,7 +463,7 @@ ${timingLine}`;
     faqWhatGet: "You'll get a detailed palm reading covering your personality, relationships, marriage, career, finances, and future.",
     paymentReminderShort: "Once you've paid, just send the screenshot here.",
     funnelNudge:
-      "Hi! 👋 Your ₹99 palm reading is still ready whenever you'd like to continue — just send your name, date of birth, and gender together. Happy to answer any questions here too.",
+      "Hi! ߑ Your ₹99 palm reading is still ready whenever you'd like to continue — just send your name, date of birth, and gender together. Happy to answer any questions here too.",
     askForHandPhotoAgain: (gender) =>
       `Could you please send a clear photo of your ${gender === "female" ? "left" : "right"} hand?`,
     askTransactionId: "No problem if you can't send a screenshot. Just type and send the transaction ID for the payment here.",
@@ -567,7 +567,7 @@ const LANGUAGE_PICKER_MESSAGE = `Hi! Please choose your language / ദയവാ�
 // picking a language — session.language is still null at this point, so
 // the normal t()-based lookup can't be used. Sent once, ever, per session
 // (see funnel_nudge_sent_at in db.js).
-const LANGUAGE_STAGE_FUNNEL_NUDGE = `Hi! 👋 Just checking in — your ₹99 palm reading is still available whenever you'd like to continue.
+const LANGUAGE_STAGE_FUNNEL_NUDGE = `Hi! ߑ Just checking in — your ₹99 palm reading is still available whenever you'd like to continue.
 
 Reply 1️⃣ for English or 2️⃣ for മലയാളം to get started / ദയവായി ഭാഷ തിരഞ്ഞെടുക്കുക.`;
 
@@ -599,6 +599,17 @@ function cannotSendScreenshotIntent(text) {
   const mentionsScreenshot = /screenshot|\bss\b/i.test(text);
   const inability = /\b(illa|pattilla|pattunnilla|cannot|can'?t|not able|mudiyilla|unable|issue|problem)\b/i.test(text);
   return mentionsScreenshot && inability;
+}
+
+// Matches an explicit ask to see the QR code again ("resend QR", "lost the
+// code", "can't find the QR", "scan again", etc.) — a customer asking this
+// wants the actual image, not another text description of "the QR code
+// above" (which is unhelpful if they can no longer see it, e.g. it scrolled
+// out of view or they're on a new device).
+function wantsQrResend(text) {
+  const mentionsQr = /\bqr\b|code|barcode|സ്കാൻ|scan/i.test(text);
+  const resendIntent = /resend|again|send.*again|kaanunnilla|kittunnilla|not (showing|visible|there)|lost|missing|kaanan|kaanuvan|onnukoodi|oru thavana koodi|vendi.*veendum/i.test(text);
+  return mentionsQr && resendIntent;
 }
 
 // FAQ intent patterns are language-agnostic (they already match English AND
@@ -680,7 +691,7 @@ function isTrivialAcknowledgment(text) {
   if (trivialWords.has(cleaned)) return true;
 
   // Catches messages made up ENTIRELY of emoji (any count/combination),
-  // e.g. "😃😃😃😃😃" — previously each burst of these triggered its own
+  // e.g. "ߘߘߘߘߘ" — previously each burst of these triggered its own
   // full GPT reply since they didn't match the fixed single-emoji set
   // above. Real incident: a rapid-fire emoji spam burst (many messages
   // within seconds of each other) each got a distinct, real GPT-5.5 call
@@ -1953,6 +1964,21 @@ Otherwise — genuine questions, hesitation, or trust concerns — end by asking
       return;
     }
 
+    if (wantsQrResend(text)) {
+      // Real gap: a customer explicitly asking to see the QR again (it
+      // scrolled out of view, they switched devices, etc.) previously only
+      // ever got a text description of "the QR code above" — unhelpful if
+      // they genuinely can't see it anymore. Now resends the actual image.
+      log("Customer at", phone, "explicitly asked to resend the QR code — sending the image again.");
+      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+      if (qrSent) {
+        await sendText(phone, withPaymentSupport(t(session.language, "paymentReminderShort")));
+      } else {
+        await sendText(phone, withPaymentSupport(t(session.language, "qrFailure")));
+      }
+      return;
+    }
+
     // Previously: any message that didn't match the small fixed FAQ list
     // (price/duration/what-you-get) got the exact same generic reminder,
     // even for genuinely different questions (trust concerns, "explain
@@ -2258,8 +2284,18 @@ Otherwise, after your answer, end with a gentle reminder that once they complete
     // outliers. Trivial acks and the second-person-order flow above don't
     // count toward this and are handled before reaching here.
     if (session.awaitingFollowUpPayment) {
-      log("Customer at", phone, "is gated on follow-up payment — reminding instead of answering. Message was:", text);
-      await sendText(phone, t(session.language, "followUpLimitReached"));
+      // Previously only sent the text reminder here — the QR image itself
+      // was only ever sent once, at the moment the gate first triggered.
+      // Any message after that (e.g. the customer asking "how do I pay
+      // again?") got text with no visual QR to actually act on. Now
+      // resends the QR every time, same as the original gate trigger.
+      log("Customer at", phone, "is gated on follow-up payment — resending QR + reminder instead of answering. Message was:", text);
+      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+      if (qrSent) {
+        await sendText(phone, t(session.language, "followUpLimitReached"));
+      } else {
+        await sendText(phone, t(session.language, "qrFailure"));
+      }
       return;
     }
 
