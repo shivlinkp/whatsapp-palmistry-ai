@@ -981,9 +981,12 @@ async function isPalmPhoto(imageDataUrl) {
 // NEW reading for a DIFFERENT person, in this SAME chat? Deliberately
 // conservative: any ambiguity, error, or non-YES answer defaults to false,
 // so a misclassification never accidentally resets someone's own session.
-async function wantsAnotherPersonReading(text) {
+async function wantsAnotherPersonReading(text, previousBotMessage) {
   if (!OPENAI_API_KEY) return false;
   try {
+    const contextLine = previousBotMessage
+      ? `\n\nFor context, the palmist's own PREVIOUS message (right before this customer reply) was: """${previousBotMessage}"""\nIf that previous message itself offered/asked whether the customer wants to start a reading for someone else, and this new message is a short agreement ("yes", "sure", "ok", "cheyyam", etc.), that DOES count as clearly wanting a new reading — reply YES in that case.`
+      : "";
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -1001,6 +1004,7 @@ Reply NO if the message is instead:
 - A question ABOUT an existing reading or reply (even if it mentions another person by name/relation) — e.g. "Ente karyamano wifeinte karyamano" ("is this about me or my wife?") is asking to CLARIFY which existing reading a reply refers to — that is NO, not a new-reading request.
 - A general question, thanks, or comment.
 - Ambiguous in any way.
+${contextLine}
 
 Reply with ONLY one word: YES or NO.
 
@@ -1258,13 +1262,6 @@ async function callOpenAIForReport(messages, maxTokens, model) {
     return { ok: false, status: null, data: null, content: null };
   }
 
-  const requestBody = {
-    model,
-    messages,
-    temperature: 0.8,
-    max_tokens: maxTokens,
-  };
-
   const loggableMessages = messages.map((m) => {
     if (!Array.isArray(m.content)) return m;
     return {
@@ -1276,9 +1273,24 @@ async function callOpenAIForReport(messages, maxTokens, model) {
       ),
     };
   });
-  log(`OpenAI report request payload for model "${model}" (image truncated):`, JSON.stringify({ ...requestBody, messages: loggableMessages }));
 
-  try {
+  // max_completion_tokens (not the older max_tokens) — same fix already
+  // proven in openaiChat(), since max_tokens is rejected outright by newer
+  // models while max_completion_tokens works correctly across old and new
+  // models alike.
+  async function attempt(includeTemperature) {
+    const requestBody = {
+      model,
+      messages,
+      max_completion_tokens: maxTokens,
+    };
+    if (includeTemperature) {
+      requestBody.temperature = 0.8;
+    }
+    log(
+      `OpenAI report request payload for model "${model}" (image truncated, temperature ${includeTemperature ? "included" : "omitted"}):`,
+      JSON.stringify({ ...requestBody, messages: loggableMessages })
+    );
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -1288,8 +1300,24 @@ async function callOpenAIForReport(messages, maxTokens, model) {
       body: JSON.stringify(requestBody),
     });
     const data = await res.json();
+    return { res, data };
+  }
 
+  try {
+    let { res, data } = await attempt(true);
     log(`OpenAI report response HTTP status (model "${model}"):`, res.status);
+
+    // Reasoning-style models (e.g. gpt-5.5 and newer) reject any non-default
+    // temperature outright rather than silently accepting/ignoring it —
+    // same quirk already handled in openaiChat(). Retry once without it
+    // instead of treating this as a hard failure, so upgrading the report
+    // model doesn't require guessing per-model temperature support.
+    if (!res.ok && data?.error?.param === "temperature") {
+      log(`OpenAI report request: model "${model}" rejected custom temperature — retrying once without it.`);
+      ({ res, data } = await attempt(false));
+      log(`OpenAI report response HTTP status (model "${model}", retry without temperature):`, res.status);
+    }
+
     log(`OpenAI report full response (model "${model}"):`, JSON.stringify(data));
 
     if (!res.ok) {
@@ -1412,7 +1440,14 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
     { role: "user", content: userContent },
   ];
 
-  const REPORT_MODEL_PRIMARY = "gpt-4.1";
+  // Upgraded from gpt-4.1 to gpt-5.5 (9/2026) — same model already proven
+  // reliable in this codebase for the follow-up chat path (better
+  // instruction-following on detailed style rules, less prone to the
+  // repetitive-phrasing failure mode). gpt-4o kept as fallback: still
+  // solid, cheap, and a genuinely different model family from gpt-5.5,
+  // which matters for the "try a different model" fallback logic below —
+  // no benefit to falling back to another same-generation reasoning model.
+  const REPORT_MODEL_PRIMARY = "gpt-5.5";
   const REPORT_MODEL_FALLBACK = "gpt-4o";
 
   // Tries one model end-to-end and returns a structured outcome, including
@@ -2224,7 +2259,8 @@ Otherwise, after your answer, end with a gentle reminder that once they complete
         text
       );
     } else {
-      const wantsAnother = await wantsAnotherPersonReading(text);
+      const previousBotMessage = await db.getLastOutboundMessage(phone);
+      const wantsAnother = await wantsAnotherPersonReading(text, previousBotMessage);
       if (wantsAnother) {
         // Check whether THIS message already contains extractable details
         // before asking for them — otherwise a message like "Sabin mathew
@@ -2337,6 +2373,21 @@ Otherwise, after your answer, end with a gentle reminder that once they complete
       ? `If the customer discloses something suggesting real personal distress or a genuine life crisis — an active divorce or separation, a death or serious illness in the family, mentions of self-harm, domestic conflict, addiction, or similar — shift out of the confident predictive style for that topic. Do not keep asserting definitive romantic/marriage/family outcomes ("marriage will happen", specific dates, etc.) as if nothing has changed; acknowledge what they've shared in a brief, human way, keep any palm-based comments general and gentle rather than definitive, and avoid speculating about a specific new partner or relationship they mention in that context. This isn't about refusing to continue the reading — just about not compounding a real, difficult moment with confident predictions that could reinforce false hope or distress. Continue answering their other questions (career, health, family in general) normally.`
       : `If the customer discloses something suggesting real personal distress or a genuine life crisis — an active divorce or separation, a death or serious illness in the family, mentions of self-harm, domestic conflict, addiction, or similar — shift out of the confident predictive style for that topic. Do not keep asserting definitive romantic/marriage/family outcomes ("വിവാഹം നടക്കും", specific dates, etc.) as if nothing has changed; acknowledge what they've shared in a brief, human way, keep any palm-based comments general and gentle rather than definitive, and avoid speculating about a specific new partner or relationship they mention in that context. This isn't about refusing to continue the reading — just about not compounding a real, difficult moment with confident predictions that could reinforce false hope or distress. Continue answering their other questions (career, health, family in general) normally.`;
 
+    // Proactive third-party-reading upsell: the model already correctly
+    // tells customers it can't fully read someone else's character/future
+    // from the customer's own palm — this happens routinely across many
+    // chats every day (a spouse, a friend, a mother-in-law, a potential
+    // partner). Previously this was a dead end — a customer would be told
+    // "I'd need their palm" and the conversation just moved on. Now the
+    // model naturally offers to start that reading right in the same
+    // chat, reusing the EXISTING second-person order flow (see
+    // wantsAnotherPersonReading / pendingSecondPerson below) — no new
+    // product or pricing decision needed, since a second reading is
+    // already ₹99, same as the first.
+    const upsellLine = isEnglish
+      ? `If answering the customer's question properly would require looking at a DIFFERENT person's own palm (their partner's, a family member's, a friend's — anyone other than the customer) — after giving the best general answer you honestly can from the customer's own palm — naturally mention that a proper reading for that person, right here in this same chat, would give a much more accurate answer, and ask if they'd like to start one. Keep this brief and natural, not salesy — one sentence is enough. Only offer this when it's genuinely relevant (their question was actually about someone else's traits/future), not on every message, and never more than once per conversation unless they bring it up again themselves.`
+      : `ഉപഭോക്താവിന്റെ ചോദ്യത്തിന് ശരിയായി ഉത്തരം നൽകാൻ മറ്റൊരു വ്യക്തിയുടെ (പങ്കാളി, കുടുംബാംഗം, സുഹൃത്ത് — ഉപഭോക്താവ് അല്ലാത്ത ആരെങ്കിലും) സ്വന്തം കൈരേഖ വേണമെങ്കിൽ — ഉപഭോക്താവിന്റെ സ്വന്തം കൈരേഖയിൽ നിന്ന് കഴിയുന്ന ഏറ്റവും നല്ല പൊതു ഉത്തരം നൽകിയ ശേഷം — ആ വ്യക്തിക്കുവേണ്ടി ഇതേ ചാറ്റിൽ തന്നെ ഒരു ശരിയായ റീഡിംഗ് ചെയ്യുന്നത് കൂടുതൽ കൃത്യമായ ഉത്തരം നൽകുമെന്ന് സ്വാഭാവികമായി പറയുകയും, അത് തുടങ്ങണോ എന്ന് ചോദിക്കുകയും ചെയ്യുക. ഇത് ചെറുതും സ്വാഭാവികവുമായി വയ്ക്കുക, sales പോലെ തോന്നരുത് — ഒരു വാക്യം മതി. ഇത് യഥാർത്ഥത്തിൽ പ്രസക്തമാകുമ്പോൾ മാത്രം (ചോദ്യം ശരിക്കും മറ്റൊരാളുടെ സ്വഭാവം/ഭാവിയെക്കുറിച്ചാണെങ്കിൽ) വാഗ്ദാനം ചെയ്യുക, എല്ലാ മെസേജിലും അല്ല, ഒരു സംഭാഷണത്തിൽ ഒരിക്കൽ മാത്രം (അവർ വീണ്ടും അത് പരാമർശിക്കുന്നില്ലെങ്കിൽ).`;
+
     const followUpMessages = [
       {
         role: "system",
@@ -2355,6 +2406,8 @@ ${languageLockLine}
 Never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked directly. If children come up, speak only in general terms about family life or the number/timing of children in the future — never the sex of a specific unborn child.
 
 ${distressLine}
+
+${upsellLine}
 ${
   (session.orderCount || 1) > 1
     ? `\nIMPORTANT: this customer has ordered more than one reading in this chat (this is order #${
@@ -2982,6 +3035,100 @@ app.get("/admin/chats", async (req, res) => {
   } catch (err) {
     log("Admin chat list failed (caught):", err.message);
     res.status(500).send("Failed to load conversations: " + err.message);
+  }
+});
+
+// Admin funnel stats — GET /admin/funnel-stats?key=resetmybot123
+// GET /admin/funnel-stats?date=2026-09-09&key=resetmybot123
+// Aggregates conversation stage counts by day, so funnel drop-off trends
+// (awaiting_language / collecting vs report_sent) can be tracked over time
+// without manually counting from /admin/chats. Built after repeated manual
+// funnel tallies (7-9/9/2026) showed 48-85% of daily chats stalling before
+// the photo step, with no easy way to see whether fixes were moving that
+// number. Uses the same underlying data and IST date-key logic as
+// /admin/chats, so the two always agree with each other.
+app.get("/admin/funnel-stats", async (req, res) => {
+  const { key, date } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+
+  try {
+    const conversations = await db.listConversations();
+
+    const istDateKey = (ts) => {
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).formatToParts(new Date(ts));
+      const get = (type) => parts.find((p) => p.type === type).value;
+      return `${get("year")}-${get("month")}-${get("day")}`;
+    };
+
+    // Group every conversation by the IST date of its last activity, then
+    // tally stage counts within each day.
+    const STAGE_ORDER = ["awaiting_language", "collecting", "awaiting_photo", "awaiting_payment", "awaiting_report", "report_sent"];
+    const dayStats = new Map(); // dateKey -> { total, byStage: {stage: count} }
+
+    for (const c of conversations) {
+      const dateKey = istDateKey(c.last_activity);
+      if (date && dateKey !== date) continue;
+      if (!dayStats.has(dateKey)) {
+        dayStats.set(dateKey, { total: 0, byStage: {} });
+      }
+      const stats = dayStats.get(dateKey);
+      stats.total += 1;
+      const stage = c.stage || "unknown";
+      stats.byStage[stage] = (stats.byStage[stage] || 0) + 1;
+    }
+
+    // Sort days most-recent-first, cap at 30 days when no specific date is
+    // requested so this stays fast and readable.
+    const sortedDays = Array.from(dayStats.keys()).sort((a, b) => (a < b ? 1 : -1));
+    const daysToShow = date ? sortedDays : sortedDays.slice(0, 30);
+
+    const rowHtml = (dateKey) => {
+      const stats = dayStats.get(dateKey);
+      const stuckBeforePhoto =
+        (stats.byStage["awaiting_language"] || 0) + (stats.byStage["collecting"] || 0);
+      const stuckPct = stats.total ? ((stuckBeforePhoto / stats.total) * 100).toFixed(0) : "0";
+      const paidPct = stats.total
+        ? (((stats.byStage["report_sent"] || 0) / stats.total) * 100).toFixed(0)
+        : "0";
+      const stageBreakdown = STAGE_ORDER.map((s) => `${escapeHtml(s)}: ${stats.byStage[s] || 0}`).join(" · ");
+      const barColor = stuckPct >= 60 ? "#e05252" : stuckPct >= 40 ? "#e0a952" : "#52c97a";
+      return `<a href="/admin/chats?key=${encodeURIComponent(key)}&date=${dateKey}" style="text-decoration:none;color:inherit;">
+        <div style="padding:14px 16px;border-bottom:1px solid #333;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;">
+            <strong style="font-size:15px;">${escapeHtml(dateKey)}</strong>
+            <span style="color:#888;font-size:12px;">${stats.total} chats</span>
+          </div>
+          <div style="margin-top:6px;background:#222;border-radius:4px;height:8px;overflow:hidden;">
+            <div style="background:${barColor};height:100%;width:${stuckPct}%;"></div>
+          </div>
+          <div style="margin-top:6px;color:#ccc;font-size:13px;">
+            <span style="color:${barColor};font-weight:bold;">${stuckPct}% stuck before photo</span>
+            &nbsp;·&nbsp; ${paidPct}% reached report_sent
+          </div>
+          <div style="margin-top:4px;color:#888;font-size:12px;">${stageBreakdown}</div>
+        </div>
+      </a>`;
+    };
+
+    const rows = daysToShow.map(rowHtml).join("");
+
+    res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Funnel Stats</title></head>
+<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
+  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Funnel Stats${date ? ` — ${escapeHtml(date)}` : " (last 30 days)"}</div>
+  <div style="padding:8px 16px;color:#888;font-size:13px;">"Stuck before photo" = awaiting_language + collecting, as a % of that day's active chats. Lower is better. Tap any day to see the full chat list for it.</div>
+  ${rows || '<div style="padding:16px;color:#888;">No data for this range.</div>'}
+</body></html>`);
+  } catch (err) {
+    log("Admin funnel-stats failed (caught):", err.message);
+    res.status(500).send("Failed to load funnel stats: " + err.message);
   }
 });
 
