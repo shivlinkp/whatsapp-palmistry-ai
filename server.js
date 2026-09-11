@@ -3077,57 +3077,60 @@ app.get("/admin/reengage-stuck", async (req, res) => {
     return res.status(403).send("Forbidden — missing or wrong key.");
   }
 
-  try {
-    const sessions = await db.findReengageableSessions(REENGAGE_COOLDOWN_MS);
-    const results = { awaiting_language: 0, collecting: 0, awaiting_photo: 0, awaiting_payment: 0, failed: 0 };
-
-    for (const session of sessions) {
-      let message;
-      if (session.stage === "awaiting_language") {
-        message = LANGUAGE_STAGE_FUNNEL_NUDGE;
-      } else if (session.stage === "collecting") {
-        message = t(session.language, "funnelNudge");
-      } else if (session.stage === "awaiting_photo") {
-        message = t(session.language, "reengagePhoto");
-      } else if (session.stage === "awaiting_payment") {
-        message = t(session.language, "reengagePayment");
-      } else {
-        continue;
-      }
-
-      const sent = await sendText(session.phone, message);
-      if (sent) {
-        results[session.stage] = (results[session.stage] || 0) + 1;
-        await db.updateSession(session.phone, { manualReengageSentAt: new Date() });
-      } else {
-        results.failed += 1;
-        log("Reengage-stuck: send FAILED for", session.phone, "-> likely outside the 24h window or a WhatsApp API error.");
-      }
-    }
-
-    const totalSent = results.awaiting_language + results.collecting + results.awaiting_photo + results.awaiting_payment;
-    log("Reengage-stuck run complete:", JSON.stringify(results));
-
-    res.status(200).send(`<!DOCTYPE html>
+  // Respond immediately rather than waiting for every message to send —
+  // each sendText() has a deliberate 10-15s human-like delay built in, so
+  // reaching even a handful of people could take several minutes total,
+  // well past typical browser/proxy timeouts. Real incident: this exact
+  // endpoint returned ERR_CONNECTION_ABORTED because the browser gave up
+  // waiting. The actual sending now runs in the background after
+  // responding — same pattern already used for the WhatsApp webhook
+  // itself (ack first, process after).
+  res.status(200).send(`<!DOCTYPE html>
 <html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Re-engage Stuck Chats</title></head>
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;padding:16px;">
-  <div style="font-size:18px;font-weight:bold;margin-bottom:12px;">✅ Sent ${totalSent} re-engagement message${totalSent === 1 ? "" : "s"}</div>
+  <div style="font-size:18px;font-weight:bold;margin-bottom:12px;">⏳ Started — sending in the background</div>
   <div style="color:#ccc;font-size:14px;line-height:1.8;">
-    awaiting_language: ${results.awaiting_language}<br>
-    collecting: ${results.collecting}<br>
-    awaiting_photo: ${results.awaiting_photo}<br>
-    awaiting_payment: ${results.awaiting_payment}<br>
-    failed (likely outside 24h window): ${results.failed}
+    Each message has a deliberate ~10-15 second human-like pacing delay, so this may take several minutes to finish if there are many stuck chats — this page won't wait for it, and you can close it safely.
   </div>
   <div style="color:#888;font-size:13px;margin-top:16px;">
-    Only reached customers who messaged within the last 24 hours — that's a WhatsApp platform rule, not a bug. For older stuck chats, you'll need an approved WhatsApp template message via Meta Business Manager to re-initiate contact. Safe to run this again later — anyone already reached in the last 12 hours is automatically skipped.
+    Check Railway's Deploy Logs for "Reengage-stuck run complete" to see the final counts, or just check /admin/chats after a few minutes to see who responded. Only reached customers who messaged within the last 24 hours — that's a WhatsApp platform rule, not a bug. For older stuck chats, you'll need an approved WhatsApp template message via Meta Business Manager. Safe to run this again later — anyone already reached in the last 12 hours is automatically skipped.
   </div>
 </body></html>`);
-  } catch (err) {
-    log("Admin reengage-stuck failed (caught):", err.message);
-    res.status(500).send("Failed: " + err.message);
-  }
+
+  runReengageStuckInBackground().catch((err) => log("Reengage-stuck background run crashed (caught):", err.message));
 });
+
+async function runReengageStuckInBackground() {
+  const sessions = await db.findReengageableSessions(REENGAGE_COOLDOWN_MS);
+  const results = { awaiting_language: 0, collecting: 0, awaiting_photo: 0, awaiting_payment: 0, failed: 0 };
+  log(`Reengage-stuck: starting background run for ${sessions.length} reengageable session(s).`);
+
+  for (const session of sessions) {
+    let message;
+    if (session.stage === "awaiting_language") {
+      message = LANGUAGE_STAGE_FUNNEL_NUDGE;
+    } else if (session.stage === "collecting") {
+      message = t(session.language, "funnelNudge");
+    } else if (session.stage === "awaiting_photo") {
+      message = t(session.language, "reengagePhoto");
+    } else if (session.stage === "awaiting_payment") {
+      message = t(session.language, "reengagePayment");
+    } else {
+      continue;
+    }
+
+    const sent = await sendText(session.phone, message);
+    if (sent) {
+      results[session.stage] = (results[session.stage] || 0) + 1;
+      await db.updateSession(session.phone, { manualReengageSentAt: new Date() });
+    } else {
+      results.failed += 1;
+      log("Reengage-stuck: send FAILED for", session.phone, "-> likely outside the 24h window or a WhatsApp API error.");
+    }
+  }
+
+  log("Reengage-stuck run complete:", JSON.stringify(results));
+}
 
 app.get("/admin/funnel-stats", async (req, res) => {
   const { key, date } = req.query;
