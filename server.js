@@ -344,6 +344,10 @@ ${timingLine}`;
     paymentReminderShort: "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.",
     funnelNudge:
       "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഇപ്പോഴും തയ്യാറാണ് — തുടരാൻ താൽപര്യമുണ്ടെങ്കിൽ പേര്, ജനനത്തീയതി, Gender എന്നിവ ഒരുമിച്ച് അയച്ചുതരാം. ചോദ്യങ്ങൾ ഉണ്ടെങ്കിൽ ഇവിടെ ചോദിക്കാം.",
+    reengagePhoto:
+      "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനത്തിനായി ഇനി കൈയുടെ ഒരു വ്യക്തമായ ഫോട്ടോ മാത്രമേ വേണ്ടൂ — തയ്യാറാകുമ്പോൾ അയച്ചുതരാം!",
+    reengagePayment:
+      "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഏതാണ്ട് പൂർത്തിയായി — മുകളിൽ നൽകിയ QR Code ഉപയോഗിച്ച് payment ചെയ്ത് screenshot അയച്ചാൽ റിപ്പോർട്ട് ലഭിക്കും. എന്തെങ്കിലും സഹായം വേണോ എന്ന് അറിയിക്കാം.",
     askForHandPhotoAgain: (gender) =>
       `ദയവായി നിങ്ങളുടെ ${gender === "female" ? "ഇടത്" : "വലത്"} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?`,
     askTransactionId: "സ്ക്രീൻഷോട്ട് അയക്കാൻ കഴിയുന്നില്ലെങ്കിൽ കുഴപ്പമില്ല. Payment ചെയ്ത transaction ID ഇവിടെ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ മതി.",
@@ -464,6 +468,10 @@ ${timingLine}`;
     paymentReminderShort: "Once you've paid, just send the screenshot here.",
     funnelNudge:
       "Hi! ߑ Your ₹99 palm reading is still ready whenever you'd like to continue — just send your name, date of birth, and gender together. Happy to answer any questions here too.",
+    reengagePhoto:
+      "Hi! ߑ Your ₹99 palm reading just needs a clear photo of your hand — send it whenever you're ready!",
+    reengagePayment:
+      "Hi! ߑ Your ₹99 palm reading is almost ready — just pay using the QR code above and send the screenshot to get your report. Let us know if you need any help.",
     askForHandPhotoAgain: (gender) =>
       `Could you please send a clear photo of your ${gender === "female" ? "left" : "right"} hand?`,
     askTransactionId: "No problem if you can't send a screenshot. Just type and send the transaction ID for the payment here.",
@@ -3047,6 +3055,80 @@ app.get("/admin/chats", async (req, res) => {
 // the photo step, with no easy way to see whether fixes were moving that
 // number. Uses the same underlying data and IST date-key logic as
 // /admin/chats, so the two always agree with each other.
+// Admin: manual re-engagement trigger — GET /admin/reengage-stuck?key=resetmybot123
+// Sends a one-time nudge to every stuck (pre-payment) session that's
+// legally reachable RIGHT NOW under WhatsApp's 24-hour customer service
+// window (an inbound message within the last 24 hours) — outside that
+// window a plain session message cannot be sent at all; that requires a
+// pre-approved WhatsApp template message via Meta Business Manager, which
+// is a manual approval process on Meta's side, not something this
+// endpoint can do. Safe to run repeatedly (e.g. throughout an ad-pause
+// period) — REENGAGE_COOLDOWN_MS prevents double-messaging anyone
+// recently reached. Built specifically for reviving the existing chat
+// backlog while ads are paused, distinct from the automatic one-time
+// funnel_nudge (which only covers awaiting_language/collecting after 3
+// hours quiet) — this covers all four pre-payment stages, triggered on
+// demand rather than waiting.
+const REENGAGE_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+app.get("/admin/reengage-stuck", async (req, res) => {
+  const { key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+
+  try {
+    const sessions = await db.findReengageableSessions(REENGAGE_COOLDOWN_MS);
+    const results = { awaiting_language: 0, collecting: 0, awaiting_photo: 0, awaiting_payment: 0, failed: 0 };
+
+    for (const session of sessions) {
+      let message;
+      if (session.stage === "awaiting_language") {
+        message = LANGUAGE_STAGE_FUNNEL_NUDGE;
+      } else if (session.stage === "collecting") {
+        message = t(session.language, "funnelNudge");
+      } else if (session.stage === "awaiting_photo") {
+        message = t(session.language, "reengagePhoto");
+      } else if (session.stage === "awaiting_payment") {
+        message = t(session.language, "reengagePayment");
+      } else {
+        continue;
+      }
+
+      const sent = await sendText(session.phone, message);
+      if (sent) {
+        results[session.stage] = (results[session.stage] || 0) + 1;
+        await db.updateSession(session.phone, { manualReengageSentAt: new Date() });
+      } else {
+        results.failed += 1;
+        log("Reengage-stuck: send FAILED for", session.phone, "-> likely outside the 24h window or a WhatsApp API error.");
+      }
+    }
+
+    const totalSent = results.awaiting_language + results.collecting + results.awaiting_photo + results.awaiting_payment;
+    log("Reengage-stuck run complete:", JSON.stringify(results));
+
+    res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Re-engage Stuck Chats</title></head>
+<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;padding:16px;">
+  <div style="font-size:18px;font-weight:bold;margin-bottom:12px;">✅ Sent ${totalSent} re-engagement message${totalSent === 1 ? "" : "s"}</div>
+  <div style="color:#ccc;font-size:14px;line-height:1.8;">
+    awaiting_language: ${results.awaiting_language}<br>
+    collecting: ${results.collecting}<br>
+    awaiting_photo: ${results.awaiting_photo}<br>
+    awaiting_payment: ${results.awaiting_payment}<br>
+    failed (likely outside 24h window): ${results.failed}
+  </div>
+  <div style="color:#888;font-size:13px;margin-top:16px;">
+    Only reached customers who messaged within the last 24 hours — that's a WhatsApp platform rule, not a bug. For older stuck chats, you'll need an approved WhatsApp template message via Meta Business Manager to re-initiate contact. Safe to run this again later — anyone already reached in the last 12 hours is automatically skipped.
+  </div>
+</body></html>`);
+  } catch (err) {
+    log("Admin reengage-stuck failed (caught):", err.message);
+    res.status(500).send("Failed: " + err.message);
+  }
+});
+
 app.get("/admin/funnel-stats", async (req, res) => {
   const { key, date } = req.query;
   if (key !== RESET_COMMAND) {
