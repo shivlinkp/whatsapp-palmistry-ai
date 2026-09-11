@@ -110,6 +110,14 @@ async function initDb() {
   // genuinely confused (non-troll) customer kept getting near-identical
   // "please send your details" prompts with no example format shown.
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS collecting_clarify_attempts INTEGER NOT NULL DEFAULT 0;`);
+  // Tracks the last time an admin-triggered manual re-engagement message
+  // was sent (see /admin/reengage-stuck) — separate from the automatic
+  // funnel_nudge_sent_at, since this one can be triggered repeatedly
+  // (e.g. during an ad pause, to revive the existing backlog) rather than
+  // firing once automatically. Has its own cooldown to prevent accidental
+  // double-sends if the admin endpoint is hit more than once in a short
+  // window.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS manual_reengage_sent_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
   // Customer's current reply language, detected per-message (see
   // detectLanguage() in server.js) and updated adaptively — whatever
@@ -198,6 +206,7 @@ function rowToSession(row) {
     followUpMessageCount: row.follow_up_message_count,
     awaitingFollowUpPayment: row.awaiting_follow_up_payment,
     collectingClarifyAttempts: row.collecting_clarify_attempts,
+    manualReengageSentAt: row.manual_reengage_sent_at,
     pendingSecondPerson: row.pending_second_person,
     paymentConfirmedAt: row.payment_confirmed_at,
     lastAttemptAt: row.last_attempt_at,
@@ -250,6 +259,7 @@ const FIELD_MAP = {
   followUpMessageCount: "follow_up_message_count",
   awaitingFollowUpPayment: "awaiting_follow_up_payment",
   collectingClarifyAttempts: "collecting_clarify_attempts",
+  manualReengageSentAt: "manual_reengage_sent_at",
   pendingSecondPerson: "pending_second_person",
   paymentConfirmedAt: "payment_confirmed_at",
   lastAttemptAt: "last_attempt_at",
@@ -357,6 +367,33 @@ async function findSentReports() {
 // repeatedly. Real finding this addresses: on 28/8, 49% of active chats
 // stalled in these two stages combined, with confirmed evidence
 // (918637429436) that customers do not return on their own.
+// Finds every stuck (pre-payment) session that can LEGALLY be messaged
+// right now under WhatsApp's 24-hour customer service window — i.e. they
+// have sent an inbound message within the last 24 hours. Outside that
+// window, WhatsApp requires a pre-approved template message (a Meta
+// Business Manager process, not something achievable from this codebase)
+// — this function deliberately only returns sessions where a normal
+// session message is actually legal to send. Also respects
+// reengageCooldownMs so the same admin trigger can be run repeatedly
+// (e.g. throughout an ad-pause period) without double-messaging anyone
+// who was already reached recently.
+async function findReengageableSessions(reengageCooldownMs) {
+  const result = await pool.query(
+    `SELECT s.* FROM sessions s
+     WHERE s.stage IN ('awaiting_language', 'collecting', 'awaiting_photo', 'awaiting_payment')
+       AND EXISTS (
+         SELECT 1 FROM messages m
+         WHERE m.phone = s.phone
+           AND m.direction = 'in'
+           AND m.created_at >= now() - interval '24 hours'
+       )
+       AND (s.manual_reengage_sent_at IS NULL OR s.manual_reengage_sent_at <= now() - ($1 || ' milliseconds')::interval)
+     ORDER BY s.updated_at DESC`,
+    [reengageCooldownMs]
+  );
+  return result.rows.map(rowToSession);
+}
+
 async function findAbandonedFunnelSessions(thresholdMs) {
   const result = await pool.query(
     `SELECT * FROM sessions
@@ -428,6 +465,18 @@ async function getMessagesForPhone(phone) {
   return result.rows;
 }
 
+// Lightweight fetch of just the most recent outbound message for a phone —
+// used to give short-context classifiers (e.g. "does this bare 'yes' agree
+// to what the bot just offered?") the context they need, without pulling a
+// customer's entire history (some run into the thousands of messages).
+async function getLastOutboundMessage(phone) {
+  const result = await pool.query(
+    `SELECT body FROM messages WHERE phone = $1 AND direction = 'out' ORDER BY created_at DESC LIMIT 1`,
+    [phone]
+  );
+  return result.rows[0]?.body || null;
+}
+
 // Lists phone numbers with any message activity, most recent first, along
 // with a short preview and message count — used for the admin chat list.
 async function listConversations() {
@@ -455,10 +504,12 @@ module.exports = {
   findDueReports,
   findOverdueAwaitingReports,
   findAbandonedFunnelSessions,
+  findReengageableSessions,
   findFailedPayments,
   findRefundRequests,
   findSentReports,
   logMessage,
   getMessagesForPhone,
+  getLastOutboundMessage,
   listConversations,
 };
