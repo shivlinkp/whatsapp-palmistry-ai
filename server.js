@@ -1,3575 +1,515 @@
 /**
- * Palmistry WhatsApp Bot - server.js
+ * db.js — PostgreSQL layer for the palmistry bot.
  *
- * ENV VARS REQUIRED:
- *   VERIFY_TOKEN      - webhook verification token you set in Meta App dashboard
- *   WHATSAPP_TOKEN    - permanent/temporary token for Graph API
- *   PHONE_NUMBER_ID   - WhatsApp Business phone number id
- *   OPENAI_API_KEY    - OpenAI key for extraction + report generation
- *   QR_IMAGE_URL      - publicly reachable URL (Cloudinary) of your payment
- *                       QR image. This is the ONLY source used to send the
- *                       QR image — no local file, no static route.
- *   DATABASE_URL      - Postgres connection string (Railway Postgres plugin)
+ * Uses the "pg" package with CommonJS require(). Expects DATABASE_URL to be
+ * set (Railway provides this automatically when you add a Postgres service
+ * and reference it, e.g. DATABASE_URL=${{ Postgres.DATABASE_URL }}).
  *
- * PRODUCTION RELIABILITY: all session state (name, dob, gender, stage,
- * payment, report status/text/due-time) is stored in Postgres via db.js —
- * nothing lives in an in-memory Map anymore. Report delivery is driven by
- * a polling worker (setInterval, every 60s) that looks for sessions whose
- * report_due_at has passed, NOT by setTimeout — so a Railway restart never
- * loses a pending report; the next poll tick picks it up from the DB.
+ * All session state (name, dob, gender, stage, payment, report status/text,
+ * report due time) lives here instead of in-memory, so nothing is lost on
+ * a Railway restart/redeploy.
  */
 
-const express = require("express");
-const fetch = require("node-fetch");
-const bodyParser = require("body-parser");
-const db = require("./db");
+const { Pool } = require("pg");
 
-const app = express();
-app.use(bodyParser.json());
-
-const PORT = process.env.PORT || 8080;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const QR_IMAGE_URL = process.env.QR_IMAGE_URL || "";
-
-const GRAPH_URL = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
-
-function log(...args) {
-  console.log(new Date().toISOString(), "-", ...args);
+if (!process.env.DATABASE_URL) {
+  console.error("FATAL: DATABASE_URL is not set. Add a Postgres service in Railway and link it.");
 }
 
-// ---------------------------------------------------------------------------
-// In-memory state that's safe to lose on restart (not customer data)
-// ---------------------------------------------------------------------------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // Railway's internal Postgres typically doesn't require SSL, but Railway's
+  // public/proxy connection strings sometimes do. This works for both.
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes("railway")
+    ? { rejectUnauthorized: false }
+    : false,
+  // "pg" has NO default connection timeout — without this, a bad/unreachable
+  // DATABASE_URL causes the app to hang forever with zero output instead of
+  // erroring out. This makes failures fast and visible in the logs.
+  connectionTimeoutMillis: 10000,
+  query_timeout: 15000,
+});
 
-// Dedup of processed WhatsApp message ids (capped ring buffer). Not
-// persisted — worst case after a restart is a very recent duplicate being
-// reprocessed once, which is an acceptable tradeoff and wasn't part of the
-// data the person asked to persist.
-const processedMessageIds = new Set();
-const processedMessageOrder = [];
-const MAX_PROCESSED_IDS = 2000;
+pool.on("error", (err) => {
+  console.error(new Date().toISOString(), "- Unexpected PG pool error (caught):", err.message);
+});
 
-function markProcessed(id) {
-  processedMessageIds.add(id);
-  processedMessageOrder.push(id);
-  if (processedMessageOrder.length > MAX_PROCESSED_IDS) {
-    const old = processedMessageOrder.shift();
-    processedMessageIds.delete(old);
-  }
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      phone             TEXT PRIMARY KEY,
+      name              TEXT,
+      dob               TEXT,
+      gender            TEXT,
+      stage             TEXT NOT NULL DEFAULT 'new',
+      palm_media_id     TEXT,
+      payment_received  BOOLEAN NOT NULL DEFAULT false,
+      report_text       TEXT,
+      report_status     TEXT NOT NULL DEFAULT 'none',
+      report_due_at     TIMESTAMPTZ,
+      report_error      TEXT,
+      report_attempts   INTEGER NOT NULL DEFAULT 0,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Safe migration for tables created before "order for someone else"
+  // support was added — ADD COLUMN IF NOT EXISTS is a no-op on tables that
+  // already have these columns, so this is safe to run on every boot.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS relation TEXT;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS order_count INTEGER NOT NULL DEFAULT 1;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_transaction_id BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_report_inquiry_count INTEGER NOT NULL DEFAULT 0;`);
+  // Same pattern as awaiting_report_inquiry_count, but for the payment
+  // verification stage — previously that stage never offered support
+  // contact no matter how many times or how confusedly a customer asked.
+  // Real incident: Sreeja pv, 918606427024, 13/8 — sent 4 messages
+  // (including confused voice notes) stuck verifying payment, never once
+  // pointed to a human.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_payment_inquiry_count INTEGER NOT NULL DEFAULT 0;`);
+  // Counts failed attempts to match a language choice in the
+  // awaiting_language picker. Without a fallback, a customer who never
+  // sends an exact "1"/"2"/"English"/"Malayalam"-style reply gets the
+  // identical picker message re-sent forever, with zero acknowledgment,
+  // no matter how many times or how differently they try — losing the
+  // sale before they've even seen pricing. Real incident: 918637429436 —
+  // tried 5 separate times across 8 days (general questions, "Tamil", a
+  // voice message), got the exact same picker every time, never got
+  // through. After a couple of failed attempts we now default to
+  // Malayalam (this bot's customers are overwhelmingly Malayalam
+  // speakers, same reasoning used elsewhere in this codebase) and let
+  // them proceed rather than trap them indefinitely.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS language_attempts INTEGER NOT NULL DEFAULT 0;`);
+  // Tracks whether a one-time re-engagement nudge has been sent to a
+  // customer who stalled early in the funnel (awaiting_language or
+  // collecting) and went quiet. Real finding: on 28/8, 25% of active chats
+  // never picked a language and 24% never finished giving name/DOB/gender
+  // — nearly half the day's conversations — with zero follow-up from the
+  // bot once they went quiet. One customer (918637429436) was confirmed to
+  // never return on their own across multiple separate days. NULL means
+  // no nudge sent yet; once sent, this is set permanently so it only ever
+  // happens once per session (never spammy, never repeated).
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS funnel_nudge_sent_at TIMESTAMPTZ;`);
+  // Counts real (non-trivial-ack) follow-up messages answered for free
+  // after a report was delivered. Without a limit, customers could ask
+  // unlimited personal questions indefinitely, each one a real paid GPT
+  // call, at zero additional revenue. Real incident: Ajitha KA,
+  // 919961850471 — 1,282 messages over a full week on a single ₹99
+  // payment, hundreds of deeply personal follow-up questions all answered
+  // for free. Resets to 0 whenever a fresh payment is confirmed (either
+  // the original report or a follow-up re-payment).
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS follow_up_message_count INTEGER NOT NULL DEFAULT 0;`);
+  // True once the free follow-up limit is reached and the bot is waiting
+  // for a new ₹99 payment screenshot before answering more questions.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS awaiting_follow_up_payment BOOLEAN NOT NULL DEFAULT false;`);
+  // Counts consecutive times a customer in "collecting" has been shown the
+  // "please send name/DOB/gender" prompt without successfully providing
+  // it — used to switch from a generic re-ask to a concrete example after
+  // repeated confusion, rather than repeating the same abstract
+  // instruction indefinitely. Real incident: several 7/9 chats where a
+  // genuinely confused (non-troll) customer kept getting near-identical
+  // "please send your details" prompts with no example format shown.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS collecting_clarify_attempts INTEGER NOT NULL DEFAULT 0;`);
+  // Tracks the last time an admin-triggered manual re-engagement message
+  // was sent (see /admin/reengage-stuck) — separate from the automatic
+  // funnel_nudge_sent_at, since this one can be triggered repeatedly
+  // (e.g. during an ad pause, to revive the existing backlog) rather than
+  // firing once automatically. Has its own cooldown to prevent accidental
+  // double-sends if the admin endpoint is hit more than once in a short
+  // window.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS manual_reengage_sent_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pending_second_person BOOLEAN NOT NULL DEFAULT false;`);
+  // Customer's current reply language, detected per-message (see
+  // detectLanguage() in server.js) and updated adaptively — whatever
+  // language their most recent message was in is what they get replied to
+  // in next, including for the eventual report generation itself. Defaults
+  // to 'ml' so every existing session (and any session where detection is
+  // ever skipped/fails) keeps today's Malayalam-only behavior unchanged.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'ml';`);
+  // Stable "payment confirmed" timestamp — unlike report_due_at (which gets
+  // pushed forward by REPORT_RETRY_INTERVAL_MS on every failed attempt),
+  // this never changes once set, so it's what we use to measure genuine
+  // elapsed wait time for the 30-minute force-retry safety net.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS payment_confirmed_at TIMESTAMPTZ;`);
+  // Tracks the moment the last actual generation attempt STARTED (poller's
+  // normal due-processing, poller's overdue sweep, or a manually forced
+  // retry from a customer message) — separate from updated_at, which gets
+  // bumped by unrelated writes like awaiting_report_inquiry_count. Used to
+  // throttle forced retries so a burst of customer messages ("ߑ", "Hlo",
+  // "??") can't each trigger their own full (costly) regeneration attempt
+  // seconds apart. Real incident: Shameena, 919946345651, 26/7 — over a
+  // dozen forced retries fired within an hour, several just 5 seconds
+  // apart, from consecutive short messages while she was frustrated and
+  // waiting.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;`);
+  // Throttles the "we'll contact you directly" message once a session is
+  // past REPORT_FORCE_RETRY_HARD_CAP_MS — without this, that exact message
+  // got repeated verbatim to every single thing the customer sent, for
+  // hours, because nobody ever actually followed up. Real incident:
+  // Sangeetha, 919778743899, 29/7 — same message repeated ~10 times over
+  // 18+ hours, including to two explicit refund requests.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS hard_cap_notified_at TIMESTAMPTZ;`);
+  // Flags sessions where the customer explicitly asked for a refund, so
+  // they're visible on their own admin list instead of only being noticed
+  // by chance while reviewing an unrelated chat.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS refund_requested_at TIMESTAMPTZ;`);
+
+  // Permanent conversation log — every inbound and outbound message, so
+  // chats can be reviewed regardless of what Meta/WhatsApp allows and
+  // regardless of Railway's log retention window.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id           SERIAL PRIMARY KEY,
+      phone        TEXT NOT NULL,
+      direction    TEXT NOT NULL, -- 'in' or 'out'
+      body         TEXT,
+      message_type TEXT,          -- 'text' | 'voice' | 'photo' | 'pdf' | 'qr_image' | etc.
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_messages_phone_time
+    ON messages (phone, created_at);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_sessions_report_due
+    ON sessions (report_status, report_due_at);
+  `);
+  console.log(new Date().toISOString(), "- DB: sessions table ready");
 }
 
-function isDuplicate(id) {
-  return processedMessageIds.has(id);
-}
-
-// Tracks the wamid of the last QR image sent per phone number, so incoming
-// status webhooks (sent/delivered/read/failed) can be correlated back to
-// the actual QR send attempt.
-const qrMessageIdsByPhone = new Map();
-
-// ---------------------------------------------------------------------------
-// WhatsApp send helpers
-// ---------------------------------------------------------------------------
-
-// Human-like pacing between outgoing messages: 10-15 seconds. This ONLY
-// affects how quickly consecutive WhatsApp messages are sent — it has no
-// effect on report/assessment scheduling (report_due_at), which is
-// computed separately via real Date math and stays exactly as configured.
-function randomSendDelayMs() {
-  return 10000 + Math.random() * 5000; // 10-15 seconds
-}
-
-async function sendWhatsAppRequest(payload) {
-  const delay = randomSendDelayMs();
-  log(`Waiting ${(delay / 1000).toFixed(1)}s before sending (human-like pacing)`);
-  await new Promise((resolve) => setTimeout(resolve, delay));
-
-  log("Outgoing WhatsApp API payload:", JSON.stringify(payload));
-
-  try {
-    const res = await fetch(GRAPH_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const rawText = await res.text();
-    let data;
-    try {
-      data = JSON.parse(rawText);
-    } catch {
-      data = { rawText };
-    }
-
-    log("WhatsApp API HTTP status:", res.status);
-    log("WhatsApp API full response:", JSON.stringify(data));
-
-    return { httpStatus: res.status, ok: res.ok, data };
-  } catch (err) {
-    log("WhatsApp send network error:", err.message);
-    return { httpStatus: null, ok: false, data: null, networkError: err.message };
-  }
-}
-
-async function sendText(to, body) {
-  log("Sending text to", to, "->", body.slice(0, 60).replace(/\n/g, " "));
-  db.logMessage(to, "out", body, "text");
-  const result = await sendWhatsAppRequest({
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body },
-  });
-  return result?.ok === true;
-}
-
-// Sends an image by link, following Meta's documented schema exactly:
-// https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages#image-messages
-// Returns true ONLY if Meta's response confirms acceptance (HTTP 2xx + a
-// real message id in response.messages[0].id). This is the ONLY QR-sending
-// method in the app — no local file, no media upload, no fallback. It only
-// ever uses process.env.QR_IMAGE_URL.
-async function sendImageByUrl(to, link, caption) {
-  if (!link || !/^https?:\/\//i.test(link)) {
-    log(`QR image NOT sent — QR_IMAGE_URL is missing or invalid. Current value: "${link}"`);
-    return false;
-  }
-
-  console.log("Using QR URL:", QR_IMAGE_URL);
-  db.logMessage(to, "out", "[QR code image]", "qr_image");
-
-  const payload = {
-    messaging_product: "whatsapp",
-    recipient_type: "individual",
-    to,
-    type: "image",
-    image: caption ? { link, caption } : { link },
+// Converts a DB row (snake_case) into the camelCase session object shape
+// used throughout server.js.
+function rowToSession(row) {
+  if (!row) return null;
+  return {
+    phone: row.phone,
+    name: row.name,
+    dob: row.dob,
+    gender: row.gender,
+    stage: row.stage,
+    palmMediaId: row.palm_media_id,
+    paymentReceived: row.payment_received,
+    reportText: row.report_text,
+    reportStatus: row.report_status,
+    reportDueAt: row.report_due_at,
+    reportError: row.report_error,
+    reportAttempts: row.report_attempts,
+    relation: row.relation,
+    orderCount: row.order_count,
+    awaitingTransactionId: row.awaiting_transaction_id,
+    awaitingReportInquiryCount: row.awaiting_report_inquiry_count,
+    awaitingPaymentInquiryCount: row.awaiting_payment_inquiry_count,
+    languageAttempts: row.language_attempts,
+    funnelNudgeSentAt: row.funnel_nudge_sent_at,
+    followUpMessageCount: row.follow_up_message_count,
+    awaitingFollowUpPayment: row.awaiting_follow_up_payment,
+    collectingClarifyAttempts: row.collecting_clarify_attempts,
+    manualReengageSentAt: row.manual_reengage_sent_at,
+    pendingSecondPerson: row.pending_second_person,
+    paymentConfirmedAt: row.payment_confirmed_at,
+    lastAttemptAt: row.last_attempt_at,
+    hardCapNotifiedAt: row.hard_cap_notified_at,
+    refundRequestedAt: row.refund_requested_at,
+    language: row.language,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
+}
 
-  console.log("IMAGE PAYLOAD =", JSON.stringify(payload, null, 2));
-
-  log("Sending QR image (by link) to", to, "-> link:", link);
-
-  const result = await sendWhatsAppRequest(payload);
-  const data = result?.data;
-
-  console.log("IMAGE META RESPONSE =", JSON.stringify(data, null, 2));
-  console.log("QR MESSAGE ID =", data?.messages?.[0]?.id);
-
-  if (!result || result.networkError) {
-    log("QR image send FAILED — network error:", result?.networkError || "unknown");
-    return false;
+// Fetches the session for a phone number, creating a fresh default row if
+// none exists yet. Always returns a session object (never null).
+async function getOrCreateSession(phone) {
+  const existing = await pool.query("SELECT * FROM sessions WHERE phone = $1", [phone]);
+  if (existing.rows.length) {
+    return rowToSession(existing.rows[0]);
   }
-
-  if (!result.ok) {
-    log("QR image REJECTED by Meta. HTTP status:", result.httpStatus, "Full response:", JSON.stringify(result.data));
-    return false;
-  }
-
-  const wamid = result.data?.messages?.[0]?.id;
-  if (!wamid) {
-    log(
-      "QR image response was HTTP",
-      result.httpStatus,
-      "but contained no message id — treating as failure. Full response:",
-      JSON.stringify(result.data)
-    );
-    return false;
-  }
-
-  log("QR image (by link) ACCEPTED by Meta. HTTP status:", result.httpStatus, "wamid:", wamid);
-  qrMessageIdsByPhone.set(to, wamid);
-  log("Tracked QR message id for", to, "->", wamid);
-  return true;
+  const inserted = await pool.query(
+    `INSERT INTO sessions (phone) VALUES ($1)
+     ON CONFLICT (phone) DO UPDATE SET updated_at = sessions.updated_at
+     RETURNING *`,
+    [phone]
+  );
+  return rowToSession(inserted.rows[0]);
 }
 
-// Splits long text into WhatsApp-safe chunks (~3500 char limit), breaking on
-// paragraph/sentence boundaries where possible.
-function splitIntoChunks(text, maxLen = 3500) {
-  const chunks = [];
-  let remaining = text.trim();
-  while (remaining.length > maxLen) {
-    let cut = remaining.lastIndexOf("\n\n", maxLen);
-    if (cut < maxLen * 0.5) cut = remaining.lastIndexOf("\n", maxLen);
-    if (cut < maxLen * 0.5) cut = remaining.lastIndexOf(". ", maxLen);
-    if (cut < maxLen * 0.5) cut = maxLen;
-    chunks.push(remaining.slice(0, cut).trim());
-    remaining = remaining.slice(cut).trim();
-  }
-  if (remaining.length) chunks.push(remaining);
-  return chunks;
-}
-
-async function sendLongText(to, text) {
-  const chunks = splitIntoChunks(text);
-  for (const chunk of chunks) {
-    await sendText(to, chunk);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Message content constants — bilingual (Malayalam + English)
-// ---------------------------------------------------------------------------
-
-const SUPPORT_EMAIL = "contact@boldwordsmedia.com";
-// New WhatsApp helpline for issues (added 24/7/2026) — a customer stuck in
-// any error state now has a human escalation path, not just an email
-// address they may not check. Shown alongside the email everywhere the
-// email already appears, plus in the two new stuck-session recovery
-// messages below.
-const SUPPORT_WHATSAPP = "6360780748";
-const SUPPORT_EMAIL_INQUIRY_THRESHOLD = 3; // offer support email after this many messages while awaiting_report
-
-// All customer-facing copy lives here, one entry per supported language.
-// Every session has a `language` field ('ml' default, or 'en') that is set
-// exactly once, deterministically, by the first-contact language picker
-// (see the "awaiting_language" stage in handleTextMessage) and never
-// changes automatically after that — t(language, key, ...args) is how
-// every send site looks up the right string. Falls back to 'ml' for any
-// unknown/missing language so behavior for existing sessions is completely
-// unchanged unless English is actually chosen.
-const T = {
-  ml: {
-    supportContactLine: `കൂടുതൽ സഹായത്തിന് ${SUPPORT_EMAIL} എന്ന ഇമെയിലിൽ ബന്ധപ്പെടാം, അല്ലെങ്കിൽ ${SUPPORT_WHATSAPP} എന്ന നമ്പറിൽ ഞങ്ങളുടെ WhatsApp helpline-ൽ മെസേജ് ചെയ്യാം.`,
-    welcome: `Hi
-
-₹99 കൈരേഖാ വിശകലനത്തിൽ നിങ്ങൾക്ക് ലഭിക്കുന്നത്:
-
-- നിങ്ങളുടെ സ്വഭാവവും വ്യക്തിത്വവും
-- സ്നേഹവും ബന്ധങ്ങളും
-- വിവാഹ സാധ്യതകളും കുടുംബജീവിതവും
-- ജോലി, കരിയർ, ബിസിനസ് സാധ്യതകൾ
-- സാമ്പത്തിക വളർച്ചയും ധനകാര്യ സൂചനകളും
-- ഭാവിയിലെ പ്രധാന അവസരങ്ങളും വെല്ലുവിളികളും
-- നിങ്ങളുടെ കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ
-
-ദയവായി താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
-
-• പേര്
-• ജനനത്തീയതി
-• Gender (ലിംഗം)
-
-ഫീസ്: ₹99 മാത്രം.`,
-    askAllDetails: `ദയവായി താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
-
-• പേര്
-• ജനനത്തീയതി
-• Gender (ലിംഗം)`,
-    detailsExample: `\n\nഉദാഹരണം: Anjali, 15-08-1995, Female`,
-    askSecondPersonDetails: `തീർച്ചയായും, ഇതേ ചാറ്റിൽ തന്നെ അടുത്ത വ്യക്തിയുടെ കൈരേഖാ വിശകലനം ആരംഭിക്കാം.
-
-ദയവായി ആ വ്യക്തിയുടെ താഴെ പറയുന്ന വിവരങ്ങൾ ഒരുമിച്ച് അയച്ചുതരാമോ?
-
-• പേര്
-• ജനനത്തീയതി
-• Gender (ലിംഗം)
-
-(ഇഷ്ടമെങ്കിൽ, ഈ വ്യക്തി നിങ്ങളുമായി എങ്ങനെ ബന്ധപ്പെട്ടിരിക്കുന്നു എന്നും പറയാം — നിർബന്ധമില്ല.)
-
-ഫീസ്: ₹99 മാത്രം.`,
-    handRequest: (name, gender) => {
-      const hand = gender === "female" ? "ഇടത്" : "വലത്";
-      return `നന്ദി ${name}.
-
-ഇപ്പോൾ ദയവായി നിങ്ങളുടെ ${hand} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?
-
-ഫോട്ടോ എടുക്കുമ്പോൾ:
-- കൈ മുഴുവനും വ്യക്തമായി കാണണം
-- നല്ല വെളിച്ചത്തിൽ എടുക്കണം
-- കൈരേഖകൾ blur ആകരുത്`;
-    },
-    photoReceivedPayment: `ഫോട്ടോ ലഭിച്ചു. നന്ദി.
-
-താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്യുക.
-
-Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`,
-    followUpLimitReached: `നന്ദി, ഇത്രയധികം ചോദ്യങ്ങൾ ചോദിച്ചതിന്! ߙ
-
-ഈ റീഡിംഗിനുള്ള ചോദ്യങ്ങളുടെ പരിധി എത്തിയിരിക്കുന്നു. കൂടുതൽ ചോദ്യങ്ങൾ ചോദിക്കാൻ ആഗ്രഹിക്കുന്നുവെങ്കിൽ, ദയവായി താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്ത് screenshot അയച്ചുതരാമോ? അതിനുശേഷം തുടരാം.`,
-    followUpPaymentConfirmed: `Payment ലഭിച്ചു, നന്ദി! ߙ ദയവായി നിങ്ങളുടെ ചോദ്യങ്ങൾ തുടരാം.`,
-    qrFailure(language) {
-      return `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${T.ml.supportContactLine}`;
-    },
-    paymentReceived: (name, isRepeatOrder) => {
-      const timingLine = isRepeatOrder
-        ? "Report ഏകദേശം 30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും."
-        : "Report ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ഇവിടെ ലഭിക്കും.";
-      return `Payment screenshot ലഭിച്ചു. നന്ദി ${name}.
-
-നിങ്ങളുടെ കൈരേഖാ വിശകലനം തയ്യാറാക്കുകയാണ്.
-
-${timingLine}`;
-    },
-    reportPreparing:
-      "നിങ്ങളുടെ റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ അല്പം സമയമെടുക്കുന്നു. ദയവായി അല്പസമയം കൂടി കാത്തിരിക്കൂ, ഞങ്ങൾ ഉടൻ അയയ്ക്കും.",
-    get reportExhausted() {
-      return `ക്ഷമിക്കണം, റിപ്പോർട്ട് തയ്യാറാക്കുന്നതിൽ കൂടുതൽ സമയമെടുക്കുന്നു. ഞങ്ങൾ ഉടൻ തന്നെ നേരിട്ട് നിങ്ങളെ ബന്ധപ്പെടും. ആവശ്യമെങ്കിൽ ${T.ml.supportContactLine}`;
-    },
-    reportStillPending: "നിങ്ങളുടെ റിപ്പോർട്ട് ഇപ്പോഴും തയ്യാറാക്കുകയാണ്. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.",
-    reportRetrying: "ഒരു നിമിഷം, റിപ്പോർട്ട് വീണ്ടും തയ്യാറാക്കാൻ ശ്രമിക്കുന്നു...",
-    get reportCorrectionDetected() {
-      return `ക്ഷമിക്കണം, മുൻപ് ലഭിച്ച റിപ്പോർട്ട് ശരിയായി തയ്യാറാക്കപ്പെട്ടിരുന്നില്ല എന്ന് ഞങ്ങൾ കണ്ടെത്തി. നിങ്ങളുടെ ₹99 payment നഷ്ടപ്പെട്ടിട്ടില്ല — അയച്ച ഫോട്ടോ ഉപയോഗിച്ച് ഇപ്പോൾ വീണ്ടും ശരിയായ റിപ്പോർട്ട് തയ്യാറാക്കുന്നു, ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ ലഭിക്കും. ബുദ്ധിമുട്ടിന് ക്ഷമ ചോദിക്കുന്നു. ${T.ml.supportContactLine}`;
-    },
-    notAPalm: (gender) =>
-      `ക്ഷമിക്കണം, അയച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. ദയവായി നിങ്ങളുടെ ${
-        gender === "female" ? "ഇടത്" : "വലത്"
-      } കൈയുടെ താളത്തിൽ നിന്ന്, നല്ല വെളിച്ചത്തിൽ എടുത്ത വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയച്ചുതരാമോ?`,
-    photoReplaced: "പുതിയ ഫോട്ടോ ലഭിച്ചു, നന്ദി. ഇത് ഉപയോഗിച്ച് നിങ്ങളുടെ കൈരേഖാ വിശകലനം വീണ്ടും തയ്യാറാക്കുന്നു. കുറച്ച് സമയത്തിനുള്ളിൽ ഇവിടെ ലഭിക്കും.",
-    voiceTranscriptionFailed: "ക്ഷമിക്കണം, നിങ്ങളുടെ ശബ്ദ സന്ദേശം മനസ്സിലാക്കാൻ കഴിഞ്ഞില്ല. ദയവായി വീണ്ടും ശബ്ദ സന്ദേശം അയക്കാമോ?",
-    resetConfirm: "സെഷൻ റീസെറ്റ് ചെയ്തു. വീണ്ടും തുടങ്ങാൻ 'Hi' എന്ന് അയക്കൂ.",
-    missingFieldsPrompt: (missingList) => `നന്ദി! ദയവായി ${missingList} കൂടി അയച്ചുതരാമോ?`,
-    thanksName: (name) => `നന്ദി ${name}.`,
-    genericPhotoAck: "ഫോട്ടോ ലഭിച്ചു, നന്ദി.",
-    photoStashedAskDetails: "ASK_ALL_DETAILS_PLACEHOLDER",
-    followUpFailed: "ക്ഷമിക്കണം, ഒരു നിമിഷം ശ്രമിക്കാമോ? ചെറിയൊരു തടസ്സം ഉണ്ടായി.",
-    videoNotPhoto: "വീഡിയോ അല്ല, ദയവായി കൈയുടെ ഒരു ഫോട്ടോ (still image) അയച്ചുതരാമോ?",
-    stickerAck: "നന്ദി! തുടരാൻ ദയവായി ഒരു text സന്ദേശമോ ഫോട്ടോയോ അയച്ചുതരാമോ?",
-    locationAck: "നന്ദി! ലൊക്കേഷൻ ഇവിടെ ആവശ്യമില്ല. തുടരാൻ ദയവായി പേര്/ഫോട്ടോ പോലുള്ള വിവരങ്ങൾ text ആയോ photo ആയോ അയച്ചുതരാമോ?",
-    contactAck: "നന്ദി! ഇവിടെ contact card ആവശ്യമില്ല. ദയവായി തുടരാൻ text ആയോ photo ആയോ അയച്ചുതരാമോ?",
-    unrecognizedFallback: "ദയവായി text ആയോ photo ആയോ അയക്കൂ.",
-    fieldName: "പേര്",
-    fieldDob: "ജനനത്തീയതി",
-    fieldGender: "Gender (ലിംഗം)",
-    faqPaymentNumber:
-      "ഇത് ഒരു കമ്പനി അക്കൗണ്ട് ആണ്; വ്യക്തിഗത payment നമ്പർ ഇല്ല. മുകളിൽ നൽകിയിരിക്കുന്ന QR Code സ്കാൻ ചെയ്ത്, ഏത് UPI ആപ്പ് ഉപയോഗിച്ചും (Google Pay, PhonePe, Paytm etc.) ₹99 payment ചെയ്യാം. Payment കഴിഞ്ഞാൽ screenshot ഇവിടെ അയച്ചാൽ മതി.",
-    faqHowMuch: "ഫീസ് ₹99 മാത്രം.",
-    faqHowLong: "Payment screenshot അയച്ചതിന് ശേഷം ഏകദേശം 25-30 മിനിറ്റിനുള്ളിൽ report ലഭിക്കും.",
-    faqWhatGet: "നിങ്ങളുടെ സ്വഭാവം, ബന്ധങ്ങൾ, വിവാഹം, കരിയർ, സാമ്പത്തികം, ഭാവി എന്നിവയെക്കുറിച്ചുള്ള വിശദമായ കൈരേഖാ വിശകലനം ലഭിക്കും.",
-    paymentReminderShort: "Payment ചെയ്തതിന് ശേഷം screenshot ഇവിടെ അയച്ചാൽ മതി.",
-    funnelNudge:
-      "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഇപ്പോഴും തയ്യാറാണ് — തുടരാൻ താൽപര്യമുണ്ടെങ്കിൽ പേര്, ജനനത്തീയതി, Gender എന്നിവ ഒരുമിച്ച് അയച്ചുതരാം. ചോദ്യങ്ങൾ ഉണ്ടെങ്കിൽ ഇവിടെ ചോദിക്കാം.",
-    reengagePhoto:
-      "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനത്തിനായി ഇനി കൈയുടെ ഒരു വ്യക്തമായ ഫോട്ടോ മാത്രമേ വേണ്ടൂ — തയ്യാറാകുമ്പോൾ അയച്ചുതരാം!",
-    reengagePayment:
-      "Hi! ߑ നിങ്ങളുടെ ₹99 കൈരേഖാ വിശകലനം ഏതാണ്ട് പൂർത്തിയായി — മുകളിൽ നൽകിയ QR Code ഉപയോഗിച്ച് payment ചെയ്ത് screenshot അയച്ചാൽ റിപ്പോർട്ട് ലഭിക്കും. എന്തെങ്കിലും സഹായം വേണോ എന്ന് അറിയിക്കാം.",
-    askForHandPhotoAgain: (gender) =>
-      `ദയവായി നിങ്ങളുടെ ${gender === "female" ? "ഇടത്" : "വലത്"} കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ അയച്ചുതരാമോ?`,
-    askTransactionId: "സ്ക്രീൻഷോട്ട് അയക്കാൻ കഴിയുന്നില്ലെങ്കിൽ കുഴപ്പമില്ല. Payment ചെയ്ത transaction ID ഇവിടെ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ മതി.",
-    extraPhotoRejectedAwaitingPhoto:
-      "ലഭിച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. നിങ്ങൾ നേരത്തെ അയച്ച കൈയുടെ ഫോട്ടോ ഉപയോഗിച്ച് തുടരും — ഇത് അവഗണിക്കാം, അല്ലെങ്കിൽ കൈയുടെ വ്യക്തമായ ഒരു ഫോട്ടോ വീണ്ടും അയക്കാം.",
-    extraPhotoAcceptedAwaitingPhoto: "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.",
-    extraPhotoRejectedAfterPayment:
-      "ലഭിച്ച ഫോട്ടോയിൽ കൈരേഖ വ്യക്തമായി കാണാൻ കഴിയുന്നില്ല. നിങ്ങൾ നേരത്തെ അയച്ച കൈയുടെ ഫോട്ടോ ഉപയോഗിച്ചാണ് റിപ്പോർട്ട് തയ്യാറാക്കുന്നത് — ഇത് അവഗണിക്കാം.",
-    extraPhotoAcceptedAfterPayment: "കൂടുതൽ ഫോട്ടോ ലഭിച്ചു, നന്ദി! ഇത് ഉപയോഗിച്ച് റിപ്പോർട്ട് തയ്യാറാക്കും.",
-    languageName: "Malayalam",
-    addressGuidance: "Never use casual/familiar address terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ, or similar.",
-  },
-  en: {
-    supportContactLine: `For further help you can reach us at ${SUPPORT_EMAIL}, or message our WhatsApp helpline at ${SUPPORT_WHATSAPP}.`,
-    welcome: `Hi
-
-With the ₹99 palm reading, you'll get insights into:
-
-- Your nature and personality
-- Love and relationships
-- Marriage prospects and family life
-- Job, career, and business prospects
-- Financial growth and money indications
-- Major upcoming opportunities and challenges
-- Special signs found in your palm
-
-Could you please send me the following details together?
-
-• Name
-• Date of birth
-• Gender
-
-Fee: just ₹99.`,
-    askAllDetails: `Could you please send me the following details together?
-
-• Name
-• Date of birth
-• Gender`,
-    detailsExample: `\n\nExample: Anjali, 15-08-1995, Female`,
-    askSecondPersonDetails: `Sure, let's start the next person's palm reading right here in this same chat.
-
-Could you please send that person's following details together?
-
-• Name
-• Date of birth
-• Gender
-
-(If you'd like, you can also mention how this person is related to you — not required.)
-
-Fee: just ₹99.`,
-    handRequest: (name, gender) => {
-      const hand = gender === "female" ? "left" : "right";
-      return `Thank you, ${name}.
-
-Now could you please send a clear photo of your ${hand} hand?
-
-When taking the photo:
-- Make sure the whole hand is clearly visible
-- Take it in good lighting
-- Make sure the palm lines aren't blurry`;
-    },
-    photoReceivedPayment: `Got the photo. Thank you.
-
-Please pay ₹99 using the QR code above.
-
-Once you've paid, just send the payment screenshot here.`,
-    followUpLimitReached: `Thank you for all your questions! ߙ
-
-You've reached the question limit for this reading. If you'd like to continue asking questions, please pay ₹99 using the QR code below and send the screenshot — we'll continue right after.`,
-    followUpPaymentConfirmed: `Payment received, thank you! ߙ Please go ahead and continue with your questions.`,
-    qrFailure(language) {
-      return `There was a small issue sending the QR code. Please try again in a little while. If the issue continues, ${T.en.supportContactLine}`;
-    },
-    paymentReceived: (name, isRepeatOrder) => {
-      const timingLine = isRepeatOrder
-        ? "Your report will be ready here in about 30 minutes."
-        : "Your report will be ready here in about 25-30 minutes.";
-      return `Got your payment screenshot. Thank you, ${name}.
-
-We're preparing your palm reading.
-
-${timingLine}`;
-    },
-    reportPreparing: "Your report is taking a little extra time to prepare. Please wait just a bit longer — we'll send it soon.",
-    get reportExhausted() {
-      return `Sorry, your report is taking longer than expected. We'll reach out to you directly very soon. If needed, ${T.en.supportContactLine}`;
-    },
-    reportStillPending: "Your report is still being prepared. It'll be ready here shortly.",
-    reportRetrying: "One moment, trying to prepare your report again...",
-    get reportCorrectionDetected() {
-      return `Sorry, we found that your earlier report wasn't generated correctly. Your ₹99 payment hasn't been lost — we're now preparing a proper report using the photo you sent, which should be ready in about 25-30 minutes. Apologies for the inconvenience. ${T.en.supportContactLine}`;
-    },
-    notAPalm: (gender) =>
-      `Sorry, we can't clearly see a palm in the photo you sent. Could you please send a clear photo of your ${
-        gender === "female" ? "left" : "right"
-      } hand, taken in good lighting?`,
-    photoReplaced: "Got the new photo, thank you. We're preparing your palm reading again using this one. It'll be ready here shortly.",
-    voiceTranscriptionFailed: "Sorry, we couldn't understand your voice message. Could you please send it again?",
-    resetConfirm: "Session reset. Send 'Hi' to start again.",
-    missingFieldsPrompt: (missingList) => `Thanks! Could you please also send ${missingList}?`,
-    thanksName: (name) => `Thank you, ${name}.`,
-    genericPhotoAck: "Got the photo, thank you.",
-    photoStashedAskDetails: "ASK_ALL_DETAILS_PLACEHOLDER",
-    followUpFailed: "Sorry, could you try again in a moment? There was a small hiccup.",
-    videoNotPhoto: "That's a video, not a photo — could you please send a still photo of your hand instead?",
-    stickerAck: "Thanks! To continue, could you please send a text message or a photo?",
-    locationAck: "Thanks! We don't need a location here. To continue, could you please send details like your name/photo as text or a photo?",
-    contactAck: "Thanks! We don't need a contact card here. Could you please continue with text or a photo?",
-    unrecognizedFallback: "Please send text or a photo.",
-    fieldName: "Name",
-    fieldDob: "Date of birth",
-    fieldGender: "Gender",
-    faqPaymentNumber:
-      "This is a company account — there's no personal payment number. Please scan the QR code above and pay ₹99 using any UPI app (Google Pay, PhonePe, Paytm, etc). Once paid, just send the screenshot here.",
-    faqHowMuch: "The fee is just ₹99.",
-    faqHowLong: "You'll get your report about 25-30 minutes after sending the payment screenshot.",
-    faqWhatGet: "You'll get a detailed palm reading covering your personality, relationships, marriage, career, finances, and future.",
-    paymentReminderShort: "Once you've paid, just send the screenshot here.",
-    funnelNudge:
-      "Hi! ߑ Your ₹99 palm reading is still ready whenever you'd like to continue — just send your name, date of birth, and gender together. Happy to answer any questions here too.",
-    reengagePhoto:
-      "Hi! ߑ Your ₹99 palm reading just needs a clear photo of your hand — send it whenever you're ready!",
-    reengagePayment:
-      "Hi! ߑ Your ₹99 palm reading is almost ready — just pay using the QR code above and send the screenshot to get your report. Let us know if you need any help.",
-    askForHandPhotoAgain: (gender) =>
-      `Could you please send a clear photo of your ${gender === "female" ? "left" : "right"} hand?`,
-    askTransactionId: "No problem if you can't send a screenshot. Just type and send the transaction ID for the payment here.",
-    extraPhotoRejectedAwaitingPhoto:
-      "We can't clearly see a palm in that photo. We'll continue using the hand photo you sent earlier — you can ignore this, or send a clear photo of your hand again.",
-    extraPhotoAcceptedAwaitingPhoto: "Got the extra photo, thank you! It's saved.",
-    extraPhotoRejectedAfterPayment:
-      "We can't clearly see a palm in that photo. Your report is being prepared using the hand photo you sent earlier — you can ignore this.",
-    extraPhotoAcceptedAfterPayment: "Got the extra photo, thank you! Your report will be prepared using this.",
-    languageName: "English",
-    addressGuidance: "Keep the tone warm but respectful and professional — avoid overly casual address terms like 'bro', 'dude', 'buddy', 'sis', or excessive slang.",
-  },
-};
-// Fix up the photoStashedAskDetails placeholder now that askAllDetails exists
-// on the same object (can't self-reference during literal construction).
-T.ml.photoStashedAskDetails = "ഫോട്ടോ ലഭിച്ചു, നന്ദി! അത് സൂക്ഷിച്ചു വച്ചിട്ടുണ്ട്.\n\n" + T.ml.askAllDetails;
-T.en.photoStashedAskDetails = "Got the photo, thank you! It's saved.\n\n" + T.en.askAllDetails;
-
-// Looks up a translated string/function for the given language, always
-// falling back to Malayalam if the language is unknown or the key is
-// missing — this keeps every existing (pre-English) code path behaving
-// identically by default.
-function t(language, key, ...args) {
-  const lang = T[language] ? language : "ml";
-  const entry = T[lang][key];
-  const value = typeof entry === "function" ? entry(...args) : entry;
-  return value ?? (typeof T.ml[key] === "function" ? T.ml[key](...args) : T.ml[key]);
-}
-
-// ---------------------------------------------------------------------------
-// GPT-based language classifier (English vs. Manglish, for Roman-script
-// text with no Malayalam script characters). NOT currently called anywhere
-// — the adaptive per-message re-detection that used to call this was
-// removed (see the comment in handleTextMessage where it used to run) after
-// two confirmed production incidents where short, common, cross-language
-// words ("Ok", "Hlo", "Female") got misread as a deliberate language
-// switch. Kept here, unused, in case a future EXPLICIT "switch language"
-// feature wants a classifier for free-form phrasing (e.g. "reply in
-// English please") — matchLanguageChoice() below remains the only thing
-// actually deciding session.language today, and it's fully deterministic.
-// ---------------------------------------------------------------------------
-
-const MALAYALAM_SCRIPT_RE = /[\u0D00-\u0D7F]/;
-
-async function detectLanguage(text, currentLanguage) {
-  if (!text || !text.trim()) return currentLanguage || "ml";
-  if (MALAYALAM_SCRIPT_RE.test(text)) return "ml";
-
-  if (!OPENAI_API_KEY) return currentLanguage || "ml";
-
-  try {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "user",
-            content: `A WhatsApp customer wrote the message below, in Roman/Latin script (no Malayalam script characters). Determine whether it is genuine English, OR Manglish (Malayalam words spelled out phonetically in English letters, e.g. "eppo kittum", "entha vila", "pattilla", "vanno" — these are Malayalam, not English, even though written in English letters).
-
-Reply with ONLY one word: ENGLISH or MANGLISH. If genuinely unsure or the message is just a name/number/emoji with no clear language signal, reply MANGLISH (safer default — this bot's customers are overwhelmingly Malayalam speakers).
-
-Message: """${text}"""`,
-          },
-        ],
-        max_completion_tokens: 5,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      log("detectLanguage check FAILED:", JSON.stringify(data));
-      return currentLanguage || "ml";
-    }
-    const answer = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
-    log("detectLanguage classification for non-Malayalam-script text ->", answer);
-    return answer.startsWith("ENGLISH") ? "en" : "ml";
-  } catch (err) {
-    log("detectLanguage crashed (caught):", err.message);
-    return currentLanguage || "ml";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// First-contact language selection — deterministic, no GPT call. Sent once,
-// on a brand-new session's very first message, before anything else. Kept
-// intentionally short and equally readable in both scripts so it works for
-// customers who can't read Malayalam at all, not just as a courtesy to
-// English speakers.
-// ---------------------------------------------------------------------------
-
-const LANGUAGE_PICKER_MESSAGE = `Hi! Please choose your language / ദയവായി ഭാഷ തിരഞ്ഞെടുക്കുക:
-
-1️⃣ English
-2️⃣ മലയാളം (Malayalam)`;
-
-// Bilingual re-engagement nudge for a customer who stalled BEFORE ever
-// picking a language — session.language is still null at this point, so
-// the normal t()-based lookup can't be used. Sent once, ever, per session
-// (see funnel_nudge_sent_at in db.js).
-const LANGUAGE_STAGE_FUNNEL_NUDGE = `Hi! ߑ Just checking in — your ₹99 palm reading is still available whenever you'd like to continue.
-
-Reply 1️⃣ for English or 2️⃣ for മലയാളം to get started / ദയവായി ഭാഷ തിരഞ്ഞെടുക്കുക.`;
-
-// Matches a reply to LANGUAGE_PICKER_MESSAGE. Deliberately simple and
-// deterministic (digit, keyword, or script match) rather than a GPT call —
-// this is the one decision that must never be ambiguous, since it's what
-// the adaptive per-message detection above was too unreliable for. Returns
-// 'en'/'ml' on a clear match, or null if the reply doesn't look like a
-// language choice at all (caller re-sends the picker rather than guessing).
-function matchLanguageChoice(text) {
-  if (!text) return null;
-  const trimmed = text.trim();
-  if (MALAYALAM_SCRIPT_RE.test(trimmed)) return "ml"; // typed in Malayalam script is itself a clear choice
-  const lower = trimmed.toLowerCase();
-  if (/^1\b/.test(lower) || /\benglish\b/.test(lower) || /\beng\b/.test(lower)) return "en";
-  if (/^2\b/.test(lower) || /\bmalayalam\b/.test(lower) || /\bmalayalee\b/.test(lower) || /\bmal\b/.test(lower)) return "ml";
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// FAQ handling (keyword based, no GPT call — keeps pre-payment flow cheap/fast)
-// ---------------------------------------------------------------------------
-
-// Detects "I can't send a screenshot" style messages (English/Manglish) so
-// we can offer the transaction-ID fallback instead. Kept as simple regex
-// (like matchFaq) since this is usually a fairly literal statement, not
-// ambiguous the way some other intents are.
-function cannotSendScreenshotIntent(text) {
-  const mentionsScreenshot = /screenshot|\bss\b/i.test(text);
-  const inability = /\b(illa|pattilla|pattunnilla|cannot|can'?t|not able|mudiyilla|unable|issue|problem)\b/i.test(text);
-  return mentionsScreenshot && inability;
-}
-
-// Matches an explicit ask to see the QR code again ("resend QR", "lost the
-// code", "can't find the QR", "scan again", etc.) — a customer asking this
-// wants the actual image, not another text description of "the QR code
-// above" (which is unhelpful if they can no longer see it, e.g. it scrolled
-// out of view or they're on a new device).
-function wantsQrResend(text) {
-  const mentionsQr = /\bqr\b|code|barcode|സ്കാൻ|scan/i.test(text);
-  const resendIntent = /resend|again|send.*again|kaanunnilla|kittunnilla|not (showing|visible|there)|lost|missing|kaanan|kaanuvan|onnukoodi|oru thavana koodi|vendi.*veendum/i.test(text);
-  return mentionsQr && resendIntent;
-}
-
-// FAQ intent patterns are language-agnostic (they already match English AND
-// Manglish keywords, since customers of either language type these same
-// keywords) — only the reply text depends on `language`.
-const FAQ_PATTERNS = {
-  asksForNumber: /(phone number|mobile number|upi number|payment number|account number|your number|number tharo|number parayo|number koodukumo|number tharuo)/i,
-  howMuch: /(how much|price|cost|fee|rate|entha vila|entra vila|₹)/i,
-  howLong: /(how long|when.*report|time.*report|eppo kittum|how many min)/i,
-  whatGet: /(what.*get|enthanu kittu|entha kittunnath|what do i|what will i)/i,
+// Maps camelCase patch keys to their DB column names. Only keys present
+// here are ever written — this is intentional, to keep the mapping between
+// server.js session fields and DB columns explicit and safe.
+const FIELD_MAP = {
+  name: "name",
+  dob: "dob",
+  gender: "gender",
+  stage: "stage",
+  palmMediaId: "palm_media_id",
+  paymentReceived: "payment_received",
+  reportText: "report_text",
+  reportStatus: "report_status",
+  reportDueAt: "report_due_at",
+  reportError: "report_error",
+  reportAttempts: "report_attempts",
+  relation: "relation",
+  orderCount: "order_count",
+  awaitingTransactionId: "awaiting_transaction_id",
+  awaitingReportInquiryCount: "awaiting_report_inquiry_count",
+  awaitingPaymentInquiryCount: "awaiting_payment_inquiry_count",
+  languageAttempts: "language_attempts",
+  funnelNudgeSentAt: "funnel_nudge_sent_at",
+  followUpMessageCount: "follow_up_message_count",
+  awaitingFollowUpPayment: "awaiting_follow_up_payment",
+  collectingClarifyAttempts: "collecting_clarify_attempts",
+  manualReengageSentAt: "manual_reengage_sent_at",
+  pendingSecondPerson: "pending_second_person",
+  paymentConfirmedAt: "payment_confirmed_at",
+  lastAttemptAt: "last_attempt_at",
+  hardCapNotifiedAt: "hard_cap_notified_at",
+  refundRequestedAt: "refund_requested_at",
+  language: "language",
 };
 
-function matchFaq(text, language) {
-  const lower = text.toLowerCase();
-  if (FAQ_PATTERNS.asksForNumber.test(lower)) return t(language, "faqPaymentNumber");
-  if (FAQ_PATTERNS.howMuch.test(lower)) return t(language, "faqHowMuch");
-  if (FAQ_PATTERNS.howLong.test(lower)) return t(language, "faqHowLong");
-  if (FAQ_PATTERNS.whatGet.test(lower)) return t(language, "faqWhatGet");
-  return null;
+// Updates only the given fields for a phone number's session, bumps
+// updated_at automatically, and returns the full updated session object.
+async function updateSession(phone, patch) {
+  const keys = Object.keys(patch).filter((k) => Object.prototype.hasOwnProperty.call(FIELD_MAP, k));
+  if (keys.length === 0) {
+    return getOrCreateSession(phone);
+  }
+
+  const setClauses = keys.map((k, i) => `${FIELD_MAP[k]} = $${i + 2}`);
+  const values = keys.map((k) => patch[k]);
+
+  const sql = `UPDATE sessions SET ${setClauses.join(", ")}, updated_at = now() WHERE phone = $1 RETURNING *`;
+  const result = await pool.query(sql, [phone, ...values]);
+
+  if (result.rows.length === 0) {
+    // Row didn't exist yet (shouldn't normally happen since webhook always
+    // calls getOrCreateSession first) — create it, then apply the patch.
+    await getOrCreateSession(phone);
+    return updateSession(phone, patch);
+  }
+
+  return rowToSession(result.rows[0]);
 }
 
-// Matches messages asking for report status while awaiting_report, e.g.
-// "report", "assessment", "എപ്പോൾ കിട്ടും", "ready ayo", "status".
-function isReportStatusQuery(text) {
-  return /report|assessment|reading|എപ്പോൾ|kittum|kitum|ready|status|vannu|vanno/i.test(text);
+// Finds all sessions whose report is pending and due (report_due_at has
+// passed). Used by the polling worker — this is what makes report delivery
+// survive a Railway restart, since it's driven entirely by DB state rather
+// than an in-memory setTimeout.
+async function findDueReports() {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE report_status = 'pending'
+       AND report_due_at IS NOT NULL
+       AND report_due_at <= now()`
+  );
+  return result.rows.map(rowToSession);
 }
 
-// Matches messages that explicitly ask for a refund, in English or common
-// Malayalam/Manglish phrasing. Deliberately broad (substring match, not
-// whole-message) since refund requests come in many forms mid-sentence
-// ("please return the payment", "paisa thirichu tharu", etc.) — false
-// positives here just mean an extra flag on a session that's already
-// stuck, which is harmless, whereas missing a real one is the actual risk.
-// Real incident this addresses: Sangeetha, 919778743899, 29/7 — asked for
-// a refund twice, got a canned "we'll contact you" reply both times, with
-// no way to notice it was specifically a refund request until manually
-// reading the full chat transcript hours later.
-function isRefundRequest(text) {
-  if (!text) return false;
-  return /refund|return.*(payment|money|amount)|money\s*back|paisa.*(thirich|return)|തിരിച്ച്.*(തരൂ|തരാമോ|നൽകൂ)|റീഫണ്ട്/i.test(text);
+// Finds every session where payment was received but report generation
+// ultimately gave up (report_status='failed', the terminal state set after
+// MAX_REPORT_ATTEMPTS). This is the authoritative "paid but not delivered"
+// list — safer than scanning chat transcripts by hand, since it's driven
+// directly by DB state rather than by what a message preview happens to
+// show. Ordered most-recent-first so the newest cases surface first.
+// Fetches every session marked report_status='sent' along with its report
+// text. Used by the one-off /admin/scan-stuck-reports endpoint to find
+// sessions where a refusal or degenerate-output slipped past isLikelyRefusal
+// / isLikelyDegenerateRepetition and got sent to the customer (and marked
+// 'sent' in the DB) as if it were their real report — these sessions never
+// show up in findFailedPayments() because their status isn't 'failed'.
+async function findSentReports() {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE report_status = 'sent'
+       AND report_text IS NOT NULL
+     ORDER BY updated_at DESC`
+  );
+  return result.rows.map(rowToSession);
 }
 
-// Matches short, low-content acknowledgment messages ("Ok", "K", "Okay",
-// "Alright", "ߑ" etc.) that genuinely don't need any reply — the customer
-// is just acknowledging the last message, not asking anything. Deliberately
-// conservative: only matches when the ENTIRE message (after trimming,
-// lowercasing, and stripping trailing punctuation) is one of these fillers,
-// so "Ok but when will it come" or "Okay, thank you so much" still get
-// treated as real messages needing a real reply.
-function isTrivialAcknowledgment(text) {
-  if (!text) return false;
-  const cleaned = text
-    .trim()
-    .toLowerCase()
-    .replace(/[.,!?~\s]+$/g, "")
-    .trim();
-  const trivialWords = new Set([
-    "ok",
-    "okay",
-    "okk",
-    "okie",
-    "k",
-    "kk",
-    "kay",
-    "fine",
-    "alright",
-    "aight",
-    "sari",
-    "seri",
-    "sheri", // Malayalam/Manglish "ok/fine"
-    "thik",
-    "thika",
-    "theek",
-    "ߑ",
-    "ߑ",
-    "✔️",
-    "✅",
-  ]);
-  if (trivialWords.has(cleaned)) return true;
-
-  // Catches messages made up ENTIRELY of emoji (any count/combination),
-  // e.g. "ߘߘߘߘߘ" — previously each burst of these triggered its own
-  // full GPT reply since they didn't match the fixed single-emoji set
-  // above. Real incident: a rapid-fire emoji spam burst (many messages
-  // within seconds of each other) each got a distinct, real GPT-5.5 call
-  // in the collecting stage, pure wasted spend on non-questions.
-  const emojiOnlyRegex = /^[\p{Extended_Pictographic}\u200d\ufe0f\s]+$/u;
-  return text.trim().length > 0 && emojiOnlyRegex.test(text.trim());
-}
-
-// ---------------------------------------------------------------------------
-// OpenAI helpers
-// ---------------------------------------------------------------------------
-
-async function openaiChat(messages, opts = {}) {
-  if (!OPENAI_API_KEY) {
-    log("OPENAI_API_KEY missing, skipping OpenAI call");
-    return null;
-  }
-  const requestedModel = opts.model || "gpt-4o-mini";
-  log("openaiChat: requesting model:", requestedModel);
-
-  async function attempt(includeTemperature) {
-    const body = {
-      model: requestedModel,
-      messages,
-      // max_tokens is rejected outright by newer models (e.g. gpt-5.5) with
-      // a 400 error — max_completion_tokens is the current parameter name
-      // and works correctly across all models including older ones.
-      max_completion_tokens: opts.max_tokens || 800,
-    };
-    if (includeTemperature) {
-      body.temperature = opts.temperature ?? 0.7;
-    }
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
-    return { res, data };
-  }
-
-  try {
-    let { res, data } = await attempt(true);
-    log("openaiChat: HTTP status:", res.status, "-> actual model used (response.model):", data.model);
-
-    // Some newer models (e.g. gpt-5.5) reject any non-default temperature
-    // value outright rather than accepting/ignoring it. If that's the exact
-    // error, retry once without sending temperature at all, instead of
-    // giving up and silently falling back to a weaker model.
-    if (!res.ok && data?.error?.param === "temperature") {
-      log("openaiChat: model rejected custom temperature — retrying once without it.");
-      ({ res, data } = await attempt(false));
-      log("openaiChat (retry): HTTP status:", res.status, "-> actual model used (response.model):", data.model);
-    }
-
-    if (!res.ok) {
-      log("OpenAI error:", JSON.stringify(data));
-      return null;
-    }
-
-    const content = data.choices?.[0]?.message?.content || "";
-    const finishReason = data.choices?.[0]?.finish_reason;
-    const usage = data.usage;
-    log(
-      "openaiChat: success — content length:",
-      content.length,
-      "finish_reason:",
-      finishReason,
-      "usage:",
-      JSON.stringify(usage)
-    );
-    if (!content) {
-      log(
-        "openaiChat: WARNING — HTTP 200 but content is EMPTY. This can happen when a reasoning model spends its entire max_completion_tokens budget on internal reasoning tokens, leaving nothing for visible output. Full response:",
-        JSON.stringify(data)
-      );
-    }
-    return content || null;
-  } catch (err) {
-    log("OpenAI call failed:", err.message);
-    return null;
-  }
-}
-
-// Extracts {name, dob, gender} from free text (English/Malayalam/Manglish).
-// Returns only the fields it is confident about; never overwrites what we
-// don't find. Falls back to simple regex if OpenAI is unavailable/fails.
-async function extractFields(text, known) {
-  const result = { name: null, dob: null, gender: null, relation: null };
-
-  const dobMatch = text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/);
-  if (dobMatch) {
-    let [, d, m, y] = dobMatch;
-    if (y.length === 2) y = (parseInt(y, 10) > 30 ? "19" : "20") + y;
-    result.dob = `${d.padStart(2, "0")}-${m.padStart(2, "0")}-${y}`;
-  }
-
-  if (/\bmale\b|ആൺ|പുരുഷൻ/i.test(text) && !/\bfemale\b/i.test(text)) {
-    result.gender = "male";
-  } else if (/\bfemale\b|പെൺ|സ്ത്രീ/i.test(text)) {
-    result.gender = "female";
-  }
-
-  const prompt = `Extract name, date of birth, gender, and (if mentioned) how this person relates to the customer, from the customer's WhatsApp message below.
-The customer may send the details in ANY order, on separate lines, comma-separated, or in Malayalam/Manglish. Examples of valid inputs:
-"Shivlin, 07-11-1992, Male"
-"Shivlin\\n07-11-1992\\nMale"
-"Male\\n07-11-1992\\nShivlin"
-"പേര് Shivlin ജനനത്തീയതി 07-11-1992 ലിംഗം Male"
-"This is for my brother, Shivlin, 07-11-1992, Male"
-
-If gender is not explicitly stated as a word (male/female/ആൺ/പെൺ etc.), but the given name is a common Indian name with a clear, widely-recognized conventional gender in Indian naming convention (e.g. Satheesh, Ramesh, Suresh, Anil, Vijay, Rahul, Shivlin → male; Priya, Anitha, Divya, Lakshmi, Meera, Nidhiya → female), infer that gender confidently instead of leaving it null — do not force the customer to state the obvious. Only do this when you are genuinely confident the name is unambiguous; if the name could plausibly be used for either gender, or is unfamiliar to you, leave gender null so it gets asked explicitly instead of guessed.
-
-Already known (do not change unless the new message clearly overrides it): ${JSON.stringify(known)}
-Customer message: """${text}"""
-
-Reply with ONLY a raw JSON object, no markdown, no explanation, in this exact shape:
-{"name": string or null, "dob": "DD-MM-YYYY" or null, "gender": "male" or "female" or null, "relation": string or null}
-"relation" should only be set if the customer explicitly describes how this person relates to them (e.g. "brother", "friend", "wife") — otherwise null. If a field is not present in the message, set it to null.`;
-
-  const raw = await openaiChat([{ role: "user", content: prompt }], {
-    model: "gpt-4o-mini",
-    temperature: 0,
-    max_tokens: 150,
-  });
-
-  if (raw) {
-    try {
-      const cleaned = raw.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(cleaned);
-      if (parsed.name) result.name = parsed.name;
-      if (parsed.dob) result.dob = parsed.dob;
-      if (parsed.gender === "male" || parsed.gender === "female") result.gender = parsed.gender;
-      if (parsed.relation) result.relation = parsed.relation;
-    } catch (err) {
-      log("Extraction JSON parse failed, using regex-only result");
-    }
-  }
-
-  // Safe regex fallback for name — only when a dob or gender was also found
-  // in the same message, to avoid misreading a stray question as a name.
-  if (!result.name && (result.dob || result.gender)) {
-    let residual = text
-      .replace(dobMatch ? dobMatch[0] : "", "")
-      .replace(/\b(male|female)\b/gi, "")
-      .replace(/ആൺ|പുരുഷൻ|പെൺ|സ്ത്രീ/g, "")
-      .replace(/[,\n]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    const words = residual.split(" ").filter(Boolean);
-    if (words.length > 0 && words.length <= 4) {
-      result.name = words.join(" ");
-    }
-  }
-
-  return result;
-}
-
-// ---------------------------------------------------------------------------
-// Media helpers (fetch WhatsApp image as base64 for vision-capable report gen)
-// ---------------------------------------------------------------------------
-
-async function getMediaBase64(mediaId) {
-  try {
-    const metaRes = await fetch(`https://graph.facebook.com/v20.0/${mediaId}`, {
-      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
-    });
-    const meta = await metaRes.json();
-    log("Media metadata lookup for", mediaId, "-> HTTP", metaRes.status, "response:", JSON.stringify(meta));
-
-    if (!meta.url) {
-      log("Media download ABORTED — no url in metadata response for mediaId:", mediaId);
-      return null;
-    }
-
-    const fileRes = await fetch(meta.url, {
-      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
-    });
-
-    if (!fileRes.ok) {
-      log("Media file download FAILED — HTTP", fileRes.status, "for mediaId:", mediaId);
-      return null;
-    }
-
-    const buffer = await fileRes.buffer();
-    const mimeType = meta.mime_type || "image/jpeg";
-    const dataUrl = `data:${mimeType};base64,${buffer.toString("base64")}`;
-
-    log("Palm image downloaded successfully. Size in bytes:", buffer.length, "mime_type:", mimeType);
-    log("Data URL first 100 chars:", dataUrl.slice(0, 100));
-
-    if (buffer.length === 0) {
-      log("Media download WARNING — downloaded buffer is 0 bytes, treating as failure.");
-      return null;
-    }
-
-    return dataUrl;
-  } catch (err) {
-    log("Failed to fetch media (caught):", err.message);
-    return null;
-  }
-}
-
-// Quick, cheap vision check: is this actually a photo of a human palm/hand?
-// Run BEFORE sending the QR/payment ask, so a wrong photo (a wall, tiles,
-// a face, etc.) gets caught immediately instead of only being discovered
-// during report generation — after the customer has already paid ₹99.
-// Fails OPEN (treats as valid) on any error, so an infrastructure hiccup
-// on our end never blocks a genuine customer from proceeding.
-async function isPalmPhoto(imageDataUrl) {
-  if (!imageDataUrl) {
-    return { valid: true, reason: "no image data to check — defaulting to accept" };
-  }
-  if (!OPENAI_API_KEY) {
-    return { valid: true, reason: "OPENAI_API_KEY missing — defaulting to accept" };
-  }
-  try {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: "Look at this image. Is it a clear photo of a human hand showing the palm (suitable for a palm reading)? Reply with ONLY one word: YES or NO.",
-              },
-              { type: "image_url", image_url: { url: imageDataUrl } },
-            ],
-          },
-        ],
-        max_completion_tokens: 10,
-      }),
-    });
-    const data = await res.json();
-    log("Palm photo validation -> HTTP status:", res.status, "response:", JSON.stringify(data));
-
-    if (!res.ok) {
-      return { valid: true, reason: "validation call failed (HTTP " + res.status + ") — defaulting to accept" };
-    }
-
-    const rawAnswer = (data.choices?.[0]?.message?.content || "").trim();
-    const upper = rawAnswer.toUpperCase();
-    if (!upper) {
-      return { valid: true, reason: "empty validation response — defaulting to accept" };
-    }
-
-    // Smaller vision models don't always follow strict "reply with ONLY
-    // one word" instructions — e.g. "Yes, this looks like a palm" or "The
-    // image shows a hand, so yes" are both genuine affirmative answers that
-    // don't literally START with "YES". Checking for YES/NO anywhere (as a
-    // whole word) is far more robust than requiring an exact prefix match,
-    // which was silently rejecting real palm photos whenever the model
-    // phrased its answer even slightly differently than instructed.
-    const saysYes = /\bYES\b/.test(upper);
-    const saysNo = /\bNO\b/.test(upper);
-
-    let valid;
-    if (saysYes && !saysNo) {
-      valid = true;
-    } else if (saysNo && !saysYes) {
-      valid = false;
-    } else {
-      // Both, neither, or genuinely unclear — fail open. Blocking a real
-      // customer over an ambiguous validation answer is a worse outcome
-      // than occasionally letting a borderline photo through.
-      valid = true;
-    }
-
-    return { valid, reason: rawAnswer };
-  } catch (err) {
-    log("Palm photo validation crashed (caught):", err.message);
-    return { valid: true, reason: "exception — defaulting to accept" };
-  }
-}
-
-// After a customer already has their own report, do they want to start a
-// NEW reading for a DIFFERENT person, in this SAME chat? Deliberately
-// conservative: any ambiguity, error, or non-YES answer defaults to false,
-// so a misclassification never accidentally resets someone's own session.
-async function wantsAnotherPersonReading(text, previousBotMessage) {
-  if (!OPENAI_API_KEY) return false;
-  try {
-    const contextLine = previousBotMessage
-      ? `\n\nFor context, the palmist's own PREVIOUS message (right before this customer reply) was: """${previousBotMessage}"""\nIf that previous message itself offered/asked whether the customer wants to start a reading for someone else, and this new message is a short agreement ("yes", "sure", "ok", "cheyyam", etc.), that DOES count as clearly wanting a new reading — reply YES in that case.`
-      : "";
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "user",
-            content: `The customer already received their own palm reading in this WhatsApp chat (and possibly a reading for one other person too, in the same chat). Does this NEW message clearly indicate they now want to START a NEW palm reading for a DIFFERENT person? Reply YES only if they are clearly asking to begin/order a new reading for someone else.
-
-Reply NO if the message is instead:
-- A question ABOUT an existing reading or reply (even if it mentions another person by name/relation) — e.g. "Ente karyamano wifeinte karyamano" ("is this about me or my wife?") is asking to CLARIFY which existing reading a reply refers to — that is NO, not a new-reading request.
-- A general question, thanks, or comment.
-- Ambiguous in any way.
-${contextLine}
-
-Reply with ONLY one word: YES or NO.
-
-Message: """${text}"""`,
-          },
-        ],
-        max_completion_tokens: 5,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      log("wantsAnotherPersonReading check FAILED:", JSON.stringify(data));
-      return false;
-    }
-    const answer = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
-    log("wantsAnotherPersonReading classification ->", answer);
-    return answer.startsWith("YES");
-  } catch (err) {
-    log("wantsAnotherPersonReading crashed (caught):", err.message);
-    return false;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Voice message support (transcription) — feeds into the SAME text pipeline
-// as typed messages. Does not touch report generation in any way.
-// ---------------------------------------------------------------------------
-
-// Downloads a WhatsApp audio/voice message and returns the raw bytes +
-// mime type (not a data URL — OpenAI's transcription endpoint needs a real
-// file upload, not base64).
-async function getAudioBuffer(mediaId) {
-  try {
-    const metaRes = await fetch(`https://graph.facebook.com/v20.0/${mediaId}`, {
-      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
-    });
-    const meta = await metaRes.json();
-    log("Voice media metadata lookup for", mediaId, "-> HTTP", metaRes.status, "response:", JSON.stringify(meta));
-
-    if (!meta.url) {
-      log("Voice media download ABORTED — no url in metadata response for mediaId:", mediaId);
-      return null;
-    }
-
-    const fileRes = await fetch(meta.url, {
-      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
-    });
-
-    if (!fileRes.ok) {
-      log("Voice media file download FAILED — HTTP", fileRes.status, "for mediaId:", mediaId);
-      return null;
-    }
-
-    const buffer = await fileRes.buffer();
-    const mimeType = meta.mime_type || "audio/ogg";
-    log("Voice message downloaded successfully. Size in bytes:", buffer.length, "mime_type:", mimeType);
-
-    if (buffer.length === 0) {
-      log("Voice media download WARNING — downloaded buffer is 0 bytes, treating as failure.");
-      return null;
-    }
-
-    return { buffer, mimeType };
-  } catch (err) {
-    log("Failed to fetch voice media (caught):", err.message);
-    return null;
-  }
-}
-
-// Transcribes voice message bytes via OpenAI's Whisper endpoint. No
-// "language" parameter is passed — Whisper auto-detects, so both Malayalam
-// and English voice messages work without special-casing either.
-async function transcribeVoiceMessage(buffer, mimeType) {
-  if (!OPENAI_API_KEY) {
-    log("OPENAI_API_KEY missing, cannot transcribe voice message");
-    return null;
-  }
-
-  try {
-    const extension = mimeType.includes("mp4")
-      ? "mp4"
-      : mimeType.includes("mpeg")
-      ? "mp3"
-      : mimeType.includes("wav")
-      ? "wav"
-      : "ogg"; // WhatsApp voice notes are typically audio/ogg (opus codec)
-
-    const form = new FormData();
-    form.append("file", new Blob([buffer], { type: mimeType }), `voice.${extension}`);
-    form.append("model", "whisper-1");
-
-    log("Sending voice message to OpenAI for transcription (whisper-1). Size:", buffer.length, "bytes, mime:", mimeType);
-
-    const res = await globalThis.fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
-    });
-
-    const rawText = await res.text();
-    let data;
-    try {
-      data = JSON.parse(rawText);
-    } catch {
-      data = { rawText };
-    }
-
-    log("OpenAI transcription HTTP status:", res.status);
-    log("OpenAI transcription full response:", JSON.stringify(data));
-
-    if (!res.ok || !data.text) {
-      log("Voice transcription FAILED:", JSON.stringify(data));
-      return null;
-    }
-
-    const transcript = data.text.trim();
-    log("Voice transcription SUCCEEDED. Transcript:", transcript);
-    return transcript || null;
-  } catch (err) {
-    log("Voice transcription call crashed (caught):", err.message);
-    return null;
-  }
-}
-
-// Handles an incoming voice message end-to-end: download -> transcribe ->
-// hand off to the EXACT SAME handleTextMessage() used for typed text, so
-// every downstream stage (detail collection, FAQs, follow-up Q&A, etc.)
-// behaves identically regardless of whether the customer typed or spoke.
-// Language can't be detected from a failed/undownloadable transcript, so
-// failure messages here use the session's current (last-known) language.
-async function handleVoiceMessage(phone, mediaId, session) {
-  log("Voice message received from", phone, "-> mediaId:", mediaId);
-
-  const audio = await getAudioBuffer(mediaId);
-  if (!audio) {
-    await sendText(phone, t(session.language, "voiceTranscriptionFailed"));
-    return;
-  }
-
-  const transcript = await transcribeVoiceMessage(audio.buffer, audio.mimeType);
-  if (!transcript) {
-    await sendText(phone, t(session.language, "voiceTranscriptionFailed"));
-    return;
-  }
-
-  log("Voice message transcribed for", phone, "-> treating as text:", transcript);
-  db.logMessage(phone, "in", `[Voice] ${transcript}`, "voice");
-  await handleTextMessage(phone, transcript, session);
-}
-
-// A genuine report is required (system prompt) to run 2000+ words minimum.
-// Keyword-matching every possible refusal phrasing is a losing game — we've
-// already had to patch this twice: bug #23's original English-only miss,
-// then a NEW Malayalam phrasing ("ലഭിച്ചിട്ടില്ല" — "hasn't been received")
-// that slipped through the exact same way on 24/7/2026 (real incident:
-// Sudheer, 919744084652 — paid ₹99, model wrongly claimed his palm photo
-// was "just a payment receipt," that refusal was accepted as his report,
-// and he got stuck with no way back — refunded manually).
+// Finds sessions stuck in awaiting_report where genuine wall-clock time
+// since payment (payment_confirmed_at) exceeds thresholdMs, regardless of
+// what report_status/report_attempts/report_due_at currently say. This is
+// a deliberate belt-and-suspenders check independent of the normal
+// attempt-counter bookkeeping — it exists specifically to catch the case
+// where that bookkeeping itself is broken (e.g. an attempt silently fails
+// to persist its incremented count and the session retries "attempt 1"
+// forever without ever reaching report_status='failed'). Real incident
+// this defends against: Aswathy, 918921390826, 24-25/7 — stuck over an
+// hour past payment with no exhausted message ever sent, because attempts
+// never appeared to progress past the first one.
 //
-// Word count is a SIGNAL, not a standalone verdict, at both ends of the
-// range — mirroring how the top end (REFUSAL_KEYWORD_CHECK_MAX_WORDS)
-// already works. It used to be a hard PRIMARY check on the low end too
-// (auto-reject anything under MIN_REPORT_WORDS, no keyword check at all),
-// which caused its own real incident: Sreekanth, 919847011965, 9-10/8 —
-// a genuine, on-topic 712-word reading was discarded purely for being
-// shorter than the 800-word floor, even though it contained no refusal
-// language whatsoever. gpt-4.1 does not reliably hit the system prompt's
-// 2000-word target on every attempt (temperature 0.8 plus normal per-palm
-// variation), so a hard length floor this high produces false positives
-// on real, paid-for reports. Fixed by lowering the only HARD floor to a
-// length no genuine report could plausibly fall under, and routing
-// everything else through the keyword check instead of skipping it.
-const MIN_REPORT_WORDS_HARD_FLOOR = 150; // no real report is ever this short; genuine refusal/apology messages are almost always well under this
-// Upper bound of the keyword-check range. A report that genuinely follows
-// the system prompt's 2000-word instruction will almost always be well
-// past this — so once content clears it, we skip the keyword check
-// entirely rather than risk a false positive. Real incident this fixes:
-// Aswathy, 918921390826, 24-25/7 — all 5 of her attempts came back HTTP
-// 200 with genuine, well-formed report content (confirmed from logs), but
-// every one was discarded because the unconditional secondary check
-// flagged common Malayalam words (അല്ല = "is not", കൈരേഖ = "palm line" —
-// both guaranteed to appear in any real reading) as if they were refusal
-// language. She was charged 5x in API cost for reports that were silently
-// thrown away, then told the report generation had failed.
-const REFUSAL_KEYWORD_CHECK_MAX_WORDS = 1500;
-
-function isLikelyRefusal(text) {
-  if (!text) return true;
-  const trimmed = text.trim();
-  const wordCount = trimmed.split(/\s+/).length;
-
-  // HARD floor — nothing this short could ever be a genuine report,
-  // regardless of content, so skip the keyword check and reject outright.
-  if (wordCount < MIN_REPORT_WORDS_HARD_FLOOR) return true;
-
-  // Comfortably past the keyword-check range: for all practical purposes
-  // guaranteed to be genuine content. Subjecting it to fragile keyword
-  // matching only risks false positives on ordinary, extremely common
-  // Malayalam words.
-  if (wordCount > REFUSAL_KEYWORD_CHECK_MAX_WORDS) return false;
-
-  // Everything from MIN_REPORT_WORDS_HARD_FLOOR up to
-  // REFUSAL_KEYWORD_CHECK_MAX_WORDS — including short-but-genuine reports
-  // like Sreekanth's 712-word one — is decided by the keyword check below,
-  // not auto-rejected for length alone.
-
-  const englishRefusalPatterns = /i'?m sorry|i can'?t assist|i cannot assist|i'?m unable to|as an ai|i can'?t help with that/i;
-  if (englishRefusalPatterns.test(trimmed)) return true;
-
-  // Malayalam refusal shape: an apology word, combined with a negation,
-  // combined with a reference to the image/receipt — this is the pattern
-  // the model uses when it (sometimes wrongly) claims the palm photo is
-  // invalid, missing, or a payment receipt instead of writing the reading.
-  const malayalamApology = /ക്ഷമിക്കണം|ക്ഷമിക്കൂ/;
-  const malayalamNegation = /അല്ല|ലഭ്യമല്ല|ലഭ്യമായിട്ടില്ല|ലഭിച്ചിട്ടില്ല|ലഭിച്ചില്ല|കഴിയില്ല|കഴിഞ്ഞില്ല|കഴിയാത്ത|സാധ്യമല്ല/;
-  const malayalamImageRef = /ചിത്രം|ഫോട്ടോ|കൈരേഖ|പാം|palm|രസീത്|സ്ക്രീൻഷോട്ട്/i;
-
-  if (malayalamApology.test(trimmed) && malayalamNegation.test(trimmed) && malayalamImageRef.test(trimmed)) {
-    return true;
-  }
-
-  return false;
-}
-
-// Detects degenerate/looping model output — the model gets stuck repeating
-// the same short phrase hundreds of times instead of writing a real
-// reading. Real incident: Subin jose, 14/7 — report collapsed into endless
-// repetitions of "palm-ന്റെ records" and was sent to the customer in full
-// as their finished ₹99 report. Nothing previously checked for this.
-// **Fixed**: new `isLikelyDegenerateRepetition()` — checks 4-word sliding
-// windows across the generated text; if any phrase repeats 15+ times in
-// a report-length output, it's treated as a failed attempt and retried,
-// same as a refusal.
-function isLikelyDegenerateRepetition(text) {
-  if (!text) return false;
-  const words = text.trim().split(/\s+/);
-  if (words.length < 200) return false; // only check reports of plausible length
-
-  const phraseCounts = new Map();
-  const windowSize = 4;
-  for (let i = 0; i <= words.length - windowSize; i++) {
-    const phrase = words.slice(i, i + windowSize).join(" ");
-    phraseCounts.set(phrase, (phraseCounts.get(phrase) || 0) + 1);
-  }
-
-  const maxCount = Math.max(...phraseCounts.values());
-  return maxCount >= 15;
-}
-
-// Dedicated OpenAI call for report generation, logging the full request
-// payload (image truncated) and full raw response.
-async function callOpenAIForReport(messages, maxTokens, model) {
-  if (!OPENAI_API_KEY) {
-    log("OPENAI_API_KEY missing, cannot generate report");
-    return { ok: false, status: null, data: null, content: null };
-  }
-
-  const loggableMessages = messages.map((m) => {
-    if (!Array.isArray(m.content)) return m;
-    return {
-      ...m,
-      content: m.content.map((part) =>
-        part.type === "image_url"
-          ? { type: "image_url", image_url: { url: (part.image_url?.url || "").slice(0, 100) + "...[truncated]" } }
-          : part
-      ),
-    };
-  });
-
-  // max_completion_tokens (not the older max_tokens) — same fix already
-  // proven in openaiChat(), since max_tokens is rejected outright by newer
-  // models while max_completion_tokens works correctly across old and new
-  // models alike.
-  async function attempt(includeTemperature) {
-    const requestBody = {
-      model,
-      messages,
-      max_completion_tokens: maxTokens,
-    };
-    if (includeTemperature) {
-      requestBody.temperature = 0.8;
-    }
-    log(
-      `OpenAI report request payload for model "${model}" (image truncated, temperature ${includeTemperature ? "included" : "omitted"}):`,
-      JSON.stringify({ ...requestBody, messages: loggableMessages })
-    );
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(requestBody),
-    });
-    const data = await res.json();
-    return { res, data };
-  }
-
-  try {
-    let { res, data } = await attempt(true);
-    log(`OpenAI report response HTTP status (model "${model}"):`, res.status);
-
-    // Reasoning-style models (e.g. gpt-5.5 and newer) reject any non-default
-    // temperature outright rather than silently accepting/ignoring it —
-    // same quirk already handled in openaiChat(). Retry once without it
-    // instead of treating this as a hard failure, so upgrading the report
-    // model doesn't require guessing per-model temperature support.
-    if (!res.ok && data?.error?.param === "temperature") {
-      log(`OpenAI report request: model "${model}" rejected custom temperature — retrying once without it.`);
-      ({ res, data } = await attempt(false));
-      log(`OpenAI report response HTTP status (model "${model}", retry without temperature):`, res.status);
-    }
-
-    log(`OpenAI report full response (model "${model}"):`, JSON.stringify(data));
-
-    if (!res.ok) {
-      log(`OpenAI report generation FAILED (model "${model}"):`, JSON.stringify(data));
-      return { ok: false, status: res.status, data, content: null };
-    }
-    return { ok: true, status: res.status, data, content: data.choices?.[0]?.message?.content || null };
-  } catch (err) {
-    log(`OpenAI report call crashed (caught) (model "${model}"):`, err.message);
-    return { ok: false, status: null, data: null, content: null, networkError: err.message };
-  }
-}
-
-async function generateReport(session) {
-  const { name, dob, gender, palmMediaId, relation } = session;
-
-  let imageDataUrl = null;
-  if (palmMediaId) {
-    imageDataUrl = await getMediaBase64(palmMediaId);
-  } else {
-    log("generateReport: session has no palmMediaId at all — no photo was ever stored.");
-  }
-
-  const imageAvailable = Boolean(imageDataUrl);
-  log("generateReport: imageAvailable =", imageAvailable);
-
-  const relationLine = relation
-    ? `\n\n(Context for you only, not to be stated as a fact in the reading: the customer described this person as their ${relation}. You may let this inform tone/warmth naturally if relevant, but do not fabricate anything about the relationship that wasn't stated.)`
-    : "";
-
-  const isEnglish = session.language === "en";
-
-  const systemPromptMl = `You are an experienced traditional Malayalam palmist (കൈരേഖാ വിശാരദൻ) with many years of practice, writing a formal, authoritative personal palm reading entirely in Malayalam script, minimum 2000 words.
-
-ADDRESSING THE CUSTOMER:
-- Never use casual/familiar terms like ചേട്ടാ, ചേച്ചി, മോനെ, മോളെ, or similar.
-- You may address the customer by name once, near the beginning (e.g. "ശിവ്ലിൻ,\n\nനിങ്ങളുടെ കൈയിലെ പ്രധാന രേഖകൾ സൂക്ഷ്മമായി പരിശോധിക്കുമ്പോൾ...") — after that, avoid repeatedly addressing them directly. Write as a respected, experienced traditional palmist speaking with quiet authority, not as a casual younger conversational voice.
-
-TONE AND CONFIDENCE:
-- Avoid hedging phrases: എനിക്ക് തോന്നുന്നു, ഒരുപക്ഷേ, ആയിരിക്കാം, ചിലപ്പോൾ.
-- Prefer grounded, authoritative interpretive phrases such as: "ഈ രേഖകൾ സൂചിപ്പിക്കുന്നത്...", "വ്യക്തമായി കാണപ്പെടുന്നത്...", "രേഖകളുടെ ഘടന വ്യക്തമാക്കുന്നത്...", "ഈ കൈരേഖയിൽ നിന്ന് മനസ്സിലാകുന്നത്...", "വിലയിരുത്തുമ്പോൾ കാണുന്നത്...".
-- The confidence should come from the interpretation of the palm itself — describe tendencies and possibilities (സാധ്യതകൾ) firmly, without making absolute guarantees about specific outcomes.
-
-VARIETY AND DIRECTNESS:
-- Do not repeatedly start sentences with നിങ്ങളുടെ ജീവിതത്തിൽ..., നിങ്ങളുടെ കൈയിൽ..., or നിങ്ങളുടെ രേഖകൾ.... Vary sentence openings and structure naturally throughout.
-- Do not explain what a palm line means in general (no palmistry-theory or textbook-style explanations). Go straight to interpreting THIS customer's palm. For example, instead of "ഹൃദയരേഖ സ്നേഹത്തെയും വികാരങ്ങളെയും സൂചിപ്പിക്കുന്നു," write something like "ഹൃദയരേഖയുടെ വ്യക്തതയും ആഴവും നോക്കുമ്പോൾ ബന്ധങ്ങളിൽ ആത്മാർത്ഥതയും സ്ഥിരതയും ആഗ്രഹിക്കുന്ന വ്യക്തിത്വമാണ് കാണുന്നത്." Customers are paying for interpretation, not a palmistry lesson.
-
-GROUNDING IN THE ACTUAL PALM:
-- Where a palm image is available, naturally weave in specific visible observations — only ones actually visible in the image — such as ജീവരേഖയുടെ ആഴം, ശിരോരേഖയുടെ ദിശ, ഹൃദയരേഖയുടെ ഘടന, ഭാഗ്യരേഖയുടെ വ്യക്തത, ശുക്രപർവതം, ഗുരുപർവതം, സൂര്യപർവതം, അംഗുഷ്ഠത്തിന്റെ ഘടന, വിരലുകളുടെ അനുപാതം. Do not invent features that are not visible.
-
-LANGUAGE:
-- Write consistently in Malayalam. Avoid unnecessary English terms like Heart Line, Head Line, Life Line, Marriage Line, Fate Line, flexibility, adaptability, decision-making — use ഹൃദയരേഖ, ശിരോരേഖ, ജീവരേഖ, വിവാഹരേഖ, ഭാഗ്യരേഖ, തീരുമാനശേഷി, സാഹചര്യങ്ങളോട് പൊരുത്തപ്പെടുന്ന സ്വഭാവം instead. English may appear in brackets only if truly necessary for clarity.
-
-CONTENT (weave naturally into a flowing narrative, never as labeled headings or a checklist):
-സ്വഭാവവും വ്യക്തിത്വവും, സ്നേഹവും ബന്ധങ്ങളും, വിവാഹവും കുടുംബജീവിതവും, ജോലി/കരിയർ/ബിസിനസ്, സാമ്പത്തിക കാര്യങ്ങൾ, ആരോഗ്യം, വിദേശ അവസരങ്ങൾ, വീട്/സ്വത്ത്, ആത്മീയ വളർച്ച, അടുത്ത 2-5 വർഷത്തെ ഭാവി സാധ്യതകളും വെല്ലുവിളികളും, കൈരേഖയിലെ പ്രത്യേക സൂചനകൾ. Expand meaningfully on future possibilities across these areas rather than listing them briefly.
-
-CONCLUSION:
-End with a strong, premium, confident, and inspiring closing passage that ties together the overall reading and future outlook — not a generic sign-off.
-
-Do not include any disclaimers. Do not say you are unable to see or analyze an image. Never use the words: fun, entertainment, AI, OpenAI, bot, automation, model, system (in English or Malayalam equivalents). Minimum 2000 words.
-
-IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked or even if it would seem to follow naturally from a comment about children/family. If children are relevant to the reading, speak only in general terms about family life, parenthood, or the number/timing of children in the future — never about the sex of a specific unborn child.`;
-
-  const systemPromptEn = `You are an experienced traditional palmist with many years of practice, writing a formal, authoritative personal palm reading entirely in English, minimum 2000 words.
-
-ADDRESSING THE CUSTOMER:
-- Never use casual/familiar terms like "bro", "dude", "buddy", "sis", or similar.
-- You may address the customer by name once, near the beginning (e.g. "Shivlin,\n\nLooking closely at the principal lines on your palm...") — after that, avoid repeatedly addressing them directly. Write as a respected, experienced traditional palmist speaking with quiet authority, not as a casual younger conversational voice.
-
-TONE AND CONFIDENCE:
-- Avoid hedging phrases: "I feel", "maybe", "perhaps", "possibly", "it seems".
-- Prefer grounded, authoritative interpretive phrases such as: "These lines indicate...", "What is clearly visible is...", "The structure of these lines makes clear...", "This palm reveals...", "On closer examination, what stands out is...".
-- The confidence should come from the interpretation of the palm itself — describe tendencies and possibilities firmly, without making absolute guarantees about specific outcomes.
-
-VARIETY AND DIRECTNESS:
-- Do not repeatedly start sentences with "In your life...", "On your hand...", or "Your lines...". Vary sentence openings and structure naturally throughout.
-- Do not explain what a palm line means in general (no palmistry-theory or textbook-style explanations). Go straight to interpreting THIS customer's palm. For example, instead of "The heart line represents love and emotions," write something like "The clarity and depth of your heart line points to a personality that values sincerity and stability in relationships." Customers are paying for interpretation, not a palmistry lesson.
-
-GROUNDING IN THE ACTUAL PALM:
-- Where a palm image is available, naturally weave in specific visible observations — only ones actually visible in the image — such as the depth of the life line, the direction of the head line, the structure of the heart line, the clarity of the fate line, the mount of Venus, the mount of Jupiter, the mount of the Sun, the structure of the thumb, the proportion of the fingers. Do not invent features that are not visible.
-
-LANGUAGE:
-- Write consistently in English throughout.
-
-CONTENT (weave naturally into a flowing narrative, never as labeled headings or a checklist):
-personality and character, love and relationships, marriage and family life, job/career/business, financial matters, health, opportunities abroad, home/property, spiritual growth, future possibilities and challenges over the next 2-5 years, special signs in the palm. Expand meaningfully on future possibilities across these areas rather than listing them briefly.
-
-CONCLUSION:
-End with a strong, premium, confident, and inspiring closing passage that ties together the overall reading and future outlook — not a generic sign-off.
-
-Do not include any disclaimers. Do not say you are unable to see or analyze an image. Never use the words: fun, entertainment, AI, OpenAI, bot, automation, model, system. Minimum 2000 words.
-
-IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked or even if it would seem to follow naturally from a comment about children/family. If children are relevant to the reading, speak only in general terms about family life, parenthood, or the number/timing of children in the future — never about the sex of a specific unborn child.`;
-
-  const systemPrompt = isEnglish ? systemPromptEn : systemPromptMl;
-
-  const instructionText = isEnglish
-    ? imageAvailable
-      ? `Customer details:\nName: ${name}\nDate of birth: ${dob}\nGender: ${
-          gender === "female" ? "Female" : "Male"
-        }\n\nThe customer's palm image is attached. Use it together with the details above to write the full reading, referencing specific palm lines and signs naturally.${relationLine}`
-      : `Customer details:\nName: ${name}\nDate of birth: ${dob}\nGender: ${
-          gender === "female" ? "Female" : "Male"
-        }\n\nWrite the full palmistry reading based on these details. Describe palm lines and signs naturally as part of the reading, without mentioning that no image was provided.${relationLine}`
-    : imageAvailable
-    ? `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
-        gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
-      }\n\nThe customer's palm image is attached. Use it together with the details above to write the full reading, referencing specific palm lines and signs naturally.${relationLine}`
-    : `Customer details:\nപേര്: ${name}\nജനനത്തീയതി: ${dob}\nലിംഗം: ${
-        gender === "female" ? "സ്ത്രീ" : "പുരുഷൻ"
-      }\n\nWrite the full palmistry reading based on these details. Describe palm lines and signs naturally as part of the reading, without mentioning that no image was provided.${relationLine}`;
-
-  const userContent = [{ type: "text", text: instructionText }];
-  if (imageAvailable) {
-    userContent.push({ type: "image_url", image_url: { url: imageDataUrl } });
-  }
-
-  const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userContent },
-  ];
-
-  // Upgraded from gpt-4.1 to gpt-5.5 (9/2026) — same model already proven
-  // reliable in this codebase for the follow-up chat path (better
-  // instruction-following on detailed style rules, less prone to the
-  // repetitive-phrasing failure mode). gpt-4o kept as fallback: still
-  // solid, cheap, and a genuinely different model family from gpt-5.5,
-  // which matters for the "try a different model" fallback logic below —
-  // no benefit to falling back to another same-generation reasoning model.
-  const REPORT_MODEL_PRIMARY = "gpt-5.5";
-  const REPORT_MODEL_FALLBACK = "gpt-4o";
-
-  // Tries one model end-to-end and returns a structured outcome, including
-  // WHETHER the failure was "cheap" (API error / empty content — fails
-  // before or with minimal token spend) or "expensive" (a full completion
-  // was already generated, just flagged as a refusal or degenerate
-  // repetition). This distinction matters for deciding whether it's worth
-  // immediately trying the other model within the same attempt.
-  async function tryModel(model) {
-    const result = await callOpenAIForReport(messages, 7000, model);
-
-    if (!result.ok) {
-      const detail = result.networkError
-        ? `network error: ${result.networkError}`
-        : `HTTP ${result.status} — ${result.data?.error?.code || result.data?.error?.type || "unknown"}: ${
-            result.data?.error?.message || JSON.stringify(result.data || {}).slice(0, 200)
-          }`;
-      return { report: null, failureReason: `${model} API failure — ${detail}`, model, cheapFailure: true };
-    }
-
-    const content = result.content;
-    if (!content) {
-      const finishReason = result.data?.choices?.[0]?.finish_reason || "unknown";
-      return {
-        report: null,
-        failureReason: `${model} returned empty content (finish_reason: ${finishReason})`,
-        model,
-        cheapFailure: true,
-      };
-    }
-
-    if (isLikelyRefusal(content)) {
-      const wc = content.trim().split(/\s+/).length;
-      return {
-        report: null,
-        rawContent: content,
-        failureReason: `${model} output flagged as refusal/too short (${wc} words): "${content.trim().slice(0, 150).replace(/\s+/g, " ")}${content.trim().length > 150 ? "..." : ""}"`,
-        model,
-        cheapFailure: false, // a full completion was already paid for
-      };
-    }
-
-    if (isLikelyDegenerateRepetition(content)) {
-      return {
-        report: null,
-        rawContent: content,
-        failureReason: `${model} output flagged as degenerate repetition`,
-        model,
-        cheapFailure: false, // ditto — real tokens were spent generating this
-      };
-    }
-
-    return { report: content, failureReason: null, model: result.data?.model || model };
-  }
-
-  // Cost-conscious fallback: only try the fallback model WITHIN THE SAME
-  // attempt for cheap failures (API error, empty response) — these fail
-  // fast with minimal/no token spend, so trying again on a different model
-  // is nearly free. For expensive failures (refusal/degenerate — a full
-  // completion was already generated and discarded), do NOT immediately
-  // burn a second full completion on the fallback model too; just let this
-  // attempt end as failed and let the NEXT scheduled attempt (poller,
-  // 3 min later) try again. Real incident this balances against: token
-  // usage spiked noticeably (27/7) from the sheer number of full 5-attempt
-  // exhaustion cycles across many customers that same day — doubling
-  // generation cost on every content-flagged failure would have made that
-  // meaningfully worse without a proportional gain in success rate.
-  let outcome = await tryModel(REPORT_MODEL_PRIMARY);
-
-  if (!outcome.report && outcome.cheapFailure) {
-    log(`generateReport: primary model (${REPORT_MODEL_PRIMARY}) failed cheaply — ${outcome.failureReason} — trying fallback model within same attempt.`);
-    const fallbackOutcome = await tryModel(REPORT_MODEL_FALLBACK);
-    if (fallbackOutcome.report) {
-      outcome = fallbackOutcome;
-    } else {
-      outcome = {
-        report: null,
-        // Keep whichever raw content exists (fallback's, since it ran
-        // last / is more likely to be the relevant one for a content-based
-        // failure) so diagnostic tools can still show something useful.
-        rawContent: fallbackOutcome.rawContent || outcome.rawContent,
-        failureReason: `primary (${REPORT_MODEL_PRIMARY}): ${outcome.failureReason} | fallback (${REPORT_MODEL_FALLBACK}): ${fallbackOutcome.failureReason}`,
-      };
-    }
-  } else if (!outcome.report) {
-    log(`generateReport: primary model (${REPORT_MODEL_PRIMARY}) failed expensively (content already generated) — ${outcome.failureReason} — NOT double-generating this attempt; will retry on next scheduled attempt.`);
-  }
-
-  const report = outcome.report;
-  const failureReason = outcome.failureReason;
-  const rawContent = outcome.rawContent || null;
-
-  if (report) {
-    // Reflects the exact model that actually produced this report —
-    // definitive proof of whether the primary or fallback model succeeded.
-    console.log("REPORT GENERATED USING:", outcome.model);
-  }
-
-  return { report, failureReason, rawContent };
-}
-
-// ---------------------------------------------------------------------------
-// Report delivery — generation + DB bookkeeping, shared by the poller and
-// by manual "check status" retries. No setTimeout anywhere in this flow.
-// ---------------------------------------------------------------------------
-
-const MAX_REPORT_ATTEMPTS = 5;
-const REPORT_RETRY_INTERVAL_MS = 3 * 60 * 1000; // how far to push report_due_at forward on failure
-
-// Wall-clock safety net, independent of report_attempts/report_due_at
-// bookkeeping: if it's been this long since payment was confirmed and the
-// report still isn't delivered, force an immediate fresh attempt — either
-// because the customer just asked, or via the poller's own sweep even if
-// nobody asks. This exists specifically so a bug in the attempt-counter
-// logic itself (which happened once — see findOverdueAwaitingReports in
-// db.js) can never leave a paying customer stuck indefinitely with no
-// resolution message ever sent.
-const REPORT_FORCE_RETRY_AFTER_MS = 30 * 60 * 1000; // 30 minutes
-
-// Absolute ceiling on auto-retrying a stuck session — past this point since
-// payment, the bot stops trying automatically (via the poller sweep AND via
-// customer messages) and just tells the customer to reach support. Without
-// this, an abandoned session got retried forever, every 30 minutes,
-// indefinitely — a real runaway retry loop that took gpt-4.1 request volume
-// from ~200/day to 7,333/day over three days (25-27/7). 3 hours is far more
-// than enough time for any genuine transient issue (rate limits, brief
-// outages) to resolve; a session still failing after that needs a human,
-// not another automatic attempt.
-const REPORT_FORCE_RETRY_HARD_CAP_MS = 3 * 60 * 60 * 1000; // 3 hours (applies to customer-triggered retries)
-
-// Separate, much tighter cap on the poller's OWN unprompted sweep — the
-// sweep should give an abandoned session exactly one extra automatic
-// chance beyond the normal 5-attempt cycle, not keep trying indefinitely
-// just because nobody told it to stop. A customer who actually comes back
-// later can still trigger a fresh retry themselves (bounded by
-// REPORT_FORCE_RETRY_HARD_CAP_MS above) — this cap only limits how long
-// the bot keeps trying on its own, unprompted.
-const SWEEP_AUTO_RETRY_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-
-// Minimum spacing between sweep-triggered attempts for the SAME session.
-// Critical fix: the poller runs every 60 seconds, and without this the
-// sweep re-attempted an overdue session on literally every tick — not
-// once per REPORT_FORCE_RETRY_AFTER_MS as intended. See
-// findOverdueAwaitingReports in db.js for the full incident writeup.
-const SWEEP_RETRY_PACING_MS = REPORT_FORCE_RETRY_AFTER_MS; // 30 minutes
-
-// How long a customer must be quiet in awaiting_language/collecting before
-// getting the one-time re-engagement nudge. 3 hours is long enough that
-// it's clearly not just normal typing/thinking pause, short enough that
-// the ₹99 pricing and context are still fresh when they get the nudge.
-const FUNNEL_NUDGE_AFTER_MS = 3 * 60 * 60 * 1000; // 3 hours
-
-// How many real (non-trivial-ack) follow-up questions a customer can ask
-// for free after their report is delivered, before being asked to pay
-// ₹99 again to continue. Generous enough that normal engagement (a
-// handful to a couple dozen genuine questions) is never affected — this
-// only stops the genuine outlier case. See report_sent handler for the
-// gate itself.
-const FOLLOW_UP_FREE_LIMIT = 30;
-
-// Minimum time between forced-retry generation attempts triggered by a
-// customer message, regardless of how many messages they send in that
-// window. Without this, a frustrated customer firing off several short
-// messages ("ߑ", "Hlo", "??") within seconds of each other each triggered
-// their own full (costly, ~7000-token) regeneration attempt — real
-// incident: Shameena, 919946345651, 26/7 — over a dozen forced attempts
-// within an hour, some just 5 seconds apart. This does not affect the
-// normal poller schedule (REPORT_RETRY_INTERVAL_MS) or the 30-minute
-// overdue sweep's own pacing — only how often a customer's own message can
-// force an out-of-schedule attempt.
-const REPORT_FORCE_RETRY_COOLDOWN_MS = 90 * 1000; // 90 seconds
-
-async function generateAndDeliverReport(session) {
-  const phone = session.phone;
-  const attemptNumber = (session.reportAttempts || 0) + 1;
-  log(`generateAndDeliverReport: attempt ${attemptNumber}/${MAX_REPORT_ATTEMPTS} for`, phone);
-
-  // Stamp the moment this attempt started — used by the force-retry logic
-  // in handleTextMessage to throttle how often a customer message can
-  // trigger a brand new (costly) generation attempt. Set unconditionally,
-  // regardless of outcome, so even a failed attempt still resets the clock.
-  await db.updateSession(phone, { lastAttemptAt: new Date() });
-
-  let report = null;
-  let failureReason = null;
-  try {
-    const outcome = await generateReport(session);
-    report = outcome.report;
-    failureReason = outcome.failureReason;
-  } catch (err) {
-    log("generateAndDeliverReport crashed (caught):", err.message);
-    failureReason = `unexpected crash: ${err.message}`;
-  }
-
-  if (report) {
-    await db.updateSession(phone, {
-      reportText: report,
-      reportStatus: "sent",
-      stage: "report_sent",
-      reportError: null,
-      reportAttempts: attemptNumber,
-    });
-    await sendLongText(phone, report);
-    log(`Report sent to ${phone} on attempt ${attemptNumber}`);
-    return { success: true, attemptNumber };
-  }
-
-  const exhausted = attemptNumber >= MAX_REPORT_ATTEMPTS;
-  await db.updateSession(phone, {
-    reportStatus: exhausted ? "failed" : "pending",
-    reportAttempts: attemptNumber,
-    reportDueAt: exhausted ? null : new Date(Date.now() + REPORT_RETRY_INTERVAL_MS),
-    // Real, specific failure reason (API error / empty content / refusal /
-    // degenerate repetition, per model tried) instead of a generic message
-    // — makes every future case diagnosable straight from
-    // /admin/failed-payments without needing to dig through raw logs.
-    reportError: failureReason || `Attempt ${attemptNumber} failed to produce a valid report (no reason captured)`,
-  });
-  log(
-    `Report generation FAILED for ${phone} on attempt ${attemptNumber} — reason: ${failureReason}` +
-      (exhausted ? " — max attempts exhausted, marked failed." : " — will retry via poller.")
+// hardCapMs is a SEPARATE, MUCH LARGER upper bound: sessions older than
+// this are EXCLUDED from the sweep entirely, even though they're still
+// "overdue" by the normal threshold. Without this, a customer who
+// abandons the chat after one failed cycle gets swept and retried FOREVER.
+//
+// pacingMs is a CRITICAL third gate, added after discovering a severe bug:
+// the poller runs every 60 SECONDS, but this query previously had no idea
+// when a session was last actually attempted — only how old the payment
+// was. That meant once a session crossed the overdue threshold, it got
+// swept and fully re-attempted on EVERY 60-second poll tick, not once
+// per REPORT_FORCE_RETRY_AFTER_MS (30 min) as intended — up to ~150+
+// redundant full generation attempts over a 3-hour window for a single
+// abandoned session. pacingMs (using last_attempt_at, set at the start of
+// every real generation attempt) enforces genuine spacing between
+// sweep-triggered attempts. This — not just the missing hard cap — is
+// almost certainly the dominant cause behind gpt-4.1 request volume
+// growing from ~200/day to 7,333/day over 25-27/7.
+// Finds pre-payment sessions that have gone quiet for at least thresholdMs
+// and never received a re-engagement nudge. Scoped to the two earliest
+// funnel stages (awaiting_language, collecting) — these are the stages
+// with the highest drop-off and, unlike awaiting_report/awaiting_payment,
+// had NO follow-up mechanism at all before this. Only ever fires once per
+// session (funnel_nudge_sent_at IS NULL), so this can never become spam —
+// a customer who's genuinely not interested gets nudged once, not
+// repeatedly. Real finding this addresses: on 28/8, 49% of active chats
+// stalled in these two stages combined, with confirmed evidence
+// (918637429436) that customers do not return on their own.
+// Finds every stuck (pre-payment) session that can LEGALLY be messaged
+// right now under WhatsApp's 24-hour customer service window — i.e. they
+// have sent an inbound message within the last 24 hours. Outside that
+// window, WhatsApp requires a pre-approved template message (a Meta
+// Business Manager process, not something achievable from this codebase)
+// — this function deliberately only returns sessions where a normal
+// session message is actually legal to send. Also respects
+// reengageCooldownMs so the same admin trigger can be run repeatedly
+// (e.g. throughout an ad-pause period) without double-messaging anyone
+// who was already reached recently.
+async function findReengageableSessions(reengageCooldownMs) {
+  const result = await pool.query(
+    `SELECT s.* FROM sessions s
+     WHERE s.stage IN ('awaiting_language', 'collecting', 'awaiting_photo', 'awaiting_payment')
+       AND EXISTS (
+         SELECT 1 FROM messages m
+         WHERE m.phone = s.phone
+           AND m.direction = 'in'
+           AND m.created_at >= now() - interval '24 hours'
+       )
+       AND (s.manual_reengage_sent_at IS NULL OR s.manual_reengage_sent_at <= now() - ($1 || ' milliseconds')::interval)
+     ORDER BY s.updated_at DESC`,
+    [reengageCooldownMs]
   );
-  return { success: false, attemptNumber, exhausted };
+  return result.rows.map(rowToSession);
 }
 
-// ---------------------------------------------------------------------------
-// Core message handling
-// ---------------------------------------------------------------------------
-
-function applyExtractedPatch(session, extracted) {
-  const patch = {};
-  if (extracted.name && !session.name) patch.name = extracted.name;
-  if (extracted.dob && !session.dob) patch.dob = extracted.dob;
-  if (extracted.gender && !session.gender) patch.gender = extracted.gender;
-  if (extracted.relation && !session.relation) patch.relation = extracted.relation;
-  return patch;
-}
-
-const COLLECTING_EXAMPLE_THRESHOLD = 3; // show a concrete example after this many unresolved prompts
-
-async function progressCollectingStage(phone, session) {
-  const missingFields = [];
-  if (!session.name) missingFields.push(t(session.language, "fieldName"));
-  if (!session.dob) missingFields.push(t(session.language, "fieldDob"));
-  if (!session.gender) missingFields.push(t(session.language, "fieldGender"));
-
-  if (missingFields.length > 0) {
-    // Track how many times in a row this customer has been shown this
-    // prompt without successfully providing their details — after a few
-    // unresolved attempts, switch from an abstract instruction to a
-    // concrete example, which converts much better for genuinely confused
-    // (non-troll) customers than repeating the same generic ask.
-    const attempts = (session.collectingClarifyAttempts || 0) + 1;
-    await db.updateSession(phone, { collectingClarifyAttempts: attempts });
-
-    // Only ask for what's actually still missing — previously this always
-    // sent the full "please send name/DOB/gender" message even when some
-    // fields (e.g. name and gender) had already been provided.
-    let message =
-      missingFields.length === 3
-        ? t(session.language, "askAllDetails")
-        : t(session.language, "missingFieldsPrompt", missingFields.join(", "));
-    if (attempts >= COLLECTING_EXAMPLE_THRESHOLD) {
-      message += t(session.language, "detailsExample");
-    }
-    await sendText(phone, message);
-    return session;
-  }
-
-  // All fields present — reset the counter so it doesn't carry over to a
-  // future second-person order in the same chat.
-  if (session.collectingClarifyAttempts) {
-    await db.updateSession(phone, { collectingClarifyAttempts: 0 });
-  }
-
-  if (session.palmMediaId) {
-    // A photo was already sent earlier (before all details were known) and
-    // stashed — don't ask for it again, just process it now.
-    log("progressCollectingStage: details complete AND a photo was already stashed for", phone, "— processing it now instead of re-asking.");
-    const updated = await db.updateSession(phone, { stage: "awaiting_photo" });
-    await sendText(phone, t(updated.language, "thanksName", updated.name));
-    await processReceivedPalmPhoto(phone, session.palmMediaId, updated);
-    return updated;
-  }
-
-  const updated = await db.updateSession(phone, { stage: "awaiting_photo" });
-  await sendText(phone, t(updated.language, "handRequest", updated.name, updated.gender));
-  return updated;
-}
-
-// Shared by all three ways a customer can confirm payment: screenshot image,
-// PDF receipt, or (if they can't send either) typing a transaction ID.
-// Real scheduling now targets 5-8 minutes (well under 10) regardless of
-// source — deliberately faster than the 25-30 minute figure customers are
-// told (see paymentReceivedMessage / matchFaq / REPORT_CORRECTION_DETECTED_
-// MESSAGE, all unchanged), so delivery consistently arrives well ahead of
-// the promised window instead of right at the edge. Unaffected by the
-// per-message send delay, which is a separate concern.
-async function confirmPaymentAndScheduleReport(phone, session, sourceLabel) {
-  const dueAt = new Date(Date.now() + (5 + Math.random() * 3) * 60 * 1000); // 5-8 minutes
-  await db.updateSession(phone, {
-    paymentReceived: true,
-    paymentConfirmedAt: new Date(),
-    stage: "awaiting_report",
-    reportStatus: "pending",
-    reportDueAt: dueAt,
-    reportAttempts: 0,
-    reportError: null,
-    awaitingTransactionId: false,
-    awaitingPaymentInquiryCount: 0,
-  });
-  log(`Payment confirmed via ${sourceLabel} for`, phone, "— report scheduled (via DB, no setTimeout), due at", dueAt.toISOString());
-  await sendText(phone, t(session.language, "paymentReceived", session.name || "", (session.orderCount || 1) > 1));
-}
-
-// Hidden testing command — wipes a phone number's session back to a fresh
-// state so the same test number(s) can be reused indefinitely instead of
-// needing a new number for every test run. Not documented to customers;
-// deliberately an uncommon phrase so it's never triggered by accident.
-const RESET_COMMAND = "resetmybot123";
-
-async function handleTextMessage(phone, text, session) {
-  if (text.trim().toLowerCase() === RESET_COMMAND) {
-    await db.updateSession(phone, {
-      stage: "new",
-      name: null,
-      dob: null,
-      gender: null,
-      palmMediaId: null,
-      paymentReceived: false,
-      reportText: null,
-      reportStatus: "none",
-      reportDueAt: null,
-      reportAttempts: 0,
-      reportError: null,
-      pendingSecondPerson: false,
-    });
-    log("Session RESET for", phone, "via hidden test command");
-    await sendText(phone, t(session.language, "resetConfirm"));
-    return;
-  }
-
-  // First-ever contact: ask for language explicitly instead of guessing.
-  // A bare "Hi" carries no reliable language signal — it's the standard
-  // greeting used by Malayalam and English speakers alike (the bot's own
-  // instructions tell everyone to send "Hi" to start) — so running it
-  // through the adaptive detectLanguage() classifier risked flipping a
-  // Malayalam-speaking customer straight into English on their very first
-  // message. This is fully deterministic (digit/keyword/script match via
-  // matchLanguageChoice below), not a GPT call, so there's no ambiguity.
-  if (session.stage === "new") {
-    session = await db.updateSession(phone, { stage: "awaiting_language" });
-    await sendText(phone, LANGUAGE_PICKER_MESSAGE);
-    return;
-  }
-
-  if (session.stage === "awaiting_language") {
-    const chosen = matchLanguageChoice(text);
-    if (!chosen) {
-      const attempts = (session.languageAttempts || 0) + 1;
-      const LANGUAGE_PICKER_FALLBACK_THRESHOLD = 2;
-
-      if (attempts >= LANGUAGE_PICKER_FALLBACK_THRESHOLD) {
-        // Don't trap them forever — default to Malayalam (this bot's
-        // customers are overwhelmingly Malayalam speakers, same reasoning
-        // used elsewhere in this codebase for ambiguous-language defaults)
-        // and let them through, rather than re-showing the identical
-        // picker with zero acknowledgment no matter how many times or how
-        // differently they try. Real incident: 918637429436 — 5 separate
-        // attempts across 8 days, never once got past this screen.
-        log(
-          "awaiting_language: unrecognized reply from",
-          phone,
-          "after",
-          attempts,
-          "attempts -> defaulting to Malayalam and proceeding instead of trapping them. Text was:",
-          text
-        );
-        session = await db.updateSession(phone, { language: "ml", stage: "collecting", languageAttempts: 0 });
-        await sendText(phone, t(session.language, "welcome"));
-
-        const extracted = await extractFields(text, session);
-        const patch = applyExtractedPatch(session, extracted);
-        if (Object.keys(patch).length) session = await db.updateSession(phone, patch);
-        await progressCollectingStage(phone, session);
-        return;
-      }
-
-      log("awaiting_language: unrecognized reply from", phone, "-> re-sending picker instead of guessing. Text was:", text);
-      await db.updateSession(phone, { languageAttempts: attempts });
-      await sendText(phone, LANGUAGE_PICKER_MESSAGE);
-      return;
-    }
-    session = await db.updateSession(phone, { language: chosen, stage: "collecting", languageAttempts: 0 });
-    await sendText(phone, t(session.language, "welcome"));
-
-    // In case the customer packed their actual details into the same
-    // message as their language choice (e.g. "1, John, 12/03/1990, Male"),
-    // don't discard that — extract and apply it immediately.
-    const extracted = await extractFields(text, session);
-    const patch = applyExtractedPatch(session, extracted);
-    if (Object.keys(patch).length) session = await db.updateSession(phone, patch);
-    await progressCollectingStage(phone, session);
-    return;
-  }
-
-  // Language is NOT re-detected here. It's set exactly once, deterministically,
-  // by the "awaiting_language" picker above, and never changes automatically
-  // for the rest of the session after that. This replaces an earlier
-  // "adaptive" version that re-ran detectLanguage() on every message and
-  // proved unreliable in production in two distinct, confirmed ways:
-  // - Faseela P, 918590262657, 11/8 — explicitly chose Malayalam, then got
-  //   two English replies purely because she'd typed "Female" (a literal
-  //   English word) as her gender answer, before flipping back on her next
-  //   message.
-  // - Shamnaz, 917306176496, 12/8 — explicitly chose Malayalam (implicitly,
-  //   by writing in Malayalam script), stayed correctly in Malayalam through
-  //   the whole name/DOB/gender/photo/payment flow, then flipped to English
-  //   on a plain "Ok", flipped back to Malayalam on a "Hlo", flipped to
-  //   English again on another "Ok" — and that last flip was still in
-  //   effect when the poller generated her report, so her actual paid
-  //   ₹99 reading was delivered entirely in English despite never once
-  //   having written a genuine English sentence in the whole conversation.
-  // Short, common, cross-language acknowledgment words ("Ok", "Hlo", "K",
-  // gender-field answers like "Female"/"Male") are exactly the class of
-  // message a language classifier will confidently score one way or the
-  // other, but which carry no real signal about which language the
-  // customer actually wants — the same fundamental problem the picker was
-  // built to solve for the very first "Hi", just recurring on every later
-  // short reply too. If a customer ever wants to actually switch language
-  // mid-conversation, that needs to be an explicit, deliberate action, not
-  // something inferred from ordinary short replies.
-
-  log(
-    "Current session state for",
-    phone,
-    "->",
-    JSON.stringify({ stage: session.stage, name: session.name, dob: session.dob, gender: session.gender, language: session.language })
+async function findAbandonedFunnelSessions(thresholdMs) {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE stage IN ('awaiting_language', 'collecting')
+       AND updated_at <= now() - ($1 || ' milliseconds')::interval
+       AND funnel_nudge_sent_at IS NULL`,
+    [thresholdMs]
   );
-
-  // Flag refund requests for visibility on /admin/refund-requests,
-  // regardless of stage — this doesn't change what reply the customer
-  // gets (that's decided normally, below), it just makes sure a refund
-  // ask is never invisible to a manual scan the way it was for Sangeetha,
-  // 919778743899, 29/7 (asked twice, no human response for hours).
-  if (isRefundRequest(text)) {
-    log("Refund request detected for", phone, "-> flagging on /admin/refund-requests. Message was:", text);
-    await db.updateSession(phone, { refundRequestedAt: new Date() });
-  }
-
-  if (session.stage === "collecting") {
-    const faqAnswer = matchFaq(text, session.language);
-    if (faqAnswer) await sendText(phone, faqAnswer);
-
-    const extracted = await extractFields(text, session);
-    const patch = applyExtractedPatch(session, extracted);
-    if (Object.keys(patch).length) session = await db.updateSession(phone, patch);
-
-    // If nothing new was extracted and no fixed FAQ matched, this is likely
-    // a genuine question or hesitation (trust concerns, "will this work",
-    // etc.) — repeating the exact same "please send your details" prompt
-    // ignores what they actually asked. Give a real, brief, reassuring
-    // reply instead, then still end with the details request.
-    if (!faqAnswer && Object.keys(patch).length === 0 && !isTrivialAcknowledgment(text)) {
-      const langName = t(session.language, "languageName");
-      const preReply = await openaiChat(
-        [
-          {
-            role: "system",
-            content: `You are the same experienced traditional palmist. The customer has not yet given their name, date of birth, and gender to start their ₹99 palm reading, and just sent a message that isn't providing those details — it may be a trust concern ("is this genuine", "will it actually work"), a question, hesitation, or a genuine decline/goodbye ("no", "not interested", "bye"). Answer briefly in ${langName} (2-3 sentences). ${t(session.language, "addressGuidance")}
-If it's a trust concern specifically, be concrete and honest, not vague: say directly that the reading is done from their own actual palm photo (not a generic template answer), and that the ₹99 fee makes it low-risk to simply try. Do NOT just describe what palmistry generally covers (personality, career, family, etc.) as if that were an answer to a trust question — that doesn't actually address "is this real/legit" and reads as empty filler before the payment ask.
-If the message clearly signals they want to stop or aren't interested (e.g. "no", "not now", "bye", "leave it") — even after some back-and-forth — respond warmly and briefly WITHOUT asking for their details again or repeating the pitch. A short, low-pressure acknowledgment (e.g. "No problem — message me anytime if you'd like a reading later") is the right tone; do not end with the name/DOB/gender ask in this case, since repeating it after someone has already tried to leave reads as ignoring them, not as helpful persistence.
-Otherwise — genuine questions, hesitation, or trust concerns — end by asking them to share their name, date of birth, and gender together to continue. Reply entirely in ${langName}.`,
-          },
-          { role: "user", content: text },
-        ],
-        { model: "gpt-5.5", temperature: 0.7, max_tokens: 800 }
-      );
-
-      if (preReply) {
-        await sendText(phone, preReply);
-        return;
-      }
-      // If the GPT call itself failed, fall through to the normal prompt below.
-    }
-
-    await progressCollectingStage(phone, session);
-    return;
-  }
-
-  if (session.stage === "awaiting_photo") {
-    const faqAnswer = matchFaq(text, session.language);
-    if (faqAnswer) await sendText(phone, faqAnswer);
-
-    if (session.palmMediaId) {
-      // Photo was already received but QR sending failed earlier — retry now.
-      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
-      if (qrSent) {
-        await db.updateSession(phone, { stage: "awaiting_payment" });
-        await sendText(phone, t(session.language, "photoReceivedPayment"));
-      } else {
-        await sendText(phone, t(session.language, "qrFailure"));
-      }
-      return;
-    }
-
-    await sendText(phone, t(session.language, "askForHandPhotoAgain", session.gender));
-    return;
-  }
-
-  if (session.stage === "awaiting_payment") {
-    // Same pattern as awaiting_report's inquiry counter — previously this
-    // stage NEVER offered support contact no matter how many times or how
-    // confusedly a customer asked. Real incident: Sreeja pv, 918606427024,
-    // 13/8 — sent 4 messages (including confused voice notes) stuck
-    // verifying payment, never once pointed to a human.
-    const paymentInquiryCount = (session.awaitingPaymentInquiryCount || 0) + 1;
-    await db.updateSession(phone, { awaitingPaymentInquiryCount: paymentInquiryCount });
-    const offerPaymentSupport = paymentInquiryCount >= SUPPORT_EMAIL_INQUIRY_THRESHOLD;
-    const withPaymentSupport = (msg) =>
-      offerPaymentSupport ? `${msg}\n\n${t(session.language, "supportContactLine")}` : msg;
-
-    if (session.awaitingTransactionId) {
-      // We already asked for a transaction ID after they said they couldn't
-      // send a screenshot — accept whatever they send now, unverified, and
-      // proceed exactly as if a payment screenshot had arrived.
-      log("Transaction ID received (unverified) for", phone, "-> treating as payment confirmation. Text was:", text);
-      await confirmPaymentAndScheduleReport(phone, session, "transaction ID text");
-      return;
-    }
-
-    if (cannotSendScreenshotIntent(text)) {
-      await db.updateSession(phone, { awaitingTransactionId: true });
-      await sendText(phone, withPaymentSupport(t(session.language, "askTransactionId")));
-      return;
-    }
-
-    const faqAnswer = matchFaq(text, session.language);
-    if (faqAnswer) {
-      await sendText(phone, withPaymentSupport(faqAnswer));
-      return;
-    }
-
-    if (isTrivialAcknowledgment(text)) {
-      // A plain "Ok"/"K" doesn't need a full GPT reassurance call — just
-      // the free, static payment reminder (still with support contact once
-      // the inquiry threshold is reached).
-      await sendText(phone, withPaymentSupport(t(session.language, "paymentReminderShort")));
-      return;
-    }
-
-    if (wantsQrResend(text)) {
-      // Real gap: a customer explicitly asking to see the QR again (it
-      // scrolled out of view, they switched devices, etc.) previously only
-      // ever got a text description of "the QR code above" — unhelpful if
-      // they genuinely can't see it anymore. Now resends the actual image.
-      log("Customer at", phone, "explicitly asked to resend the QR code — sending the image again.");
-      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
-      if (qrSent) {
-        await sendText(phone, withPaymentSupport(t(session.language, "paymentReminderShort")));
-      } else {
-        await sendText(phone, withPaymentSupport(t(session.language, "qrFailure")));
-      }
-      return;
-    }
-
-    // Previously: any message that didn't match the small fixed FAQ list
-    // (price/duration/what-you-get) got the exact same generic reminder,
-    // even for genuinely different questions (trust concerns, "explain
-    // first", etc.) — repetitive and unhelpful right before asking someone
-    // to pay. Now: give a real, brief, reassuring answer, still ending
-    // with the payment reminder.
-    const langName = t(session.language, "languageName");
-    const preReply = await openaiChat(
-      [
-        {
-          role: "system",
-          content: `You are the same experienced traditional palmist, speaking with a customer who is about to pay ₹99 for their palm reading but has a question or hesitation before paying. Answer briefly in ${langName} (2-4 sentences) — this could be a trust concern ("how do I know this is legit"), a request to explain the process again, a genuine decline/goodbye ("no", "not interested", "bye"), or anything else. ${t(session.language, "addressGuidance")}
-If it's a trust concern specifically, be concrete and honest, not vague: say directly that the reading is done from their own actual palm photo they already sent (not a generic template answer), and that the ₹99 fee makes it low-risk to simply try. Do NOT just describe what palmistry generally covers (personality, career, family, etc.) as if that were an answer to a trust question — that doesn't actually address "is this real/legit" and reads as empty filler before the payment ask.
-If the message clearly signals they want to stop or aren't interested — even after some back-and-forth — respond warmly and briefly WITHOUT repeating the payment reminder. A short, low-pressure acknowledgment is the right tone; do not end with the QR/payment ask in this case, since repeating it after someone has already tried to leave reads as ignoring them.
-Otherwise, after your answer, end with a gentle reminder that once they complete the ₹99 payment using the QR code above, they should send the payment screenshot here to receive their reading. Reply entirely in ${langName}.`,
-        },
-        { role: "user", content: text },
-      ],
-      { model: "gpt-5.5", temperature: 0.7, max_tokens: 800 }
-    );
-
-
-    if (preReply) {
-      await sendText(phone, withPaymentSupport(preReply));
-    } else {
-      await sendText(phone, withPaymentSupport(t(session.language, "paymentReminderShort")));
-    }
-    return;
-  }
-
-  if (session.stage === "awaiting_report") {
-    // A plain "Ok"/"K" here is just acknowledging the last message, not
-    // asking for status — skip entirely (no reply, no inquiry-count bump,
-    // no forced-retry check), same treatment as an emoji reaction. This
-    // also avoids accidentally burning a forced-retry generation attempt
-    // on a message that wasn't actually asking anything.
-    if (isTrivialAcknowledgment(text)) {
-      log("Trivial acknowledgment received in awaiting_report for", phone, "-> no reply needed.");
-      return;
-    }
-
-    // Track how many times this customer has messaged while still waiting.
-    // After several inquiries with no report yet, proactively offer the
-    // support email/WhatsApp helpline rather than waiting for them to ask.
-    const inquiryCount = (session.awaitingReportInquiryCount || 0) + 1;
-    await db.updateSession(phone, { awaitingReportInquiryCount: inquiryCount });
-    const offerSupport = inquiryCount >= SUPPORT_EMAIL_INQUIRY_THRESHOLD;
-    const withSupport = (msg) =>
-      offerSupport ? `${msg}\n\n${t(session.language, "supportContactLine")}` : msg;
-
-    // Always re-check fresh DB state on ANY message in this stage — no
-    // longer gated behind isReportStatusQuery() keyword matching. Real
-    // incident this fixes: Aswathy, 918921390826, 24-25/7 — every one of
-    // her messages ("My result where", "Time is long", etc.) failed to
-    // match the old keyword list, so the bot repeated a canned "still
-    // preparing" line for over an hour without ever checking whether the
-    // report had actually failed, succeeded, or was simply stuck.
-    const fresh = await db.getOrCreateSession(phone);
-
-    if (
-      fresh.reportStatus === "sent" &&
-      fresh.reportText &&
-      !isLikelyRefusal(fresh.reportText) &&
-      !isLikelyDegenerateRepetition(fresh.reportText)
-    ) {
-      // Self-heal an edge case where stage didn't get updated in sync.
-      await db.updateSession(phone, { stage: "report_sent", awaitingReportInquiryCount: 0 });
-      await sendLongText(phone, fresh.reportText);
-      return;
-    }
-
-    // Genuine wall-clock overdue check, independent of report_attempts/
-    // report_due_at bookkeeping — see REPORT_FORCE_RETRY_AFTER_MS above.
-    const paymentAgeMs = fresh.paymentConfirmedAt
-      ? Date.now() - new Date(fresh.paymentConfirmedAt).getTime()
-      : 0;
-    const overdue = paymentAgeMs > REPORT_FORCE_RETRY_AFTER_MS;
-    const pastHardCap = paymentAgeMs > REPORT_FORCE_RETRY_HARD_CAP_MS;
-
-    if (pastHardCap && (fresh.reportStatus === "failed" || overdue)) {
-      // Past the absolute ceiling — stop attempting automatically and point
-      // to support instead. See REPORT_FORCE_RETRY_HARD_CAP_MS above: this
-      // is what stops an abandoned-then-returned-to session from
-      // re-triggering another full 5-attempt cycle.
-      //
-      // Throttled separately from the retry logic itself: without this,
-      // the exact same "we'll contact you directly" message got repeated
-      // verbatim to every single thing the customer sent, for hours — real
-      // incident: Sangeetha, 919778743899, 29/7, ~10 identical replies
-      // over 18+ hours, including to two explicit refund requests. Now
-      // this notice is sent at most once per HARD_CAP_NOTIFY_COOLDOWN_MS;
-      // anything in between gets silence rather than a hollow repeat of a
-      // promise nobody has acted on yet.
-      const sinceNotifiedMs = fresh.hardCapNotifiedAt
-        ? Date.now() - new Date(fresh.hardCapNotifiedAt).getTime()
-        : Infinity;
-      const HARD_CAP_NOTIFY_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
-
-      if (sinceNotifiedMs < HARD_CAP_NOTIFY_COOLDOWN_MS) {
-        log(
-          "awaiting_report past-hard-cap message SKIPPED (already notified",
-          Math.round(sinceNotifiedMs / 60000),
-          "min ago) for",
-          phone,
-          "— staying silent instead of repeating the same notice again."
-        );
-        return;
-      }
-
-      log(
-        "awaiting_report force-retry SKIPPED (past hard cap) for",
-        phone,
-        "-> payment age",
-        Math.round(paymentAgeMs / 60000),
-        "min exceeds",
-        REPORT_FORCE_RETRY_HARD_CAP_MS / 60000,
-        "min ceiling — pointing to support instead of retrying again."
-      );
-      await sendText(phone, t(session.language, "reportExhausted"));
-      await db.updateSession(phone, { hardCapNotifiedAt: new Date() });
-      return;
-    }
-
-    if (fresh.reportStatus === "failed" || overdue) {
-      // Throttle: don't let a burst of customer messages ("ߑ", "Hlo", "??")
-      // each trigger their own full regeneration attempt seconds apart.
-      // See REPORT_FORCE_RETRY_COOLDOWN_MS above. This does NOT block the
-      // customer from getting a reply — they still get a status message —
-      // it only skips starting a brand new (costly) generation attempt if
-      // one was already kicked off very recently.
-      const sinceLastAttemptMs = fresh.lastAttemptAt
-        ? Date.now() - new Date(fresh.lastAttemptAt).getTime()
-        : Infinity;
-      if (sinceLastAttemptMs < REPORT_FORCE_RETRY_COOLDOWN_MS) {
-        log(
-          "awaiting_report force-retry SKIPPED for",
-          phone,
-          "-> a generation attempt already started",
-          Math.round(sinceLastAttemptMs / 1000),
-          "seconds ago (cooldown", REPORT_FORCE_RETRY_COOLDOWN_MS / 1000, "s) — replying with status only, not starting another."
-        );
-        await sendText(phone, withSupport(t(session.language, "reportStillPending")));
-        return;
-      }
-
-      // Either formally exhausted, or simply taking too long regardless of
-      // internal attempt bookkeeping — force an immediate fresh attempt
-      // right now instead of waiting on the normal backoff/poller schedule.
-      log(
-        "awaiting_report force-retry for",
-        phone,
-        "-> reason:",
-        fresh.reportStatus === "failed" ? "status=failed" : `overdue by ${Math.round(paymentAgeMs / 60000)} min`
-      );
-      await sendText(phone, t(session.language, "reportRetrying"));
-      const resetSession = await db.updateSession(phone, { reportAttempts: 0, reportStatus: "pending" });
-      const result = await generateAndDeliverReport(resetSession);
-      if (!result.success) {
-        await sendText(
-          phone,
-          withSupport(t(session.language, result.exhausted ? "reportExhausted" : "reportStillPending"))
-        );
-      } else {
-        await db.updateSession(phone, { awaitingReportInquiryCount: 0 });
-      }
-      return;
-    }
-
-    // Genuinely still within the normal wait window — no need to force a
-    // fresh (costly) generation attempt on every casual message, just
-    // reassure them it's in progress.
-    await sendText(phone, withSupport(t(session.language, "reportStillPending")));
-    return;
-  }
-
-  if (session.stage === "report_sent") {
-    // A plain "Ok"/"K"/"ߑ" after the report or a reply doesn't need any
-    // response — skip entirely before spending anything on the
-    // wantsAnotherPersonReading() classifier call or the full follow-up
-    // GPT call below, same treatment as an emoji reaction.
-    if (isTrivialAcknowledgment(text) && !session.pendingSecondPerson) {
-      log("Trivial acknowledgment received in report_sent for", phone, "-> no reply needed.");
-      return;
-    }
-
-    // Two-step flow for "reading for someone else in this chat":
-    //   Step 1 — classifier says this message wants a new order. We ask for
-    //   the next person's name/DOB/gender, but do NOT touch the current
-    //   (paid) session yet — nothing is wiped at this point.
-    //   Step 2 — this specific reply, sent to the sole hidden question above.
-    //   We treat it as a genuine new order and reset the session ONLY if it
-    //   actually contains person details (name/dob/gender). If it doesn't
-    //   (e.g. the customer asks something else, or says "never mind"), we
-    //   drop back to the normal follow-up flow instead of forcing a reset.
-    //
-    // This still always asks for the next person's details when someone
-    // wants a second reading (same as before) — it just moves the
-    // destructive part (wiping the paid session) to only happen once we
-    // have confirmed real details in hand, instead of firing off a single
-    // classifier call against an arbitrary message. Fixes a real incident
-    // where the old single-step version misfired on a customer answering
-    // an unrelated follow-up question, wiped his paid session, and made
-    // him think it was a scam.
-    if (session.pendingSecondPerson) {
-      const nextPerson = await extractFields(text, {}); // fresh — do not inherit the previous person's details
-      if (nextPerson.name || nextPerson.dob || nextPerson.gender) {
-        log(
-          "Customer at",
-          phone,
-          "provided next-person details — restarting collection flow in the same chat (order #",
-          (session.orderCount || 1) + 1,
-          ")"
-        );
-        const reset = await db.updateSession(phone, {
-          stage: "collecting",
-          name: nextPerson.name || null,
-          dob: nextPerson.dob || null,
-          gender: nextPerson.gender || null,
-          relation: nextPerson.relation || null,
-          palmMediaId: null,
-          paymentReceived: false,
-          reportText: null,
-          reportStatus: "none",
-          reportDueAt: null,
-          reportAttempts: 0,
-          reportError: null,
-          orderCount: (session.orderCount || 1) + 1,
-          pendingSecondPerson: false,
-        });
-        // Reuses the normal collecting-stage logic — it will ask for
-        // whatever's still missing, or move straight to asking for a
-        // photo if this one reply already had everything.
-        await progressCollectingStage(phone, reset);
-        return;
-      }
-      // Didn't look like person details — clear the pending flag and fall
-      // through to the normal follow-up Q&A below instead of resetting.
-      await db.updateSession(phone, { pendingSecondPerson: false });
-      log(
-        "pendingSecondPerson reply for",
-        phone,
-        "didn't contain any name/dob/gender — treating as a normal follow-up instead of resetting. Message was:",
-        text
-      );
-    } else {
-      const previousBotMessage = await db.getLastOutboundMessage(phone);
-      const wantsAnother = await wantsAnotherPersonReading(text, previousBotMessage);
-      if (wantsAnother) {
-        // Check whether THIS message already contains extractable details
-        // before asking for them — otherwise a message like "Sabin mathew
-        // 25/02/1990 Male" (which itself satisfies wantsAnotherPersonReading
-        // as clearly starting a new order) gets asked to repeat the exact
-        // same information it just gave. Real incident: Jancy mol L,
-        // 917306344205, 8/7 — had to send her friend's details twice
-        // because the first submission triggered this same "please send
-        // details" prompt instead of being recognized as already complete.
-        const immediateDetails = await extractFields(text, {});
-        if (immediateDetails.name || immediateDetails.dob || immediateDetails.gender) {
-          log(
-            "Customer at",
-            phone,
-            "started a new-person order AND already included their details in the same message — skipping the redundant prompt, restarting collection flow directly (order #",
-            (session.orderCount || 1) + 1,
-            ")"
-          );
-          const reset = await db.updateSession(phone, {
-            stage: "collecting",
-            name: immediateDetails.name || null,
-            dob: immediateDetails.dob || null,
-            gender: immediateDetails.gender || null,
-            relation: immediateDetails.relation || null,
-            palmMediaId: null,
-            paymentReceived: false,
-            reportText: null,
-            reportStatus: "none",
-            reportDueAt: null,
-            reportAttempts: 0,
-            reportError: null,
-            orderCount: (session.orderCount || 1) + 1,
-            pendingSecondPerson: false,
-          });
-          await progressCollectingStage(phone, reset);
-          return;
-        }
-
-        log(
-          "Customer at",
-          phone,
-          "indicated they want a reading for another person — asking for that person's details before touching anything."
-        );
-        await db.updateSession(phone, { pendingSecondPerson: true });
-        await sendText(phone, t(session.language, "askSecondPersonDetails"));
-        return;
-      }
-    }
-
-    // Free-follow-up limit: after a report is delivered, customers can ask
-    // reasonable follow-up questions for free — but without a ceiling this
-    // is unbounded. Real incident: Ajitha KA, 919961850471 — 1,282
-    // messages over a full week on a single ₹99 payment, hundreds of real
-    // GPT calls answering deeply personal questions for zero additional
-    // revenue. FOLLOW_UP_FREE_LIMIT is generous (30 real questions) so
-    // normal engagement is unaffected — this only kicks in for genuine
-    // outliers. Trivial acks and the second-person-order flow above don't
-    // count toward this and are handled before reaching here.
-    if (session.awaitingFollowUpPayment) {
-      // Previously only sent the text reminder here — the QR image itself
-      // was only ever sent once, at the moment the gate first triggered.
-      // Any message after that (e.g. the customer asking "how do I pay
-      // again?") got text with no visual QR to actually act on. Now
-      // resends the QR every time, same as the original gate trigger.
-      log("Customer at", phone, "is gated on follow-up payment — resending QR + reminder instead of answering. Message was:", text);
-      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
-      if (qrSent) {
-        await sendText(phone, t(session.language, "followUpLimitReached"));
-      } else {
-        await sendText(phone, t(session.language, "qrFailure"));
-      }
-      return;
-    }
-
-    const followUpCount = (session.followUpMessageCount || 0) + 1;
-    if (followUpCount > FOLLOW_UP_FREE_LIMIT) {
-      log(
-        "Customer at",
-        phone,
-        "reached the free follow-up limit (",
-        FOLLOW_UP_FREE_LIMIT,
-        ") — gating further Q&A behind a new ₹99 payment instead of calling GPT."
-      );
-      await db.updateSession(phone, { awaitingFollowUpPayment: true, followUpMessageCount: followUpCount });
-      const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
-      if (qrSent) {
-        await sendText(phone, t(session.language, "followUpLimitReached"));
-      } else {
-        await sendText(phone, t(session.language, "qrFailure"));
-      }
-      return;
-    }
-    await db.updateSession(phone, { followUpMessageCount: followUpCount });
-
-    const todayStr = new Date().toISOString().slice(0, 10); // e.g. "2026-07-03"
-    const currentYear = new Date().getFullYear();
-    const isEnglish = session.language === "en";
-    const langName = t(session.language, "languageName");
-
-    const hedgingLine = isEnglish
-      ? "Speak with the same quiet, authoritative confidence as the original reading (avoid hedging words like 'I feel', 'maybe', 'perhaps', 'possibly'). Use natural, correct English word choices throughout."
-      : "Speak with the same quiet, authoritative confidence as the original reading (avoid hedging words like എനിക്ക് തോന്നുന്നു, ഒരുപക്ഷേ, ആയിരിക്കാം, ചിലപ്പോൾ). Use correct, natural Malayalam word choices throughout.";
-    const timeframeLine = isEnglish
-      ? `If asked generally "when," prefer a relative timeframe (the next few months, next year, within the next 1-2 years) over naming a specific year unless you are confident it is genuinely in the future.`
-      : `If asked generally "when," prefer a relative timeframe (അടുത്ത കുറച്ച് മാസങ്ങൾ, അടുത്ത വർഷം, അടുത്ത 1-2 വർഷത്തിനുള്ളിൽ) over naming a specific year unless you are confident it is genuinely in the future.`;
-    const languageLockLine = isEnglish
-      ? "Always reply in English, matching the customer's current language — even if the earlier reading below happens to be in Malayalam, read and interpret it, but write your reply in English."
-      : "Always reply in Malayalam, even if the customer writes in English or explicitly asks for an English reply/summary — politely continue in Malayalam rather than switching languages. (If the earlier reading below happens to be in English because the customer's language was English at the time it was generated, still answer in Malayalam now, since that is their current language.)";
-    const distressLine = isEnglish
-      ? `If the customer discloses something suggesting real personal distress or a genuine life crisis — an active divorce or separation, a death or serious illness in the family, mentions of self-harm, domestic conflict, addiction, or similar — shift out of the confident predictive style for that topic. Do not keep asserting definitive romantic/marriage/family outcomes ("marriage will happen", specific dates, etc.) as if nothing has changed; acknowledge what they've shared in a brief, human way, keep any palm-based comments general and gentle rather than definitive, and avoid speculating about a specific new partner or relationship they mention in that context. This isn't about refusing to continue the reading — just about not compounding a real, difficult moment with confident predictions that could reinforce false hope or distress. Continue answering their other questions (career, health, family in general) normally.`
-      : `If the customer discloses something suggesting real personal distress or a genuine life crisis — an active divorce or separation, a death or serious illness in the family, mentions of self-harm, domestic conflict, addiction, or similar — shift out of the confident predictive style for that topic. Do not keep asserting definitive romantic/marriage/family outcomes ("വിവാഹം നടക്കും", specific dates, etc.) as if nothing has changed; acknowledge what they've shared in a brief, human way, keep any palm-based comments general and gentle rather than definitive, and avoid speculating about a specific new partner or relationship they mention in that context. This isn't about refusing to continue the reading — just about not compounding a real, difficult moment with confident predictions that could reinforce false hope or distress. Continue answering their other questions (career, health, family in general) normally.`;
-
-    // Proactive third-party-reading upsell: the model already correctly
-    // tells customers it can't fully read someone else's character/future
-    // from the customer's own palm — this happens routinely across many
-    // chats every day (a spouse, a friend, a mother-in-law, a potential
-    // partner). Previously this was a dead end — a customer would be told
-    // "I'd need their palm" and the conversation just moved on. Now the
-    // model naturally offers to start that reading right in the same
-    // chat, reusing the EXISTING second-person order flow (see
-    // wantsAnotherPersonReading / pendingSecondPerson below) — no new
-    // product or pricing decision needed, since a second reading is
-    // already ₹99, same as the first.
-    const upsellLine = isEnglish
-      ? `If answering the customer's question properly would require looking at a DIFFERENT person's own palm (their partner's, a family member's, a friend's — anyone other than the customer) — after giving the best general answer you honestly can from the customer's own palm — naturally mention that a proper reading for that person, right here in this same chat, would give a much more accurate answer, and ask if they'd like to start one. Keep this brief and natural, not salesy — one sentence is enough. Only offer this when it's genuinely relevant (their question was actually about someone else's traits/future), not on every message, and never more than once per conversation unless they bring it up again themselves.`
-      : `ഉപഭോക്താവിന്റെ ചോദ്യത്തിന് ശരിയായി ഉത്തരം നൽകാൻ മറ്റൊരു വ്യക്തിയുടെ (പങ്കാളി, കുടുംബാംഗം, സുഹൃത്ത് — ഉപഭോക്താവ് അല്ലാത്ത ആരെങ്കിലും) സ്വന്തം കൈരേഖ വേണമെങ്കിൽ — ഉപഭോക്താവിന്റെ സ്വന്തം കൈരേഖയിൽ നിന്ന് കഴിയുന്ന ഏറ്റവും നല്ല പൊതു ഉത്തരം നൽകിയ ശേഷം — ആ വ്യക്തിക്കുവേണ്ടി ഇതേ ചാറ്റിൽ തന്നെ ഒരു ശരിയായ റീഡിംഗ് ചെയ്യുന്നത് കൂടുതൽ കൃത്യമായ ഉത്തരം നൽകുമെന്ന് സ്വാഭാവികമായി പറയുകയും, അത് തുടങ്ങണോ എന്ന് ചോദിക്കുകയും ചെയ്യുക. ഇത് ചെറുതും സ്വാഭാവികവുമായി വയ്ക്കുക, sales പോലെ തോന്നരുത് — ഒരു വാക്യം മതി. ഇത് യഥാർത്ഥത്തിൽ പ്രസക്തമാകുമ്പോൾ മാത്രം (ചോദ്യം ശരിക്കും മറ്റൊരാളുടെ സ്വഭാവം/ഭാവിയെക്കുറിച്ചാണെങ്കിൽ) വാഗ്ദാനം ചെയ്യുക, എല്ലാ മെസേജിലും അല്ല, ഒരു സംഭാഷണത്തിൽ ഒരിക്കൽ മാത്രം (അവർ വീണ്ടും അത് പരാമർശിക്കുന്നില്ലെങ്കിൽ).`;
-
-    const followUpMessages = [
-      {
-        role: "system",
-        content: `You are the same experienced traditional palmist continuing a conversation with a customer, after having given them a palm reading earlier. Respond naturally and briefly in ${langName}.
-${t(session.language, "addressGuidance")} ${hedgingLine}
-
-Today's actual date is ${todayStr} (year ${currentYear}). If the customer asks about future timing (which year, when, how soon, etc.), any year or timeframe you mention MUST be ${currentYear} or later — never state a year that has already passed as if it were a future prediction. ${timeframeLine}
-
-Customers write casually, and Malayalam-speaking customers sometimes type in Manglish (Malayalam typed in English letters). Read past literal wording to their actual intent before answering:
-- If they're asking a question about THEIR OWN earlier reading, answer using the reading context below.
-- If they're asking about price for an additional or repeat reading, the fee is ₹99 per person, same as before.
-- If it's a greeting, thanks, or general conversation unrelated to the reading, respond warmly and briefly in the same authoritative but personal voice, without forcing it back to palm topics.
-
-${languageLockLine}
-
-Never predict or comment on the sex/gender of an unborn baby (a pregnancy, an expected child, "will it be a boy or girl"), even if asked directly. If children come up, speak only in general terms about family life or the number/timing of children in the future — never the sex of a specific unborn child.
-
-${distressLine}
-
-${upsellLine}
-${
-  (session.orderCount || 1) > 1
-    ? `\nIMPORTANT: this customer has ordered more than one reading in this chat (this is order #${
-        session.orderCount
-      }, most recently for ${
-        session.name || "the person below"
-      }). The reading below belongs to that most recent order specifically. If the customer's message is at all ambiguous about WHICH person's reading you're discussing (e.g. "is this about me or about my wife?"), explicitly clarify by naming whose reading this is before answering — do not answer generically as if there's only one reading in this chat.`
-    : ""
+  return result.rows.map(rowToSession);
 }
 
-Earlier reading:\n${session.reportText || ""}`,
-      },
-      { role: "user", content: text },
-    ];
-
-    // gpt-4o-mini was producing instruction slips (still using banned
-    // address terms) and outright wrong word choices in this specific
-    // conversational path. gpt-5.5 is the current available flagship;
-    // falls back to gpt-4o-mini only if gpt-5.5 is inaccessible on this
-    // account for any reason. Main report generation (gpt-4.1/gpt-4o) is
-    // untouched by this change.
-    let followUp = await openaiChat(followUpMessages, {
-      model: "gpt-5.5",
-      temperature: 0.7,
-      max_tokens: 800,
-    });
-
-    if (!followUp) {
-      log("Follow-up Q&A: gpt-5.5 call failed or returned nothing — falling back to gpt-4o-mini.");
-      followUp = await openaiChat(followUpMessages, {
-        model: "gpt-4o-mini",
-        temperature: 0.7,
-        max_tokens: 500,
-      });
-    }
-
-    if (followUp) {
-      await sendText(phone, followUp);
-    } else {
-      await sendText(phone, t(session.language, "followUpFailed"));
-    }
-    return;
-  }
-}
-
-// Validates a palm photo and either sends the QR (moving to
-// awaiting_payment) or asks for a proper resend (staying in awaiting_photo).
-// Shared between the normal awaiting_photo flow and the case where a photo
-// arrives BEFORE name/DOB/gender are known (see handleImageMessage and
-// progressCollectingStage) — previously that second case silently
-// discarded the photo entirely.
-async function processReceivedPalmPhoto(phone, mediaId, session) {
-  const imageDataUrl = await getMediaBase64(mediaId);
-  const validation = await isPalmPhoto(imageDataUrl);
-  log("Palm photo validation result for", phone, "->", JSON.stringify(validation));
-
-  if (!validation.valid) {
-    await db.updateSession(phone, { stage: "awaiting_photo", palmMediaId: null });
-    await sendText(phone, t(session.language, "notAPalm", session.gender));
-    return;
-  }
-
-  await db.updateSession(phone, { palmMediaId: mediaId, stage: "awaiting_photo" });
-
-  const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
-  if (!qrSent) {
-    log("QR image failed to send to", phone, "— NOT sending payment message. Staying in awaiting_photo for retry.");
-    await sendText(phone, t(session.language, "qrFailure"));
-    return;
-  }
-
-  await db.updateSession(phone, { stage: "awaiting_payment" });
-  await sendText(phone, t(session.language, "photoReceivedPayment"));
-}
-
-// Single, mandatory-validation gateway for ANY code path that wants to set
-// palmMediaId to a newly-received photo — whether it's the very first
-// photo, an extra angle, or a "corrected" resend. Centralized deliberately:
-// three separate call sites used to each inline their own validate-then-
-// overwrite logic, which is exactly how a real bug slipped through — one
-// of those three paths (the new "extra angle shortly after payment"
-// branch) originally overwrote palmMediaId with NO validation at all,
-// silently replacing a customer's real palm photo with what turned out to
-// be a payment screenshot. The report-generation model then correctly
-// reported it had been given a payment receipt — it wasn't refusing, it
-// was accurately describing bad input data. Real incident: Honey Samji,
-// 917736266839, 29/7. Routing every future "accept this as the palm
-// photo" decision through ONE function makes it structurally harder for a
-// future change to reintroduce the same class of bug.
-async function tryAcceptPalmPhoto(phone, mediaId) {
-  const imageDataUrl = await getMediaBase64(mediaId);
-  const validation = await isPalmPhoto(imageDataUrl);
-  if (!validation.valid) {
-    log("tryAcceptPalmPhoto: REJECTED for", phone, "-> reason:", validation.reason);
-    return { accepted: false, reason: validation.reason };
-  }
-  await db.updateSession(phone, { palmMediaId: mediaId });
-  log("tryAcceptPalmPhoto: accepted for", phone);
-  return { accepted: true, reason: validation.reason };
-}
-
-async function handleImageMessage(phone, mediaId, session) {
-  log("Current session state for", phone, "->", JSON.stringify({ stage: session.stage }));
-
-  if (session.stage === "awaiting_photo") {
-    if (session.palmMediaId) {
-      // A valid photo was already accepted here (QR already sent for it) —
-      // a second photo arriving in this same stage is USUALLY just another
-      // angle of the same palm — validated via tryAcceptPalmPhoto before
-      // ever overwriting the existing one.
-      const { accepted, reason } = await tryAcceptPalmPhoto(phone, mediaId);
-      if (!accepted) {
-        log("Additional photo received while awaiting_photo for", phone, "failed validation (", reason, ") — existing photo kept.");
-        await sendText(phone, t(session.language, "extraPhotoRejectedAwaitingPhoto"));
-        return;
-      }
-      log("Additional palm photo received while awaiting_photo (QR already sent) for", phone, "— validated, treating as another angle, not re-sending QR.");
-      await sendText(phone, t(session.language, "extraPhotoAcceptedAwaitingPhoto"));
-      return;
-    }
-    await processReceivedPalmPhoto(phone, mediaId, session);
-    return;
-  }
-
-  if (session.stage === "awaiting_payment") {
-    log("Payment screenshot received from", phone);
-    await confirmPaymentAndScheduleReport(phone, session, "screenshot image");
-    return;
-  }
-
-  if (session.stage === "awaiting_report") {
-    // A photo sent very soon after payment is USUALLY just another angle
-    // of the same palm sent in the same burst — validated via
-    // tryAcceptPalmPhoto before ever overwriting palmMediaId. This is the
-    // exact code path that caused Honey Samji's (917736266839, 29/7) real
-    // palm photo to be silently replaced by a payment receipt screenshot.
-    const RECENT_PAYMENT_PHOTO_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
-    const paymentAgeMs = session.paymentConfirmedAt
-      ? Date.now() - new Date(session.paymentConfirmedAt).getTime()
-      : Infinity;
-
-    if (paymentAgeMs < RECENT_PAYMENT_PHOTO_WINDOW_MS) {
-      const { accepted, reason } = await tryAcceptPalmPhoto(phone, mediaId);
-      if (!accepted) {
-        log("Additional photo received shortly after payment for", phone, "failed validation (", reason, ") — existing photo kept, report schedule untouched.");
-        await sendText(phone, t(session.language, "extraPhotoRejectedAfterPayment"));
-        return;
-      }
-      log("Additional palm photo received shortly after payment (", Math.round(paymentAgeMs / 1000), "s ago) for", phone, "— validated, treating as another angle, not resetting report schedule.");
-      await sendText(phone, t(session.language, "extraPhotoAcceptedAfterPayment"));
-      return;
-    }
-
-    // CRITICAL: this path previously had NO cap at all — a customer could
-    // send corrected photos indefinitely, each one silently starting a
-    // brand new full 5-attempt generation cycle, completely bypassing
-    // REPORT_FORCE_RETRY_HARD_CAP_MS (which only guarded the text-message
-    // and poller-sweep retry paths). This was very likely a major source
-    // of renewed token usage on 29/7 — customers doing exactly what we
-    // told them to do (resend a corrected photo) kept getting full fresh
-    // retry cycles indefinitely, hours or even a full day after payment.
-    if (paymentAgeMs > REPORT_FORCE_RETRY_HARD_CAP_MS) {
-      // Still worth validating the photo — useful signal for manual
-      // follow-up (do they now have a genuine palm photo on file?) — but
-      // do NOT auto-start another generation cycle this long after payment.
-      const { accepted, reason } = await tryAcceptPalmPhoto(phone, mediaId);
-      log(
-        "Photo received well past hard cap (",
-        Math.round(paymentAgeMs / 60000),
-        "min since payment) for",
-        phone,
-        "-> validation:",
-        accepted ? "valid palm photo" : `rejected (${reason})`,
-        "— NOT auto-starting a new retry cycle. Needs manual /admin/force-report if you want to try again."
-      );
-      await sendText(phone, t(session.language, "reportExhausted"));
-      return;
-    }
-
-    // Previously: any photo sent here fell through to a generic "photo
-    // received, thanks" with NO session update at all — so if the report
-    // failed because the original photo wasn't a valid palm, a corrected
-    // photo sent afterward was silently ignored forever, and every retry
-    // kept re-using the original bad photo. Now: validate via
-    // tryAcceptPalmPhoto, then treat this as a genuine replacement and
-    // actually reschedule using the new photo.
-    const { accepted, reason } = await tryAcceptPalmPhoto(phone, mediaId);
-    if (!accepted) {
-      log("Corrected photo received while awaiting_report for", phone, "failed validation (", reason, ") — existing photo kept, retry cycle not reset.");
-      await sendText(phone, t(session.language, "notAPalm", session.gender));
-      return;
-    }
-
-    log("New photo received while awaiting_report for", phone, "— validated, treating as a corrected palm photo submission.");
-    const retryDueAt = new Date(Date.now() + 2 * 60 * 1000);
-    await db.updateSession(phone, {
-      reportStatus: "pending",
-      reportAttempts: 0,
-      reportDueAt: retryDueAt,
-      reportError: null,
-    });
-    await sendText(phone, t(session.language, "photoReplaced"));
-    return;
-  }
-
-  if (session.stage === "report_sent") {
-    // A photo arriving while gated on the free-follow-up limit is treated
-    // as the payment screenshot for continuing — accept it unconditionally
-    // (same trust model as the original payment flow: no verification,
-    // just proceed) and reset the counter so Q&A resumes normally.
-    if (session.awaitingFollowUpPayment) {
-      log("Follow-up payment screenshot received from", phone, "-> resetting follow-up limit and resuming Q&A.");
-      await db.updateSession(phone, { awaitingFollowUpPayment: false, followUpMessageCount: 0 });
-      await sendText(phone, t(session.language, "followUpPaymentConfirmed"));
-      return;
-    }
-
-    // Safety net for the same failure mode as bug #23/#24, but caught late:
-    // if the stored report itself still looks like a refusal or degenerate
-    // repetition — whether from before a phrasing fix was deployed, or a
-    // wording isLikelyRefusal() doesn't yet know about — treat an incoming
-    // photo as the customer trying to fix it, and auto-retry, instead of
-    // silently swallowing it with "ഫോട്ടോ ലഭിച്ചു, നന്ദി." and leaving them
-    // stuck with a paid-but-broken session. Real incident this fixes:
-    // Sudheer, 919744084652, 24/7 — sent 6 corrected photos after a bad
-    // refusal was accepted as his report, none of which did anything;
-    // refunded manually.
-    //
-    // A genuinely finished, valid report must NOT be disturbed by a stray
-    // photo (e.g. someone sending a thank-you selfie), so this only fires
-    // when the stored report_text itself fails the same checks used during
-    // generation.
-    if (isLikelyRefusal(session.reportText) || isLikelyDegenerateRepetition(session.reportText)) {
-      log(
-        "Photo received in report_sent for",
-        phone,
-        "but stored report looks like a refusal/garbage — treating as a correction and retrying instead of the generic fallback."
-      );
-      const retryDueAt = new Date(Date.now() + 2 * 60 * 1000);
-      await db.updateSession(phone, {
-        palmMediaId: mediaId,
-        stage: "awaiting_report",
-        reportStatus: "pending",
-        reportAttempts: 0,
-        reportDueAt: retryDueAt,
-        reportError: null,
-        awaitingReportInquiryCount: 0,
-      });
-      await sendText(phone, t(session.language, "reportCorrectionDetected"));
-      return;
-    }
-    // else: fall through to the generic ack below — a genuinely valid,
-    // already-sent report shouldn't be disturbed by a stray photo.
-  }
-
-  if (session.stage === "new" || session.stage === "awaiting_language") {
-    // A photo carries no language signal, and the picker itself needs to be
-    // readable regardless of what language the customer eventually picks —
-    // so stash the photo and ask for language first, exactly as if their
-    // first message had been text instead of a photo.
-    log("Photo received before language was chosen (stage", session.stage, ") for", phone, "— stashing mediaId, asking for language first.");
-    await db.updateSession(phone, { stage: "awaiting_language", palmMediaId: mediaId });
-    await sendText(phone, LANGUAGE_PICKER_MESSAGE);
-    return;
-  }
-
-  if (session.stage === "collecting") {
-    // Previously: a photo sent before name/DOB/gender were known was
-    // completely discarded — not saved anywhere — and the customer would
-    // later be asked for "a photo" again during awaiting_photo as if it
-    // had never been sent. Now: stash it, and acknowledge that it's saved.
-    log("Photo received early (stage", session.stage, ") for", phone, "— stashing mediaId for later, not discarding.");
-
-    await db.updateSession(phone, { palmMediaId: mediaId });
-    await sendText(phone, t(session.language, "photoStashedAskDetails"));
-    return;
-  }
-
-  await sendText(phone, t(session.language, "genericPhotoAck"));
-}
-
-
-// ---------------------------------------------------------------------------
-// Polling worker — replaces setTimeout for report delivery. Runs every 60s,
-// finds sessions whose report is due, generates + sends. Survives restarts
-// because it's driven entirely by DB state (report_status + report_due_at).
-// ---------------------------------------------------------------------------
-
-let pollInProgress = false;
-
-async function pollDueReports() {
-  if (pollInProgress) return;
-  pollInProgress = true;
-  try {
-    const dueSessions = await db.findDueReports();
-    if (dueSessions.length) {
-      log(`Poller: found ${dueSessions.length} due report(s)`);
-    }
-    const processedPhones = new Set();
-    for (const session of dueSessions) {
-      processedPhones.add(session.phone);
-      const result = await generateAndDeliverReport(session);
-      if (!result.success) {
-        if (result.attemptNumber === 1) {
-          await sendText(session.phone, t(session.language, "reportPreparing"));
-        }
-        if (result.exhausted) {
-          await sendText(session.phone, t(session.language, "reportExhausted"));
-        }
-      }
-    }
-
-    // Safety sweep, independent of report_attempts/report_due_at
-    // bookkeeping: force an attempt for any session that's been waiting
-    // past REPORT_FORCE_RETRY_AFTER_MS since payment, no matter what
-    // report_status/report_due_at currently claim. This exists specifically
-    // to catch the case where the normal attempt-counter logic itself is
-    // broken (e.g. an increment silently fails to persist and the session
-    // re-tries "attempt 1" forever without ever reaching report_status=
-    // 'failed'). Real incident this defends against: Aswathy, 918921390826,
-    // 24-25/7 — stuck over an hour with no exhausted message ever sent.
-    const overdueSessions = await db.findOverdueAwaitingReports(
-      REPORT_FORCE_RETRY_AFTER_MS,
-      SWEEP_AUTO_RETRY_WINDOW_MS,
-      SWEEP_RETRY_PACING_MS
-    );
-    for (const session of overdueSessions) {
-      if (processedPhones.has(session.phone)) continue; // already handled above this tick
-      log(
-        "Poller safety sweep: forcing retry for",
-        session.phone,
-        "— overdue past the",
-        REPORT_FORCE_RETRY_AFTER_MS / 60000,
-        "minute wall-clock threshold regardless of internal attempt bookkeeping."
-      );
-      const resetSession = await db.updateSession(session.phone, { reportAttempts: 0, reportStatus: "pending" });
-      const result = await generateAndDeliverReport(resetSession);
-      if (!result.success && result.exhausted) {
-        await sendText(session.phone, t(session.language, "reportExhausted"));
-      }
-    }
-
-    // One-time re-engagement nudge for customers who stalled in the two
-    // earliest, highest-drop-off funnel stages (awaiting_language,
-    // collecting) and went quiet — these stages previously had NO
-    // follow-up at all. Real finding: 28/8, 49% of active chats stalled
-    // here combined, with confirmed evidence (918637429436) that
-    // customers do not return on their own. Fires at most once ever per
-    // session (see funnel_nudge_sent_at / findAbandonedFunnelSessions).
-    const abandonedSessions = await db.findAbandonedFunnelSessions(FUNNEL_NUDGE_AFTER_MS);
-    for (const session of abandonedSessions) {
-      const nudgeText =
-        session.stage === "awaiting_language"
-          ? LANGUAGE_STAGE_FUNNEL_NUDGE
-          : t(session.language, "funnelNudge");
-      log(
-        "Funnel nudge: sending one-time re-engagement message to",
-        session.phone,
-        "-> stalled in stage:",
-        session.stage
-      );
-      await sendText(session.phone, nudgeText);
-      await db.updateSession(session.phone, { funnelNudgeSentAt: new Date() });
-    }
-  } catch (err) {
-    log("Poller crashed (caught):", err.message);
-  } finally {
-    pollInProgress = false;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Webhook routes
-// ---------------------------------------------------------------------------
-
-app.get("/", (req, res) => {
-  res.status(200).send("Palmistry WhatsApp bot is running");
-});
-
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    log("Webhook verified");
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
-});
-
-// Admin/testing endpoint — resets a phone number's session by visiting a
-// URL, no need to send a WhatsApp message from that number. Protected by
-// the same secret as the hidden in-chat reset command (see RESET_COMMAND).
-// Usage: GET /admin/reset-session?phone=917736236010&key=resetmybot123
-app.get("/admin/reset-session", async (req, res) => {
-  const { phone, key } = req.query;
-
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-  if (!phone) {
-    return res.status(400).send('Missing ?phone= (e.g. ?phone=917736236010&key=...)');
-  }
-
-  try {
-    await db.updateSession(phone, {
-      stage: "new",
-      name: null,
-      dob: null,
-      gender: null,
-      palmMediaId: null,
-      paymentReceived: false,
-      reportText: null,
-      reportStatus: "none",
-      reportDueAt: null,
-      reportAttempts: 0,
-      reportError: null,
-      pendingSecondPerson: false,
-    });
-    log("Session RESET for", phone, "via admin HTTP endpoint");
-    res.status(200).send(`Session reset for ${phone}. Send "Hi" from that number on WhatsApp to start fresh.`);
-  } catch (err) {
-    log("Admin reset failed (caught):", err.message);
-    res.status(500).send("Reset failed: " + err.message);
-  }
-});
-
-// Admin: force an immediate generation attempt for one phone right now,
-// bypassing the normal poller schedule, the 90s cooldown, and the 30-min/
-// 3-hour overdue thresholds entirely — this IS the manual override, so
-// those pacing rules (which exist to stop the BOT retrying itself into a
-// runaway loop) don't apply to a deliberate one-off admin action. If it
-// succeeds, the report is saved and sent to the customer immediately. If
-// it fails, the real reason is shown right in the response — no need to
-// dig through chat/logs separately.
-// Usage: GET /admin/force-report?phone=917736266839&key=resetmybot123
-app.get("/admin/force-report", async (req, res) => {
-  const { phone, key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-  if (!phone) {
-    return res.status(400).send("Missing ?phone= (e.g. ?phone=917736266839&key=...)");
-  }
-
-  try {
-    const session = await db.getOrCreateSession(phone);
-    if (!session.palmMediaId) {
-      return res.status(400).send("No palm photo on file for this session — cannot generate a report.");
-    }
-
-    log("Admin force-report triggered for", phone);
-    const resetSession = await db.updateSession(phone, { reportAttempts: 0, reportStatus: "pending" });
-    const result = await generateAndDeliverReport(resetSession);
-
-    if (result.success) {
-      res.status(200).send(`✅ Report generated and sent to ${phone} (attempt ${result.attemptNumber}).`);
-    } else {
-      const fresh = await db.getOrCreateSession(phone);
-      res
-        .status(200)
-        .send(
-          `❌ Attempt failed.\n\nReason: ${fresh.reportError || "unknown"}\n\nExhausted: ${result.exhausted}\n\n` +
-            `You can reload this URL to try again — each reload is a fresh attempt, not subject to the normal cooldown.`
-        );
-    }
-  } catch (err) {
-    log("Admin force-report failed (caught):", err.message);
-    res.status(500).send("Force-report failed: " + err.message);
-  }
-});
-
-// Admin: SAFE diagnostic preview — runs the exact same generation pipeline
-// (same photo, same details, same prompt) as a real attempt, but does NOT
-// touch the session or send anything to the customer. Shows you the raw
-// model output (even if it's a refusal) directly in the browser, which is
-// exactly what was missing all week — every prior diagnosis needed manual
-// Railway log archaeology just to see what the model actually said.
-// Usage: GET /admin/preview-report?phone=917736266839&key=resetmybot123
-app.get("/admin/preview-report", async (req, res) => {
-  const { phone, key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-  if (!phone) {
-    return res.status(400).send("Missing ?phone= (e.g. ?phone=917736266839&key=...)");
-  }
-
-  try {
-    const session = await db.getOrCreateSession(phone);
-    if (!session.palmMediaId) {
-      return res.status(400).send("No palm photo on file for this session — cannot preview.");
-    }
-
-    log("Admin preview-report triggered for", phone, "(read-only — nothing will be saved or sent)");
-    const outcome = await generateReport(session);
-
-    const statusLine = outcome.report
-      ? `✅ SUCCESS — this would have been accepted as a valid report (${outcome.report.trim().split(/\s+/).length} words).`
-      : `❌ FAILED — reason: ${outcome.failureReason || "unknown"}`;
-
-    const displayText = outcome.report || outcome.rawContent || "(no content generated — likely a pure API error with no completion at all; see failure reason above)";
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Preview: ${escapeHtml(phone)}</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;padding:16px;white-space:pre-wrap;">
-<div style="font-size:16px;font-weight:bold;margin-bottom:12px;">${escapeHtml(statusLine)}</div>
-<div style="color:#888;font-size:12px;margin-bottom:16px;">Nothing was saved or sent to the customer — this is read-only.</div>
-<div style="border-top:1px solid #333;padding-top:12px;font-size:14px;line-height:1.6;">${escapeHtml(displayText)}</div>
-</body></html>`);
-  } catch (err) {
-    log("Admin preview-report failed (caught):", err.message);
-    res.status(500).send("Preview failed: " + err.message);
-  }
-});
-
-function escapeHtml(str) {
-  return String(str || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-// Admin chat list — GET /admin/chats?key=resetmybot123
-// Shows every phone number with any message activity, grouped by IST
-// calendar day (most recent day first). Add &date=YYYY-MM-DD to jump
-// straight to one day's chats only, e.g. &date=2026-07-16.
-app.get("/admin/chats", async (req, res) => {
-  const { key, date } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-
-  try {
-    const conversations = await db.listConversations();
-
-    // IST calendar date (YYYY-MM-DD) for a given timestamp — used both for
-    // grouping and for the ?date= filter, so they always agree with each
-    // other regardless of the server's own timezone.
-    const istDateKey = (ts) => {
-      const parts = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Kolkata",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-      }).formatToParts(new Date(ts));
-      const get = (type) => parts.find((p) => p.type === type).value;
-      return `${get("year")}-${get("month")}-${get("day")}`; // e.g. "2026-07-16"
-    };
-
-    const filtered = date
-      ? conversations.filter((c) => istDateKey(c.last_activity) === date)
-      : conversations;
-
-    // Group into { "2026-07-16": [...], "2026-07-15": [...] }, preserving
-    // the existing most-recent-first order from listConversations().
-    const groups = new Map();
-    for (const c of filtered) {
-      const dateKey = istDateKey(c.last_activity);
-      if (!groups.has(dateKey)) groups.set(dateKey, []);
-      groups.get(dateKey).push(c);
-    }
-
-    const rowHtml = (c) => {
-      const preview = escapeHtml((c.last_message || "").slice(0, 80));
-      const name = escapeHtml(c.name || "(no name yet)");
-      const stage = escapeHtml(c.stage || "");
-      const time = new Date(c.last_activity).toLocaleString("en-IN", {
-        timeZone: "Asia/Kolkata",
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: true,
-      });
-      return `<a href="/admin/chats/view?phone=${encodeURIComponent(c.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
-        <div style="padding:12px 16px;border-bottom:1px solid #333;">
-          <div style="display:flex;justify-content:space-between;">
-            <strong>${escapeHtml(c.phone)}</strong>
-            <span style="color:#888;font-size:12px;">${time}</span>
-          </div>
-          <div style="color:#aaa;font-size:14px;">${name} · ${stage} · ${c.message_count} messages</div>
-          <div style="color:#ccc;font-size:14px;margin-top:2px;">${preview}</div>
-        </div>
-      </a>`;
-    };
-
-    const dayHeader = (dateKey, count) => {
-      const label = new Date(dateKey + "T12:00:00+05:30").toLocaleDateString("en-IN", {
-        timeZone: "Asia/Kolkata",
-        weekday: "long",
-        day: "numeric",
-        month: "long",
-        year: "numeric",
-      });
-      return `<div style="position:sticky;top:0;background:#1a1a1a;color:#eee;padding:10px 16px;font-weight:bold;border-bottom:1px solid #333;">
-        <a href="/admin/chats?key=${encodeURIComponent(key)}&date=${dateKey}" style="color:inherit;text-decoration:none;">${label}</a>
-        <span style="color:#888;font-weight:normal;font-size:13px;"> · ${count} chat${count === 1 ? "" : "s"}</span>
-      </div>`;
-    };
-
-    let bodyHtml = "";
-    for (const [dateKey, chats] of groups) {
-      bodyHtml += dayHeader(dateKey, chats.length);
-      bodyHtml += chats.map(rowHtml).join("");
-    }
-
-    const filterBar = date
-      ? `<div style="padding:10px 16px;background:#222;color:#aaa;font-size:13px;">Showing only ${escapeHtml(
-          date
-        )} — <a href="/admin/chats?key=${encodeURIComponent(key)}" style="color:#4fc3f7;">clear filter</a></div>`
-      : `<div style="padding:10px 16px;background:#222;color:#aaa;font-size:13px;">Tip: add &date=YYYY-MM-DD to the URL to jump to one day, e.g. &date=${istDateKey(
-          Date.now()
-        )}</div>`;
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chats</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
-  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Customer Conversations (${filtered.length}${
-      date ? ` of ${conversations.length}` : ""
-    })</div>
-  ${filterBar}
-  ${bodyHtml || '<div style="padding:16px;color:#888;">No conversations logged yet.</div>'}
-</body></html>`);
-  } catch (err) {
-    log("Admin chat list failed (caught):", err.message);
-    res.status(500).send("Failed to load conversations: " + err.message);
-  }
-});
-
-// Admin funnel stats — GET /admin/funnel-stats?key=resetmybot123
-// GET /admin/funnel-stats?date=2026-09-09&key=resetmybot123
-// Aggregates conversation stage counts by day, so funnel drop-off trends
-// (awaiting_language / collecting vs report_sent) can be tracked over time
-// without manually counting from /admin/chats. Built after repeated manual
-// funnel tallies (7-9/9/2026) showed 48-85% of daily chats stalling before
-// the photo step, with no easy way to see whether fixes were moving that
-// number. Uses the same underlying data and IST date-key logic as
-// /admin/chats, so the two always agree with each other.
-// Admin: manual re-engagement trigger — GET /admin/reengage-stuck?key=resetmybot123
-// Sends a one-time nudge to every stuck (pre-payment) session that's
-// legally reachable RIGHT NOW under WhatsApp's 24-hour customer service
-// window (an inbound message within the last 24 hours) — outside that
-// window a plain session message cannot be sent at all; that requires a
-// pre-approved WhatsApp template message via Meta Business Manager, which
-// is a manual approval process on Meta's side, not something this
-// endpoint can do. Safe to run repeatedly (e.g. throughout an ad-pause
-// period) — REENGAGE_COOLDOWN_MS prevents double-messaging anyone
-// recently reached. Built specifically for reviving the existing chat
-// backlog while ads are paused, distinct from the automatic one-time
-// funnel_nudge (which only covers awaiting_language/collecting after 3
-// hours quiet) — this covers all four pre-payment stages, triggered on
-// demand rather than waiting.
-const REENGAGE_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
-
-app.get("/admin/reengage-stuck", async (req, res) => {
-  const { key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-
-  try {
-    const sessions = await db.findReengageableSessions(REENGAGE_COOLDOWN_MS);
-    const results = { awaiting_language: 0, collecting: 0, awaiting_photo: 0, awaiting_payment: 0, failed: 0 };
-
-    for (const session of sessions) {
-      let message;
-      if (session.stage === "awaiting_language") {
-        message = LANGUAGE_STAGE_FUNNEL_NUDGE;
-      } else if (session.stage === "collecting") {
-        message = t(session.language, "funnelNudge");
-      } else if (session.stage === "awaiting_photo") {
-        message = t(session.language, "reengagePhoto");
-      } else if (session.stage === "awaiting_payment") {
-        message = t(session.language, "reengagePayment");
-      } else {
-        continue;
-      }
-
-      const sent = await sendText(session.phone, message);
-      if (sent) {
-        results[session.stage] = (results[session.stage] || 0) + 1;
-        await db.updateSession(session.phone, { manualReengageSentAt: new Date() });
-      } else {
-        results.failed += 1;
-        log("Reengage-stuck: send FAILED for", session.phone, "-> likely outside the 24h window or a WhatsApp API error.");
-      }
-    }
-
-    const totalSent = results.awaiting_language + results.collecting + results.awaiting_photo + results.awaiting_payment;
-    log("Reengage-stuck run complete:", JSON.stringify(results));
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Re-engage Stuck Chats</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;padding:16px;">
-  <div style="font-size:18px;font-weight:bold;margin-bottom:12px;">✅ Sent ${totalSent} re-engagement message${totalSent === 1 ? "" : "s"}</div>
-  <div style="color:#ccc;font-size:14px;line-height:1.8;">
-    awaiting_language: ${results.awaiting_language}<br>
-    collecting: ${results.collecting}<br>
-    awaiting_photo: ${results.awaiting_photo}<br>
-    awaiting_payment: ${results.awaiting_payment}<br>
-    failed (likely outside 24h window): ${results.failed}
-  </div>
-  <div style="color:#888;font-size:13px;margin-top:16px;">
-    Only reached customers who messaged within the last 24 hours — that's a WhatsApp platform rule, not a bug. For older stuck chats, you'll need an approved WhatsApp template message via Meta Business Manager to re-initiate contact. Safe to run this again later — anyone already reached in the last 12 hours is automatically skipped.
-  </div>
-</body></html>`);
-  } catch (err) {
-    log("Admin reengage-stuck failed (caught):", err.message);
-    res.status(500).send("Failed: " + err.message);
-  }
-});
-
-app.get("/admin/funnel-stats", async (req, res) => {
-  const { key, date } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-
-  try {
-    const conversations = await db.listConversations();
-
-    const istDateKey = (ts) => {
-      const parts = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Kolkata",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-      }).formatToParts(new Date(ts));
-      const get = (type) => parts.find((p) => p.type === type).value;
-      return `${get("year")}-${get("month")}-${get("day")}`;
-    };
-
-    // Group every conversation by the IST date of its last activity, then
-    // tally stage counts within each day.
-    const STAGE_ORDER = ["awaiting_language", "collecting", "awaiting_photo", "awaiting_payment", "awaiting_report", "report_sent"];
-    const dayStats = new Map(); // dateKey -> { total, byStage: {stage: count} }
-
-    for (const c of conversations) {
-      const dateKey = istDateKey(c.last_activity);
-      if (date && dateKey !== date) continue;
-      if (!dayStats.has(dateKey)) {
-        dayStats.set(dateKey, { total: 0, byStage: {} });
-      }
-      const stats = dayStats.get(dateKey);
-      stats.total += 1;
-      const stage = c.stage || "unknown";
-      stats.byStage[stage] = (stats.byStage[stage] || 0) + 1;
-    }
-
-    // Sort days most-recent-first, cap at 30 days when no specific date is
-    // requested so this stays fast and readable.
-    const sortedDays = Array.from(dayStats.keys()).sort((a, b) => (a < b ? 1 : -1));
-    const daysToShow = date ? sortedDays : sortedDays.slice(0, 30);
-
-    const rowHtml = (dateKey) => {
-      const stats = dayStats.get(dateKey);
-      const stuckBeforePhoto =
-        (stats.byStage["awaiting_language"] || 0) + (stats.byStage["collecting"] || 0);
-      const stuckPct = stats.total ? ((stuckBeforePhoto / stats.total) * 100).toFixed(0) : "0";
-      const paidPct = stats.total
-        ? (((stats.byStage["report_sent"] || 0) / stats.total) * 100).toFixed(0)
-        : "0";
-      const stageBreakdown = STAGE_ORDER.map((s) => `${escapeHtml(s)}: ${stats.byStage[s] || 0}`).join(" · ");
-      const barColor = stuckPct >= 60 ? "#e05252" : stuckPct >= 40 ? "#e0a952" : "#52c97a";
-      return `<a href="/admin/chats?key=${encodeURIComponent(key)}&date=${dateKey}" style="text-decoration:none;color:inherit;">
-        <div style="padding:14px 16px;border-bottom:1px solid #333;">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;">
-            <strong style="font-size:15px;">${escapeHtml(dateKey)}</strong>
-            <span style="color:#888;font-size:12px;">${stats.total} chats</span>
-          </div>
-          <div style="margin-top:6px;background:#222;border-radius:4px;height:8px;overflow:hidden;">
-            <div style="background:${barColor};height:100%;width:${stuckPct}%;"></div>
-          </div>
-          <div style="margin-top:6px;color:#ccc;font-size:13px;">
-            <span style="color:${barColor};font-weight:bold;">${stuckPct}% stuck before photo</span>
-            &nbsp;·&nbsp; ${paidPct}% reached report_sent
-          </div>
-          <div style="margin-top:4px;color:#888;font-size:12px;">${stageBreakdown}</div>
-        </div>
-      </a>`;
-    };
-
-    const rows = daysToShow.map(rowHtml).join("");
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Funnel Stats</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
-  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Funnel Stats${date ? ` — ${escapeHtml(date)}` : " (last 30 days)"}</div>
-  <div style="padding:8px 16px;color:#888;font-size:13px;">"Stuck before photo" = awaiting_language + collecting, as a % of that day's active chats. Lower is better. Tap any day to see the full chat list for it.</div>
-  ${rows || '<div style="padding:16px;color:#888;">No data for this range.</div>'}
-</body></html>`);
-  } catch (err) {
-    log("Admin funnel-stats failed (caught):", err.message);
-    res.status(500).send("Failed to load funnel stats: " + err.message);
-  }
-});
-
-// Admin chat viewer — GET /admin/chats/view?phone=917736236010&key=resetmybot123
-// Shows the full message history for one phone number, WhatsApp-bubble style.
-app.get("/admin/chats/view", async (req, res) => {
-  const { phone, key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-  if (!phone) {
-    return res.status(400).send("Missing ?phone=");
-  }
-
-  try {
-    const messages = await db.getMessagesForPhone(phone);
-    const bubbles = messages
-      .map((m) => {
-        const isOut = m.direction === "out";
-        const time = new Date(m.created_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-        const body = escapeHtml(m.body).replace(/\n/g, "<br>");
-        return `<div style="display:flex;justify-content:${isOut ? "flex-end" : "flex-start"};margin:6px 12px;">
-          <div style="max-width:75%;background:${isOut ? "#005c4b" : "#202c33"};color:#eee;padding:8px 12px;border-radius:8px;">
-            <div style="font-size:15px;">${body}</div>
-            <div style="font-size:11px;color:#aaa;margin-top:4px;text-align:right;">${escapeHtml(m.message_type)} · ${time}</div>
-          </div>
-        </div>`;
-      })
-      .join("");
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(phone)}</title></head>
-<body style="background:#0b141a;margin:0;font-family:sans-serif;">
-  <div style="padding:14px 16px;background:#202c33;color:#eee;font-weight:bold;position:sticky;top:0;">
-    <a href="/admin/chats?key=${encodeURIComponent(key)}" style="color:#aaa;text-decoration:none;margin-right:12px;">←</a>
-    ${escapeHtml(phone)} (${messages.length} messages)
-  </div>
-  <div style="padding:12px 0;">${bubbles || '<div style="padding:16px;color:#888;">No messages logged yet.</div>'}</div>
-</body></html>`);
-  } catch (err) {
-    log("Admin chat view failed (caught):", err.message);
-    res.status(500).send("Failed to load chat: " + err.message);
-  }
-});
-
-// Admin: paid-but-not-delivered list — GET /admin/failed-payments?key=resetmybot123
-// Shows every session where report_status='failed' (payment was received,
-// generation retried MAX_REPORT_ATTEMPTS times, and every attempt failed).
-// This is the direct, DB-backed answer to "did anyone pay and not get a
-// report" — no need to scan chat transcripts by hand. Sessions in this
-// state already received REPORT_EXHAUSTED_MESSAGE telling them you'll
-// follow up directly, so this list is exactly who still needs that
-// follow-up.
-app.get("/admin/failed-payments", async (req, res) => {
-  const { key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-
-  try {
-    const failed = await db.findFailedPayments();
-    const rows = failed
-      .map((s) => {
-        const time = new Date(s.updatedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-        const name = escapeHtml(s.name || "(no name)");
-        return `<a href="/admin/chats/view?phone=${encodeURIComponent(s.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
-          <div style="padding:12px 16px;border-bottom:1px solid #333;">
-            <div style="display:flex;justify-content:space-between;">
-              <strong>${escapeHtml(s.phone)}</strong>
-              <span style="color:#888;font-size:12px;">last update: ${time}</span>
-            </div>
-            <div style="color:#aaa;font-size:14px;">${name} · payment_received: ${s.paymentReceived} · ${s.reportAttempts} failed attempt(s)</div>
-            <div style="color:#ccc;font-size:13px;margin-top:2px;">${escapeHtml(s.reportError || "")}</div>
-          </div>
-        </a>`;
-      })
-      .join("");
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Failed Payments</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
-  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Paid but report generation gave up (${failed.length})</div>
-  <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat. Each of these already received a message telling them you'll follow up directly.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None right now — nobody is stuck in a failed state. ߎ</div>'}
-</body></html>`);
-  } catch (err) {
-    log("Admin failed-payments list failed (caught):", err.message);
-    res.status(500).send("Failed to load: " + err.message);
-  }
-});
-
-// Admin: refund requests — GET /admin/refund-requests?key=resetmybot123
-// Lists every session where the customer explicitly asked for a refund
-// (detected by isRefundRequest() on any message, any stage), most-recent
-// first. Real incident this fixes: Sangeetha, 919778743899, 29/7 — asked
-// for a refund twice, got a canned "we'll contact you" reply both times,
-// and nobody noticed for hours because there was no way to see refund
-// asks separately from ordinary "where's my report" inquiries.
-app.get("/admin/refund-requests", async (req, res) => {
-  const { key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-
-  try {
-    const requests = await db.findRefundRequests();
-    const rows = requests
-      .map((s) => {
-        const time = new Date(s.refundRequestedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-        const name = escapeHtml(s.name || "(no name)");
-        return `<a href="/admin/chats/view?phone=${encodeURIComponent(s.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
-          <div style="padding:12px 16px;border-bottom:1px solid #333;">
-            <div style="display:flex;justify-content:space-between;">
-              <strong>${escapeHtml(s.phone)}</strong>
-              <span style="color:#888;font-size:12px;">refund asked: ${time}</span>
-            </div>
-            <div style="color:#aaa;font-size:14px;">${name} · payment_received: ${s.paymentReceived} · stage: ${escapeHtml(s.stage || "")}</div>
-          </div>
-        </a>`;
-      })
-      .join("");
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Refund Requests</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
-  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Customers who explicitly asked for a refund (${requests.length})</div>
-  <div style="padding:8px 16px;color:#888;font-size:13px;">Tap any row to open the full chat and confirm before processing. This list is separate from /admin/failed-payments since not every refund ask comes from a failed report.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None right now. ߎ</div>'}
-</body></html>`);
-  } catch (err) {
-    log("Admin refund-requests list failed (caught):", err.message);
-    res.status(500).send("Failed to load: " + err.message);
-  }
-});
-
-// One-off admin diagnostic — GET /admin/scan-stuck-reports?key=resetmybot123
-// Scans every session marked report_status='sent' and re-runs the same
-// isLikelyRefusal() / isLikelyDegenerateRepetition() checks used during
-// generation against the stored report_text. Any match means a refusal or
-// garbled output slipped through and was delivered to the customer (and
-// the DB marked 'sent') as if it were their real report — the exact
-// failure mode found in Akhil ks's chat (918157017051) and Sudheer's chat
-// (919744084652). These sessions are invisible to /admin/failed-payments
-// since their status isn't 'failed', so this is the only way to find the
-// rest of them. NOTE: since isLikelyRefusal() is now length-first (see
-// MIN_REPORT_WORDS), this scan is also stricter than before and should
-// catch more historical cases than it used to.
-// Read-only. Safe to run repeatedly. Consider removing this route once the
-// backlog has been reviewed and cleared.
-app.get("/admin/scan-stuck-reports", async (req, res) => {
-  const { key } = req.query;
-  if (key !== RESET_COMMAND) {
-    return res.status(403).send("Forbidden — missing or wrong key.");
-  }
-
-  try {
-    const sentSessions = await db.findSentReports();
-    const suspects = sentSessions.filter(
-      (s) => isLikelyRefusal(s.reportText) || isLikelyDegenerateRepetition(s.reportText)
-    );
-
-    const rows = suspects
-      .map((s) => {
-        const time = new Date(s.updatedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-        const name = escapeHtml(s.name || "(no name)");
-        const preview = escapeHtml((s.reportText || "").slice(0, 200));
-        const reason = isLikelyRefusal(s.reportText) ? "refusal pattern / too short" : "degenerate repetition";
-        return `<a href="/admin/chats/view?phone=${encodeURIComponent(s.phone)}&key=${encodeURIComponent(key)}" style="text-decoration:none;color:inherit;">
-          <div style="padding:12px 16px;border-bottom:1px solid #333;">
-            <div style="display:flex;justify-content:space-between;">
-              <strong>${escapeHtml(s.phone)}</strong>
-              <span style="color:#888;font-size:12px;">last update: ${time}</span>
-            </div>
-            <div style="color:#aaa;font-size:14px;">${name} · flagged as: ${reason}</div>
-            <div style="color:#ccc;font-size:13px;margin-top:2px;">${preview}...</div>
-          </div>
-        </a>`;
-      })
-      .join("");
-
-    res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Stuck Reports Scan</title></head>
-<body style="background:#111;color:#eee;font-family:sans-serif;margin:0;">
-  <div style="padding:16px;font-size:20px;font-weight:bold;border-bottom:1px solid #333;">Sessions marked "sent" that look like refusals (${suspects.length} of ${sentSessions.length} scanned)</div>
-  <div style="padding:8px 16px;color:#888;font-size:13px;">These customers paid and their session shows report_status='sent', but the stored report text matches a refusal or degenerate-output pattern (or is simply too short to be a real report) — meaning they likely never got a real reading. Tap any row to open the full chat and confirm before refunding/regenerating. As of the 24/7 fix, sending this customer a new photo while they're in report_sent will now auto-retry on its own — see REPORT_CORRECTION_DETECTED_MESSAGE.</div>
-  ${rows || '<div style="padding:16px;color:#888;">None found — no other sessions match this pattern. ߎ</div>'}
-</body></html>`);
-  } catch (err) {
-    log("Admin scan-stuck-reports failed (caught):", err.message);
-    res.status(500).send("Failed to scan: " + err.message);
-  }
-});
-
-app.post("/webhook", (req, res) => {
-  res.sendStatus(200); // Ack immediately so Meta doesn't retry/timeout
-
-  processWebhookBody(req.body).catch((err) => log("Webhook handler crashed (caught):", err.message));
-});
-
-async function processWebhookBody(body) {
-  log("Webhook received");
-  const entry = body.entry?.[0];
-  const change = entry?.changes?.[0];
-  const value = change?.value;
-
-  const statuses = value?.statuses;
-  if (statuses?.length) {
-    console.log("STATUS WEBHOOK:", JSON.stringify(statuses, null, 2));
-    for (const status of statuses) {
-      log("Status update -> id:", status.id);
-      log("Status update -> status:", status.status);
-      log("Status update -> timestamp:", status.timestamp);
-      log("Status update -> recipient_id:", status.recipient_id);
-      log("Status update -> full payload:", JSON.stringify(status));
-
-      if (status.status === "failed") {
-        log("Status update -> FAILURE ERROR DETAILS:", JSON.stringify(status.errors));
-      }
-
-      const trackedQrId = qrMessageIdsByPhone.get(status.recipient_id);
-      if (trackedQrId && trackedQrId === status.id) {
-        log("*** This status update matches the tracked QR image message id for", status.recipient_id, "-> status:", status.status);
-      }
-    }
-    return;
-  }
-
-  const message = value?.messages?.[0];
-  if (!message) return;
-
-  if (isDuplicate(message.id)) {
-    log("Duplicate message ignored:", message.id);
-    return;
-  }
-  markProcessed(message.id);
-
-  const phone = message.from;
-  const session = await db.getOrCreateSession(phone);
-
-  log("Message type:", message.type, "from", phone);
-
-  if (message.type === "text") {
-    const text = message.text?.body || "";
-    db.logMessage(phone, "in", text, "text");
-    await handleTextMessage(phone, text, session);
-  } else if (message.type === "audio") {
-    // Voice messages/voice notes — transcribed and then handled exactly
-    // like a normal text message (see handleVoiceMessage above). The
-    // transcript itself gets logged inside handleVoiceMessage once known.
-    const mediaId = message.audio?.id;
-    await handleVoiceMessage(phone, mediaId, session);
-  } else if (
-    message.type === "image" ||
-    (message.type === "document" && message.document?.mime_type?.startsWith("image/"))
-  ) {
-    // WhatsApp sometimes sends HD-quality photos as a document instead of
-    // a standard image message — treat both the same way.
-    const mediaId = message.image?.id || message.document?.id;
-    log("Photo received as", message.type, "-> mediaId:", mediaId);
-    db.logMessage(phone, "in", "[Photo]", "photo");
-    await handleImageMessage(phone, mediaId, session);
-  } else if (
-    message.type === "document" &&
-    message.document?.mime_type === "application/pdf" &&
-    session.stage === "awaiting_payment"
-  ) {
-    // Payment receipt sent as a PDF (some UPI apps/banks do this instead of
-    // a screenshot) — accepted unconditionally, same trust model as the
-    // transaction-ID fallback: no parsing/verification, just proceed.
-    log("Payment PDF receipt received from", phone, "-> accepting unconditionally, proceeding to report scheduling.");
-    db.logMessage(phone, "in", "[Payment PDF receipt]", "pdf");
-    await confirmPaymentAndScheduleReport(phone, session, "PDF receipt");
-  } else if (message.type === "unsupported") {
-    // WhatsApp sends a transient "unsupported" placeholder event a few
-    // milliseconds before the real "image"/"document" event for HD media
-    // sends (confirmed repeatedly in logs — same phone, same moment,
-    // always immediately followed by the real photo event). This is not
-    // real customer content, so we log it and say nothing, letting the
-    // follow-up event that arrives right after handle the actual photo —
-    // replying here just confuses the customer mid-send.
-    log("Ignoring transient 'unsupported' placeholder event from", phone, "(real event should follow immediately)");
-  } else if (message.type === "video" || message.type === "sticker") {
-    // Customers occasionally send a video (instead of a photo) or a sticker
-    // (as a reaction/emoji-style message). Neither is something we can act
-    // on, but the old generic "please send text or photo" line reads as a
-    // confusing non-sequitur when someone just sent a sticker as a "thanks"
-    // or reaction. Give a clearer, type-specific nudge instead.
-    log(message.type, "message received from", phone, "-> not actionable, asking for text/photo instead.");
-    db.logMessage(phone, "in", `[${message.type === "video" ? "Video" : "Sticker"}]`, message.type);
-    await sendText(
-      phone,
-      message.type === "video"
-        ? t(session.language, "videoNotPhoto")
-        : t(session.language, "stickerAck")
-    );
-  } else if (message.type === "location") {
-    log("Location message received from", phone, "-> not relevant to this flow, acknowledging and redirecting.");
-    db.logMessage(phone, "in", "[Location]", "location");
-    await sendText(phone, t(session.language, "locationAck"));
-  } else if (message.type === "contacts") {
-    log("Contact card received from", phone, "-> not relevant to this flow, acknowledging and redirecting.");
-    db.logMessage(phone, "in", "[Contact card]", "contacts");
-    await sendText(phone, t(session.language, "contactAck"));
-  } else if (message.type === "reaction") {
-    // Emoji reactions to a previous message (ߑ, ❤️ etc.) — not something
-    // that needs (or should get) a reply; replying here would be spammy.
-    log("Reaction received from", phone, "-> acknowledging silently, no reply needed.");
-    db.logMessage(phone, "in", "[Reaction]", "reaction");
-  } else {
-    log("Unrecognized message type from", phone, "->", message.type, "- full payload:", JSON.stringify(message));
-    db.logMessage(phone, "in", `[Unrecognized message type: ${message.type}]`, message.type || "unknown");
-    await sendText(phone, t(session.language, "unrecognizedFallback"));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Startup
-// ---------------------------------------------------------------------------
-
-async function start() {
-  log("Process started. Node version:", process.version);
-  log(
-    "DATABASE_URL is",
-    process.env.DATABASE_URL ? "set (length " + process.env.DATABASE_URL.length + ")" : "MISSING"
+async function findOverdueAwaitingReports(thresholdMs, hardCapMs, pacingMs) {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE stage = 'awaiting_report'
+       AND report_status != 'sent'
+       AND payment_confirmed_at IS NOT NULL
+       AND payment_confirmed_at <= now() - ($1 || ' milliseconds')::interval
+       AND ($2::bigint IS NULL OR payment_confirmed_at > now() - ($2 || ' milliseconds')::interval)
+       AND ($3::bigint IS NULL OR last_attempt_at IS NULL OR last_attempt_at <= now() - ($3 || ' milliseconds')::interval)`,
+    [thresholdMs, hardCapMs || null, pacingMs || null]
   );
-  if (process.env.DATABASE_URL) {
-    // Log only the shape (scheme + host), never credentials.
-    try {
-      const u = new URL(process.env.DATABASE_URL);
-      log("DATABASE_URL shape -> protocol:", u.protocol, "host:", u.hostname, "port:", u.port || "(default)");
-    } catch (e) {
-      log("DATABASE_URL could not be parsed as a URL — this itself may be the problem. Error:", e.message);
-    }
-  }
-
-  log("Connecting to database...");
-  try {
-    await Promise.race([
-      db.initDb(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("DB connection timed out after 15s — check DATABASE_URL / network")), 15000)
-      ),
-    ]);
-    log("Database connected successfully.");
-  } catch (err) {
-    log("FATAL: could not initialize database:", err.message);
-    process.exit(1);
-  }
-
-  app.listen(PORT, () => {
-    log(`Bot running on port ${PORT}`);
-    console.log("STARTUP QR_IMAGE_URL =", process.env.QR_IMAGE_URL);
-  });
-
-  setInterval(pollDueReports, 60 * 1000);
-  log("Report polling worker started (every 60s)");
-  // Run one immediately at boot too, in case reports were already due
-  // while the container was restarting.
-  pollDueReports();
+  return result.rows.map(rowToSession);
 }
 
-start();
+// Finds every session where the customer explicitly asked for a refund at
+// some point (refund_requested_at set), most-recent-first. Real incident
+// this fixes: Sangeetha, 919778743899, 29/7 — asked for a refund twice,
+// got a canned "we'll contact you" reply both times, and nobody noticed
+// for hours because there was no way to see refund requests separately
+// from ordinary "where's my report" inquiries.
+async function findRefundRequests() {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE refund_requested_at IS NOT NULL
+     ORDER BY refund_requested_at DESC`
+  );
+  return result.rows.map(rowToSession);
+}
+
+async function findFailedPayments() {
+  const result = await pool.query(
+    `SELECT * FROM sessions
+     WHERE report_status = 'failed'
+     ORDER BY updated_at DESC`
+  );
+  return result.rows.map(rowToSession);
+}
+
+// Logs one message (inbound or outbound) to the permanent conversation log.
+// Never throws — a logging failure should never break the actual bot flow.
+async function logMessage(phone, direction, body, messageType) {
+  try {
+    await pool.query(
+      `INSERT INTO messages (phone, direction, body, message_type) VALUES ($1, $2, $3, $4)`,
+      [phone, direction, body || "", messageType || "text"]
+    );
+  } catch (err) {
+    console.error(new Date().toISOString(), "- logMessage failed (caught):", err.message);
+  }
+}
+
+// Returns full message history for one phone number, oldest first.
+async function getMessagesForPhone(phone) {
+  const result = await pool.query(
+    `SELECT direction, body, message_type, created_at FROM messages WHERE phone = $1 ORDER BY created_at ASC`,
+    [phone]
+  );
+  return result.rows;
+}
+
+// Lightweight fetch of just the most recent outbound message for a phone —
+// used to give short-context classifiers (e.g. "does this bare 'yes' agree
+// to what the bot just offered?") the context they need, without pulling a
+// customer's entire history (some run into the thousands of messages).
+async function getLastOutboundMessage(phone) {
+  const result = await pool.query(
+    `SELECT body FROM messages WHERE phone = $1 AND direction = 'out' ORDER BY created_at DESC LIMIT 1`,
+    [phone]
+  );
+  return result.rows[0]?.body || null;
+}
+
+// Lists phone numbers with any message activity, most recent first, along
+// with a short preview and message count — used for the admin chat list.
+async function listConversations() {
+  const result = await pool.query(`
+    SELECT
+      m.phone,
+      COUNT(*) AS message_count,
+      MAX(m.created_at) AS last_activity,
+      (SELECT body FROM messages WHERE phone = m.phone ORDER BY created_at DESC LIMIT 1) AS last_message,
+      s.name,
+      s.stage
+    FROM messages m
+    LEFT JOIN sessions s ON s.phone = m.phone
+    GROUP BY m.phone, s.name, s.stage
+    ORDER BY last_activity DESC
+  `);
+  return result.rows;
+}
+
+module.exports = {
+  pool,
+  initDb,
+  getOrCreateSession,
+  updateSession,
+  findDueReports,
+  findOverdueAwaitingReports,
+  findAbandonedFunnelSessions,
+  findReengageableSessions,
+  findFailedPayments,
+  findRefundRequests,
+  findSentReports,
+  logMessage,
+  getMessagesForPhone,
+  getLastOutboundMessage,
+  listConversations,
+};
