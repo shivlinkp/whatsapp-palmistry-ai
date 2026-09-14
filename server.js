@@ -2758,27 +2758,36 @@ async function pollDueReports() {
       }
     }
 
-    // One-time re-engagement nudge for customers who stalled in the two
-    // earliest, highest-drop-off funnel stages (awaiting_language,
-    // collecting) and went quiet — these stages previously had NO
-    // follow-up at all. Real finding: 28/8, 49% of active chats stalled
-    // here combined, with confirmed evidence (918637429436) that
-    // customers do not return on their own. Fires at most once ever per
-    // session (see funnel_nudge_sent_at / findAbandonedFunnelSessions).
-    const abandonedSessions = await db.findAbandonedFunnelSessions(FUNNEL_NUDGE_AFTER_MS);
-    for (const session of abandonedSessions) {
-      const nudgeText =
-        session.stage === "awaiting_language"
-          ? LANGUAGE_STAGE_FUNNEL_NUDGE
-          : t(session.language, "funnelNudge");
-      log(
-        "Funnel nudge: sending one-time re-engagement message to",
-        session.phone,
-        "-> stalled in stage:",
-        session.stage
-      );
-      await sendText(session.phone, nudgeText);
-      await db.updateSession(session.phone, { funnelNudgeSentAt: new Date() });
+    // DISABLED (11/9/2026) — this proactive re-engagement nudge, combined
+    // with the manual /admin/reengage-stuck trigger, is very likely what
+    // triggered a real WhatsApp "Account activity issue: sending spam"
+    // warning from Meta on the connected business account. WhatsApp's
+    // spam detection flags unsolicited outbound messages to customers who
+    // went quiet and didn't ask to be re-contacted — the 24-hour customer
+    // service window permits sending A message, but it's meant for direct
+    // replies to something the customer just sent, not for reopening a
+    // sales pitch on our own initiative. Left in place (not deleted) in
+    // case this becomes safe to re-enable later — e.g. via an approved
+    // WhatsApp message TEMPLATE (a Meta-approved, opt-in-appropriate
+    // format for exactly this use case) instead of a plain session
+    // message. Do not re-enable this loop with plain sendText() calls.
+    const FUNNEL_NUDGE_ENABLED = false;
+    if (FUNNEL_NUDGE_ENABLED) {
+      const abandonedSessions = await db.findAbandonedFunnelSessions(FUNNEL_NUDGE_AFTER_MS);
+      for (const session of abandonedSessions) {
+        const nudgeText =
+          session.stage === "awaiting_language"
+            ? LANGUAGE_STAGE_FUNNEL_NUDGE
+            : t(session.language, "funnelNudge");
+        log(
+          "Funnel nudge: sending one-time re-engagement message to",
+          session.phone,
+          "-> stalled in stage:",
+          session.stage
+        );
+        await sendText(session.phone, nudgeText);
+        await db.updateSession(session.phone, { funnelNudgeSentAt: new Date() });
+      }
     }
   } catch (err) {
     log("Poller crashed (caught):", err.message);
@@ -3077,30 +3086,31 @@ app.get("/admin/reengage-stuck", async (req, res) => {
     return res.status(403).send("Forbidden — missing or wrong key.");
   }
 
-  // Respond immediately rather than waiting for every message to send —
-  // each sendText() has a deliberate 10-15s human-like delay built in, so
-  // reaching even a handful of people could take several minutes total,
-  // well past typical browser/proxy timeouts. Real incident: this exact
-  // endpoint returned ERR_CONNECTION_ABORTED because the browser gave up
-  // waiting. The actual sending now runs in the background after
-  // responding — same pattern already used for the WhatsApp webhook
-  // itself (ack first, process after).
-  res.status(200).send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Re-engage Stuck Chats</title></head>
+  // DISABLED (11/9/2026) — this endpoint (bulk proactive outbound
+  // messages to customers who went quiet) is very likely what triggered a
+  // real WhatsApp "Account activity issue: sending spam" warning from
+  // Meta on the connected business account. Returning an explanation
+  // instead of running, rather than deleting the code outright, in case
+  // this becomes safe to re-enable later via an approved WhatsApp
+  // message TEMPLATE instead of plain sendText() calls.
+  return res.status(200).send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Re-engage Stuck Chats — Disabled</title></head>
 <body style="background:#111;color:#eee;font-family:sans-serif;margin:0;padding:16px;">
-  <div style="font-size:18px;font-weight:bold;margin-bottom:12px;">⏳ Started — sending in the background</div>
+  <div style="font-size:18px;font-weight:bold;margin-bottom:12px;color:#e05252;">⛔ This feature is currently disabled</div>
   <div style="color:#ccc;font-size:14px;line-height:1.8;">
-    Each message has a deliberate ~10-15 second human-like pacing delay, so this may take several minutes to finish if there are many stuck chats — this page won't wait for it, and you can close it safely.
+    Proactively re-messaging customers who went quiet triggered a WhatsApp "sending spam" warning on the connected business account. This endpoint (and the automatic funnel nudge) have been switched off to avoid the account being restricted or disabled.
   </div>
   <div style="color:#888;font-size:13px;margin-top:16px;">
-    Check Railway's Deploy Logs for "Reengage-stuck run complete" to see the final counts, or just check /admin/chats after a few minutes to see who responded. Only reached customers who messaged within the last 24 hours — that's a WhatsApp platform rule, not a bug. For older stuck chats, you'll need an approved WhatsApp template message via Meta Business Manager. Safe to run this again later — anyone already reached in the last 12 hours is automatically skipped.
+    Genuine replies to customer messages (payment confirmations, QR resends, follow-up answers) are unaffected — those respond to something the customer just sent, which is fine. Re-enabling proactive outreach safely would need an approved WhatsApp message template via Meta Business Manager, not plain session messages.
   </div>
 </body></html>`);
-
-  runReengageStuckInBackground().catch((err) => log("Reengage-stuck background run crashed (caught):", err.message));
 });
 
-async function runReengageStuckInBackground() {
+/* DISABLED (11/9/2026) — the background sender this route used to call.
+Kept for reference only in case proactive outreach is ever safely
+re-enabled via an approved WhatsApp template. Not reachable from anywhere.
+
+async function runReengageStuckInBackground_DISABLED() {
   const sessions = await db.findReengageableSessions(REENGAGE_COOLDOWN_MS);
   const results = { awaiting_language: 0, collecting: 0, awaiting_photo: 0, awaiting_payment: 0, failed: 0 };
   log(`Reengage-stuck: starting background run for ${sessions.length} reengageable session(s).`);
@@ -3131,6 +3141,7 @@ async function runReengageStuckInBackground() {
 
   log("Reengage-stuck run complete:", JSON.stringify(results));
 }
+*/
 
 app.get("/admin/funnel-stats", async (req, res) => {
   const { key, date } = req.query;
