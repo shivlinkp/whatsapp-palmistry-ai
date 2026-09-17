@@ -2864,6 +2864,43 @@ app.get("/admin/reset-session", async (req, res) => {
 // it fails, the real reason is shown right in the response — no need to
 // dig through chat/logs separately.
 // Usage: GET /admin/force-report?phone=917736266839&key=resetmybot123
+// Admin: manually gate one customer's follow-up chat right now — GET
+// /admin/gate-followup?phone=919961850471&key=resetmybot123
+// Immediately puts a report_sent session into the same "please pay ₹99 to
+// continue" state the automatic 30-question limit produces, regardless of
+// their actual follow-up count. For a legitimate paying customer whose
+// conversation has drifted into extensive, non-revenue-generating
+// territory (personal drama, staff management, family disputes, etc.)
+// faster than the natural threshold catches it — not a ban, since paying
+// again fully resumes normal Q&A, same as the automatic gate.
+app.get("/admin/gate-followup", async (req, res) => {
+  const { phone, key } = req.query;
+  if (key !== RESET_COMMAND) {
+    return res.status(403).send("Forbidden — missing or wrong key.");
+  }
+  if (!phone) {
+    return res.status(400).send("Missing ?phone= (e.g. ?phone=919961850471&key=...)");
+  }
+
+  try {
+    const session = await db.getOrCreateSession(phone);
+    if (session.stage !== "report_sent") {
+      return res.status(400).send(`Session for ${phone} is in stage "${session.stage}", not report_sent — nothing to gate.`);
+    }
+
+    await db.updateSession(phone, { awaitingFollowUpPayment: true });
+    log("Admin manually gated follow-up chat for", phone);
+
+    res.status(200).send(
+      `✅ ${phone} is now gated. Their next message will get the "please pay ₹99 to continue" reminder ` +
+        `instead of a real answer. Paying again resumes normal Q&A immediately, same as the automatic 30-question limit.`
+    );
+  } catch (err) {
+    log("Admin gate-followup failed (caught):", err.message);
+    res.status(500).send("Failed: " + err.message);
+  }
+});
+
 app.get("/admin/force-report", async (req, res) => {
   const { phone, key } = req.query;
   if (key !== RESET_COMMAND) {
