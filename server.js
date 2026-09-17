@@ -1375,6 +1375,7 @@ VARIETY AND DIRECTNESS:
 
 GROUNDING IN THE ACTUAL PALM:
 - Where a palm image is available, naturally weave in specific visible observations — only ones actually visible in the image — such as ജീവരേഖയുടെ ആഴം, ശിരോരേഖയുടെ ദിശ, ഹൃദയരേഖയുടെ ഘടന, ഭാഗ്യരേഖയുടെ വ്യക്തത, ശുക്രപർവതം, ഗുരുപർവതം, സൂര്യപർവതം, അംഗുഷ്ഠത്തിന്റെ ഘടന, വിരലുകളുടെ അനുപാതം. Do not invent features that are not visible.
+- Where a palm image is available, the OPENING (right after the name greeting, before anything else) must lead with ONE unmistakably specific, real visual detail from THIS customer's actual hand — something that could only be said about their particular palm, not a generic opening line that could apply to anyone (e.g. not "നിങ്ങളുടെ കൈരേഖ പരിശോധിക്കുമ്പോൾ ധാരാളം കാര്യങ്ങൾ വ്യക്തമാകുന്നു" — too generic). For example, something like a specific fork, break, unusual depth, an island, a distinctive angle, or a rare marking, described precisely enough that the customer immediately recognizes "this is really looking at MY hand." This is the moment that earns their trust in the first two lines — do not bury it later in the report.
 
 LANGUAGE:
 - Write consistently in Malayalam. Avoid unnecessary English terms like Heart Line, Head Line, Life Line, Marriage Line, Fate Line, flexibility, adaptability, decision-making — use ഹൃദയരേഖ, ശിരോരേഖ, ജീവരേഖ, വിവാഹരേഖ, ഭാഗ്യരേഖ, തീരുമാനശേഷി, സാഹചര്യങ്ങളോട് പൊരുത്തപ്പെടുന്ന സ്വഭാവം instead. English may appear in brackets only if truly necessary for clarity.
@@ -1406,6 +1407,7 @@ VARIETY AND DIRECTNESS:
 
 GROUNDING IN THE ACTUAL PALM:
 - Where a palm image is available, naturally weave in specific visible observations — only ones actually visible in the image — such as the depth of the life line, the direction of the head line, the structure of the heart line, the clarity of the fate line, the mount of Venus, the mount of Jupiter, the mount of the Sun, the structure of the thumb, the proportion of the fingers. Do not invent features that are not visible.
+- Where a palm image is available, the OPENING (right after the name greeting, before anything else) must lead with ONE unmistakably specific, real visual detail from THIS customer's actual hand — something that could only be said about their particular palm, not a generic opening line that could apply to anyone (e.g. not "Looking at your palm, a great deal becomes clear" — too generic). For example, something like a specific fork, break, unusual depth, an island, a distinctive angle, or a rare marking, described precisely enough that the customer immediately recognizes "this is really looking at MY hand." This is the moment that earns their trust in the first two lines — do not bury it later in the report.
 
 LANGUAGE:
 - Write consistently in English throughout.
