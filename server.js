@@ -2401,10 +2401,18 @@ Otherwise, after your answer, end with a gentle reminder that once they complete
     const followUpMessages = [
       {
         role: "system",
+        // Deliberately ordered for prompt caching: the block below, up
+        // through the "never predict unborn gender" line, is 100%
+        // identical for every follow-up call of this language, for every
+        // customer, every day — this is the shared, fully cacheable
+        // prefix (previously broken by the date being embedded near the
+        // top, which invalidated caching on this entire block daily).
+        // Customer-specific content (order count, their own report text)
+        // comes next — stable across that customer's own conversation.
+        // The one genuinely daily-changing piece (today's date) is now
+        // LAST, so it's the only part that ever needs fresh processing.
         content: `You are the same experienced traditional palmist continuing a conversation with a customer, after having given them a palm reading earlier. Respond naturally and briefly in ${langName}.
 ${t(session.language, "addressGuidance")} ${hedgingLine}
-
-Today's actual date is ${todayStr} (year ${currentYear}). If the customer asks about future timing (which year, when, how soon, etc.), any year or timeframe you mention MUST be ${currentYear} or later — never state a year that has already passed as if it were a future prediction. ${timeframeLine}
 
 Customers write casually, and Malayalam-speaking customers sometimes type in Manglish (Malayalam typed in English letters). Read past literal wording to their actual intent before answering:
 - If they're asking a question about THEIR OWN earlier reading, answer using the reading context below.
@@ -2428,7 +2436,9 @@ ${
     : ""
 }
 
-Earlier reading:\n${session.reportText || ""}`,
+Earlier reading:\n${session.reportText || ""}
+
+Today's actual date is ${todayStr} (year ${currentYear}). If the customer asks about future timing (which year, when, how soon, etc.), any year or timeframe you mention MUST be ${currentYear} or later — never state a year that has already passed as if it were a future prediction. ${timeframeLine}`,
       },
       { role: "user", content: text },
     ];
@@ -2910,32 +2920,51 @@ app.get("/admin/force-report", async (req, res) => {
     return res.status(400).send("Missing ?phone= (e.g. ?phone=917736266839&key=...)");
   }
 
+  let session;
   try {
-    const session = await db.getOrCreateSession(phone);
-    if (!session.palmMediaId) {
-      return res.status(400).send("No palm photo on file for this session — cannot generate a report.");
-    }
+    session = await db.getOrCreateSession(phone);
+  } catch (err) {
+    log("Admin force-report failed to load session (caught):", err.message);
+    return res.status(500).send("Failed to load session: " + err.message);
+  }
+  if (!session.palmMediaId) {
+    return res.status(400).send("No palm photo on file for this session — cannot generate a report.");
+  }
 
-    log("Admin force-report triggered for", phone);
+  // Respond immediately rather than waiting for the full generation to
+  // finish — a real OpenAI call (especially with gpt-5.5, a reasoning
+  // model) can take long enough that the browser/proxy closes the
+  // connection before any response arrives, even though the generation
+  // itself may still succeed server-side. Real incident: this exact
+  // endpoint returned ERR_CONNECTION_CLOSED. The actual work now runs in
+  // the background after responding, same pattern as /admin/reengage-stuck.
+  res.status(200).send(
+    `⏳ Started — generating in the background for ${phone}.\n\n` +
+      `This may take a minute or two. Check Railway's Deploy Logs for "Force-report result" to see the outcome, ` +
+      `or just reopen the chat view for this number in a bit — if it succeeded, the report will be there.`
+  );
+
+  runForceReportInBackground(phone, session).catch((err) =>
+    log("Force-report background run crashed (caught):", err.message)
+  );
+});
+
+async function runForceReportInBackground(phone, session) {
+  try {
+    log("Admin force-report (background) triggered for", phone);
     const resetSession = await db.updateSession(phone, { reportAttempts: 0, reportStatus: "pending" });
     const result = await generateAndDeliverReport(resetSession);
 
     if (result.success) {
-      res.status(200).send(`✅ Report generated and sent to ${phone} (attempt ${result.attemptNumber}).`);
+      log(`Force-report result for ${phone}: SUCCESS (attempt ${result.attemptNumber}).`);
     } else {
       const fresh = await db.getOrCreateSession(phone);
-      res
-        .status(200)
-        .send(
-          `❌ Attempt failed.\n\nReason: ${fresh.reportError || "unknown"}\n\nExhausted: ${result.exhausted}\n\n` +
-            `You can reload this URL to try again — each reload is a fresh attempt, not subject to the normal cooldown.`
-        );
+      log(`Force-report result for ${phone}: FAILED. Reason: ${fresh.reportError || "unknown"}. Exhausted: ${result.exhausted}.`);
     }
   } catch (err) {
-    log("Admin force-report failed (caught):", err.message);
-    res.status(500).send("Force-report failed: " + err.message);
+    log("Force-report background run failed for", phone, "(caught):", err.message);
   }
-});
+}
 
 // Admin: SAFE diagnostic preview — runs the exact same generation pipeline
 // (same photo, same details, same prompt) as a real attempt, but does NOT
