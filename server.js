@@ -2995,6 +2995,61 @@ app.get("/admin/force-report", async (req, res) => {
   );
 });
 
+// Admin: retry ALL paid sessions stuck in awaiting_report, one at a time,
+// in the background (paced so OpenAI spend and rate limits stay sane).
+// Usage: GET /admin/force-all-stuck?key=...&skip=919946650689,918xxxxxxxxx
+let forceAllRunning = false;
+app.get("/admin/force-all-stuck", async (req, res) => {
+  const { key, skip } = req.query;
+  if (key !== RESET_COMMAND) return res.status(403).send("Forbidden — missing or wrong key.");
+  if (forceAllRunning) return res.status(409).send("A force-all run is already in progress. Check Deploy Logs for 'Force-all'.");
+
+  const skipSet = new Set(String(skip || "").split(",").map((x) => x.trim()).filter(Boolean));
+  let rows;
+  try {
+    const r = await db.pool.query(
+      `SELECT phone, name FROM sessions
+       WHERE stage = 'awaiting_report' AND palm_media_id IS NOT NULL AND payment_received = TRUE
+       ORDER BY report_due_at ASC NULLS FIRST`
+    );
+    rows = r.rows.filter((x) => !skipSet.has(x.phone));
+  } catch (err) {
+    return res.status(500).send("Query failed: " + err.message);
+  }
+
+  forceAllRunning = true;
+  res.status(200).send(
+    `⏳ Started — retrying ${rows.length} paid stuck report(s) one at a time (about 1–2 min each), in the background.\n\n` +
+      rows.map((x) => `${x.phone} ${x.name || ""}`).join("\n") +
+      `\n\nWatch the chats, or Railway Deploy Logs for "Force-all".`
+  );
+
+  (async () => {
+    let ok = 0;
+    let failed = 0;
+    for (const row of rows) {
+      try {
+        const session = await db.getOrCreateSession(row.phone);
+        if (session.stage !== "awaiting_report") continue; // delivered meanwhile
+        await runForceReportInBackground(row.phone, session);
+        const fresh = await db.getOrCreateSession(row.phone);
+        if (fresh.stage === "report_sent") ok++;
+        else failed++;
+        log(`Force-all: ${row.phone} -> stage ${fresh.stage}`);
+      } catch (err) {
+        failed++;
+        log("Force-all: error for", row.phone, err.message);
+      }
+      await new Promise((r) => setTimeout(r, 10000));
+    }
+    forceAllRunning = false;
+    log(`Force-all finished: ${ok} delivered, ${failed} not delivered, of ${rows.length}.`);
+  })().catch((err) => {
+    forceAllRunning = false;
+    log("Force-all crashed (caught):", err.message);
+  });
+});
+
 async function runForceReportInBackground(phone, session) {
   try {
     log("Admin force-report (background) triggered for", phone);
