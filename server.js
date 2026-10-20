@@ -1085,7 +1085,7 @@ async function getAudioBuffer(mediaId) {
 // Transcribes voice message bytes via OpenAI's Whisper endpoint. No
 // "language" parameter is passed — Whisper auto-detects, so both Malayalam
 // and English voice messages work without special-casing either.
-async function transcribeVoiceMessage(buffer, mimeType) {
+async function transcribeVoiceMessage(buffer, mimeType, language) {
   if (!OPENAI_API_KEY) {
     log("OPENAI_API_KEY missing, cannot transcribe voice message");
     return null;
@@ -1103,6 +1103,10 @@ async function transcribeVoiceMessage(buffer, mimeType) {
     const form = new FormData();
     form.append("file", new Blob([buffer], { type: mimeType }), `voice.${extension}`);
     form.append("model", "whisper-1");
+    // Without a hint Whisper sometimes auto-detects Malayalam as Tamil and
+    // returns Tamil-script gibberish (real incident: Nandakumar,
+    // 919946650689, 20/10). Pin Malayalam unless the customer chose English.
+    if (language !== "en") form.append("language", "ml");
 
     log("Sending voice message to OpenAI for transcription (whisper-1). Size:", buffer.length, "bytes, mime:", mimeType);
 
@@ -1152,7 +1156,7 @@ async function handleVoiceMessage(phone, mediaId, session) {
     return;
   }
 
-  const transcript = await transcribeVoiceMessage(audio.buffer, audio.mimeType);
+  const transcript = await transcribeVoiceMessage(audio.buffer, audio.mimeType, session.language);
   if (!transcript) {
     await sendText(phone, t(session.language, "voiceTranscriptionFailed"));
     return;
@@ -1286,6 +1290,7 @@ async function callOpenAIForReport(messages, maxTokens, model) {
   // proven in openaiChat(), since max_tokens is rejected outright by newer
   // models while max_completion_tokens works correctly across old and new
   // models alike.
+  let skipReasoningEffort = false;
   async function attempt(includeTemperature) {
     const requestBody = {
       model,
@@ -1294,6 +1299,11 @@ async function callOpenAIForReport(messages, maxTokens, model) {
     };
     if (includeTemperature) {
       requestBody.temperature = 0.8;
+    }
+    // Reasoning models burn hidden reasoning tokens from max_completion_tokens;
+    // a long Malayalam report needs the budget for visible output.
+    if (/^gpt-5|^o\d/.test(model) && !skipReasoningEffort) {
+      requestBody.reasoning_effort = "low";
     }
     log(
       `OpenAI report request payload for model "${model}" (image truncated, temperature ${includeTemperature ? "included" : "omitted"}):`,
@@ -1326,7 +1336,17 @@ async function callOpenAIForReport(messages, maxTokens, model) {
       log(`OpenAI report response HTTP status (model "${model}", retry without temperature):`, res.status);
     }
 
+    if (!res.ok && data?.error?.param === "reasoning_effort") {
+      log(`OpenAI report request: model "${model}" rejected reasoning_effort — retrying without it.`);
+      skipReasoningEffort = true;
+      ({ res, data } = await attempt(false));
+    }
+
     log(`OpenAI report full response (model "${model}"):`, JSON.stringify(data));
+    log(
+      `OpenAI report usage (model "${model}"): finish_reason=${data?.choices?.[0]?.finish_reason}`,
+      JSON.stringify(data?.usage || {})
+    );
 
     if (!res.ok) {
       log(`OpenAI report generation FAILED (model "${model}"):`, JSON.stringify(data));
@@ -1467,7 +1487,7 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
   // repetition). This distinction matters for deciding whether it's worth
   // immediately trying the other model within the same attempt.
   async function tryModel(model) {
-    const result = await callOpenAIForReport(messages, 7000, model);
+    const result = await callOpenAIForReport(messages, 16000, model);
 
     if (!result.ok) {
       const detail = result.networkError
@@ -2479,7 +2499,22 @@ Today's actual date is ${todayStr} (year ${currentYear}). If the customer asks a
 // arrives BEFORE name/DOB/gender are known (see handleImageMessage and
 // progressCollectingStage) — previously that second case silently
 // discarded the photo entirely.
+const palmPhotoInFlight = new Set();
 async function processReceivedPalmPhoto(phone, mediaId, session) {
+  // Two photos sent together used to run this twice in parallel and send a
+  // duplicate QR + "photo received" (Nandakumar, 20/10). Drop the second.
+  if (palmPhotoInFlight.has(phone)) {
+    log("processReceivedPalmPhoto: already in flight for", phone, "— skipping duplicate.");
+    return;
+  }
+  palmPhotoInFlight.add(phone);
+  try {
+    await processReceivedPalmPhotoInner(phone, mediaId, session);
+  } finally {
+    palmPhotoInFlight.delete(phone);
+  }
+}
+async function processReceivedPalmPhotoInner(phone, mediaId, session) {
   const imageDataUrl = await getMediaBase64(mediaId);
   const validation = await isPalmPhoto(imageDataUrl);
   log("Palm photo validation result for", phone, "->", JSON.stringify(validation));
