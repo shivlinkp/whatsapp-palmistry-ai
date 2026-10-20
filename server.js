@@ -1086,6 +1086,17 @@ async function getAudioBuffer(mediaId) {
 // "language" parameter is passed — Whisper auto-detects, so both Malayalam
 // and English voice messages work without special-casing either.
 async function transcribeVoiceMessage(buffer, mimeType, language) {
+  // Try with the Malayalam hint first; if that yields nothing (e.g. the
+  // API rejects the hint), retry once with plain auto-detect.
+  if (language !== "en") {
+    const hinted = await transcribeVoiceMessageOnce(buffer, mimeType, "ml");
+    if (hinted) return hinted;
+    log("Voice transcription with language=ml returned nothing — retrying with auto-detect.");
+  }
+  return transcribeVoiceMessageOnce(buffer, mimeType, null);
+}
+
+async function transcribeVoiceMessageOnce(buffer, mimeType, language) {
   if (!OPENAI_API_KEY) {
     log("OPENAI_API_KEY missing, cannot transcribe voice message");
     return null;
@@ -1106,7 +1117,7 @@ async function transcribeVoiceMessage(buffer, mimeType, language) {
     // Without a hint Whisper sometimes auto-detects Malayalam as Tamil and
     // returns Tamil-script gibberish (real incident: Nandakumar,
     // 919946650689, 20/10). Pin Malayalam unless the customer chose English.
-    if (language !== "en") form.append("language", "ml");
+    if (language) form.append("language", language);
 
     log("Sending voice message to OpenAI for transcription (whisper-1). Size:", buffer.length, "bytes, mime:", mimeType);
 
