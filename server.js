@@ -289,9 +289,11 @@ const T = {
 താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്യുക.
 
 Payment ചെയ്തതിന് ശേഷം payment screenshot ഇവിടെ അയച്ചാൽ മതി.`,
+    followUpBatchHint: `ℹ️ നിങ്ങളുടെ എല്ലാ ചോദ്യങ്ങളും ഒറ്റ സന്ദേശത്തിൽ ഒരുമിച്ച് ചോദിക്കുക. റീഡിംഗിന് ശേഷം 5 സന്ദേശങ്ങൾ വരെ ചോദിക്കാം; അതിനുശേഷം തുടരാൻ ₹99 payment ആവശ്യമാണ്.`,
+    followUpLastHint: `ℹ️ ഇത് നിങ്ങളുടെ അവസാനത്തെ ചോദ്യ സന്ദേശമായിരുന്നു. ഇനിയും ചോദിക്കണമെങ്കിൽ ₹99 payment ചെയ്യേണ്ടതുണ്ട്.`,
     followUpLimitReached: `നന്ദി, ഇത്രയധികം ചോദ്യങ്ങൾ ചോദിച്ചതിന്! ߙ
 
-ഈ റീഡിംഗിനുള്ള ചോദ്യങ്ങളുടെ പരിധി എത്തിയിരിക്കുന്നു. കൂടുതൽ ചോദ്യങ്ങൾ ചോദിക്കാൻ ആഗ്രഹിക്കുന്നുവെങ്കിൽ, ദയവായി താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്ത് screenshot അയച്ചുതരാമോ? അതിനുശേഷം തുടരാം.`,
+ഈ റീഡിംഗിനുള്ള ചോദ്യങ്ങളുടെ പരിധി (5 സന്ദേശങ്ങൾ) എത്തിയിരിക്കുന്നു. കൂടുതൽ ചോദ്യങ്ങൾ ചോദിക്കാൻ ആഗ്രഹിക്കുന്നുവെങ്കിൽ, ദയവായി താഴെ നൽകിയിരിക്കുന്ന QR Code ഉപയോഗിച്ച് ₹99 payment ചെയ്ത് screenshot അയച്ചുതരാമോ? അതിനുശേഷം തുടരാം.`,
     followUpPaymentConfirmed: `Payment ലഭിച്ചു, നന്ദി! ߙ ദയവായി നിങ്ങളുടെ ചോദ്യങ്ങൾ തുടരാം.`,
     qrFailure(language) {
       return `QR code അയക്കുന്നതിൽ ചെറിയ പ്രശ്നം ഉണ്ടായി. ദയവായി കുറച്ച് സമയം കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കൂ. തുടർച്ചയായി പ്രശ്നം ഉണ്ടെങ്കിൽ ${T.ml.supportContactLine}`;
@@ -414,9 +416,11 @@ When taking the photo:
 Please pay ₹99 using the QR code above.
 
 Once you've paid, just send the payment screenshot here.`,
+    followUpBatchHint: `ℹ️ Please send all your questions together in one message. You can send up to 5 messages after your reading; after that, ₹99 is needed to continue.`,
+    followUpLastHint: `ℹ️ That was your last question message. To ask more, please pay ₹99 again.`,
     followUpLimitReached: `Thank you for all your questions! ߙ
 
-You've reached the question limit for this reading. If you'd like to continue asking questions, please pay ₹99 using the QR code below and send the screenshot — we'll continue right after.`,
+You've reached the question limit (5 messages) for this reading. If you'd like to continue asking questions, please pay ₹99 using the QR code below and send the screenshot — we'll continue right after.`,
     followUpPaymentConfirmed: `Payment received, thank you! ߙ Please go ahead and continue with your questions.`,
     qrFailure(language) {
       return `There was a small issue sending the QR code. Please try again in a little while. If the issue continues, ${T.en.supportContactLine}`;
@@ -1488,7 +1492,12 @@ IMPORTANT — never predict or comment on the sex/gender of an unborn baby (a pr
   // solid, cheap, and a genuinely different model family from gpt-5.5,
   // which matters for the "try a different model" fallback logic below —
   // no benefit to falling back to another same-generation reasoning model.
-  const REPORT_MODEL_PRIMARY = "gpt-5.5";
+  // Reliability first: gpt-5.5 only gets the FIRST normal attempt. Any retry
+  // (attempt 2+) or manual admin force-report uses gpt-4.1, the model that
+  // delivered reports reliably before the upgrade, so one flaky model can't
+  // leave a paid customer stuck (20/10 incident: ~20 paid reports stuck).
+  const useSafeModel = (session.reportAttempts || 0) >= 1 || session.useSafeModel === true;
+  const REPORT_MODEL_PRIMARY = useSafeModel ? "gpt-4.1" : "gpt-5.5";
   const REPORT_MODEL_FALLBACK = "gpt-4o";
 
   // Tries one model end-to-end and returns a structured outcome, including
@@ -1647,7 +1656,7 @@ const FUNNEL_NUDGE_AFTER_MS = 3 * 60 * 60 * 1000; // 3 hours
 // handful to a couple dozen genuine questions) is never affected — this
 // only stops the genuine outlier case. See report_sent handler for the
 // gate itself.
-const FOLLOW_UP_FREE_LIMIT = 30;
+const FOLLOW_UP_FREE_LIMIT = 5; // was 30 — token cost; customers are told to batch questions
 
 // Minimum time between forced-retry generation attempts triggered by a
 // customer message, regardless of how many messages they send in that
@@ -1692,6 +1701,11 @@ async function generateAndDeliverReport(session) {
       reportAttempts: attemptNumber,
     });
     await sendLongText(phone, report);
+    try {
+      await sendText(phone, t(session.language, "followUpBatchHint"));
+    } catch (e) {
+      log("followUpBatchHint send failed (non-fatal):", e.message);
+    }
     log(`Report sent to ${phone} on attempt ${attemptNumber}`);
     return { success: true, attemptNumber };
   }
@@ -2497,6 +2511,9 @@ Today's actual date is ${todayStr} (year ${currentYear}). If the customer asks a
 
     if (followUp) {
       await sendText(phone, followUp);
+      if (followUpCount === FOLLOW_UP_FREE_LIMIT) {
+        await sendText(phone, t(session.language, "followUpLastHint"));
+      }
     } else {
       await sendText(phone, t(session.language, "followUpFailed"));
     }
@@ -3054,7 +3071,7 @@ async function runForceReportInBackground(phone, session) {
   try {
     log("Admin force-report (background) triggered for", phone);
     const resetSession = await db.updateSession(phone, { reportAttempts: 0, reportStatus: "pending" });
-    const result = await generateAndDeliverReport(resetSession);
+    const result = await generateAndDeliverReport({ ...resetSession, useSafeModel: true });
 
     if (result.success) {
       log(`Force-report result for ${phone}: SUCCESS (attempt ${result.attemptNumber}).`);
