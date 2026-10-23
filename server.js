@@ -2702,6 +2702,22 @@ async function handleImageMessage(phone, mediaId, session) {
     // (same trust model as the original payment flow: no verification,
     // just proceed) and reset the counter so Q&A resumes normally.
     if (session.awaitingFollowUpPayment) {
+      // A palm photo is NOT a payment screenshot. Previously ANY image reset
+      // the gate, so a customer who kept sending hand photos got unlimited
+      // free chat (Sreedevi, 919846463896: 3,000+ messages, never re-asked
+      // to pay). If it validates as a palm, keep the gate and re-ask.
+      try {
+        const gateImg = await getMediaBase64(mediaId);
+        const gateCheck = await isPalmPhoto(gateImg);
+        if (gateCheck && gateCheck.valid) {
+          log("Image from gated customer", phone, "is a palm photo, not a payment screenshot — keeping gate, re-asking for payment.");
+          const qrSent = await sendImageByUrl(phone, QR_IMAGE_URL, "");
+          await sendText(phone, qrSent ? t(session.language, "followUpLimitReached") : t(session.language, "qrFailure"));
+          return;
+        }
+      } catch (e) {
+        log("Gate palm-check failed (non-fatal, falling back to accept):", e.message);
+      }
       log("Follow-up payment screenshot received from", phone, "-> resetting follow-up limit and resuming Q&A.");
       await db.updateSession(phone, { awaitingFollowUpPayment: false, followUpMessageCount: 0 });
       await sendText(phone, t(session.language, "followUpPaymentConfirmed"));
@@ -3010,6 +3026,37 @@ app.get("/admin/force-report", async (req, res) => {
   runForceReportInBackground(phone, session).catch((err) =>
     log("Force-report background run crashed (caught):", err.message)
   );
+});
+
+// Admin: how many times has the bot asked a customer to pay?
+// Usage: GET /admin/payment-asks?phone=919846463896&key=...
+app.get("/admin/payment-asks", async (req, res) => {
+  const { phone, key } = req.query;
+  if (key !== RESET_COMMAND) return res.status(403).send("Forbidden — missing or wrong key.");
+  if (!phone) return res.status(400).send("Missing ?phone=");
+  try {
+    const qr = await db.pool.query(
+      `SELECT to_char(created_at AT TIME ZONE 'Asia/Kolkata','YYYY-MM-DD') AS day, COUNT(*)::int AS n
+       FROM messages WHERE phone=$1 AND direction='out' AND message_type='qr_image'
+       GROUP BY 1 ORDER BY 1`, [phone]);
+    const lim = await db.pool.query(
+      `SELECT COUNT(*)::int AS n FROM messages
+       WHERE phone=$1 AND direction='out' AND (body LIKE '%question limit%' OR body LIKE '%ചോദ്യങ്ങളുടെ പരിധി%')`, [phone]);
+    const shots = await db.pool.query(
+      `SELECT COUNT(*)::int AS n FROM messages WHERE phone=$1 AND direction='in' AND message_type='image'`, [phone]);
+    const sess = await db.getOrCreateSession(phone);
+    res.status(200).type("text/plain").send(
+      `Payment asks for ${phone}\n` +
+      `QR images sent: ${qr.rows.reduce((a, r) => a + r.n, 0)}\n` +
+      qr.rows.map((r) => `  ${r.day}: ${r.n}`).join("\n") + "\n" +
+      `"Question limit reached" messages: ${lim.rows[0].n}\n` +
+      `Images received from customer (photos + screenshots): ${shots.rows[0].n}\n` +
+      `Currently gated for payment: ${!!sess.awaitingFollowUpPayment}\n` +
+      `Follow-up message count: ${sess.followUpMessageCount || 0}\n`
+    );
+  } catch (err) {
+    res.status(500).send("Failed: " + err.message);
+  }
 });
 
 // Admin: retry ALL paid sessions stuck in awaiting_report, one at a time,
